@@ -1,25 +1,29 @@
 package onvmpoller
 
 import (
+	"fmt"
 	"strconv"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
 
 const (
+	// For Connection.state
 	CONN_NULL          = 0
 	CONN_READY_TO_SEND = 1
 	CONN_READY_TO_RECV = 2
 	CONN_READY_TO_BOTH = 3
+	// For four_tuple
+	SRC_IP_ADDR_IDX = 0
+	SRC_IP_PORT_IDX = 1
+	DST_IP_ADDR_IDX = 2
+	DST_IP_PORT_IDX = 3
 )
 
 type HttpTransaction struct {
-	streamID   uint32
-	src_nf     uint8  // Source NF Service ID
-	dst_nf     uint8  // Destination NF Service ID
-	nf_handler string // Handle this transaction
-	request    string
-	response   string
+	four_tuple  [4]string
+	http_packet []byte
 }
 
 type RxChannelData struct {
@@ -31,10 +35,23 @@ type TxChannelData struct {
 }
 
 type Connection struct {
-	rxchan  chan (RxChannelData)
-	txchan  chan (TxChannelData)
-	conn_id uint16
-	state   uint8
+	rxchan     chan (RxChannelData)
+	txchan     chan (TxChannelData)
+	src_nf     uint8 // Source NF Service ID
+	dst_nf     uint8 // Destination NF Service ID
+	conn_id    uint16
+	state      uint8
+	four_tuple [4]string
+}
+
+type OnvmListner struct {
+	// TODO
+}
+
+type OnvmAddr struct {
+	srevice_id uint8 // Service ID of NF
+	ipv4_addr  string
+	port       uint16
 }
 
 type OnvmPoll struct {
@@ -47,7 +64,7 @@ var (
 	conn_id             uint16
 	onvmpoll            OnvmPoll
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
-	streamID_to_connID  map[uint32]uint16
+	fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 )
 
 func init() {
@@ -56,14 +73,17 @@ func init() {
 	onvmpoll.conn_table = make(map[uint16]Connection)
 	onvmpoll.ready_list = make([]uint16, 0)
 	nf_pkt_handler_chan = make(chan RxChannelData)
-	streamID_to_connID = make(map[uint32]uint16)
+	fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 	logrus.SetLevel(logrus.DebugLevel)
 }
 
-/* Methods of OnvmPoll */
+/*********************************
+	Methods of OnvmPoll
+*********************************/
+// TODO: what parameters should Create need?
 func (onvmpoll *OnvmPoll) Create() Connection {
 	var conn Connection
 	for {
@@ -119,7 +139,7 @@ func (onvmpoll *OnvmPoll) RecvFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
 	for rxData := range nf_pkt_handler_chan {
-		conn_id := streamID_to_connID[rxData.transaction.streamID]
+		conn_id := fourTuple_to_connID[rxData.transaction.four_tuple]
 		conn := onvmpoll.conn_table[conn_id]
 		conn.rxchan <- rxData
 	}
@@ -133,6 +153,10 @@ func (onvmpoll *OnvmPoll) SendToONVM(id uint16, data TxChannelData) {
 }
 
 func (onvmpoll OnvmPoll) polling() {
+	// GoRoutint for receiving packet from pakcet handler
+	go onvmpoll.RecvFromONVM()
+
+	// Infinite loop checks ecah connection's state
 	for {
 		for conn_id, conn := range onvmpoll.conn_table {
 			if conn.state == CONN_READY_TO_SEND {
@@ -148,7 +172,62 @@ func (onvmpoll OnvmPoll) polling() {
 	}
 }
 
-/* Methods of Connection */
+/*********************************
+	Methods of OnvmAddr
+*********************************/
+func (oa OnvmAddr) Network() string {
+	return "onvm"
+}
+
+func (oa OnvmAddr) String() string {
+	s := fmt.Sprintf("Service ID: %2d, IP Address: %s, Port: %5d.")
+	return s
+}
+
+/*********************************
+	Methods of Connection
+*********************************/
+// Read implements the net.Conn Read method.
+func (connection *Connection) Read(b []byte) (n int, err error) {
+
+}
+
+// Write implements the net.Conn Write method.
+func (connection *Connection) Write(b []byte) (n int, err error) {
+
+}
+
+// Close implements the net.Conn Close method.
+func (connection *Connection) Close() error {
+	onvmpoll.Delete(connection.conn_id)
+	return nil
+}
+
+// LocalAddr implements the net.Conn LocalAddr method.
+func (connection Connection) LocalAddr() OnvmAddr {
+
+}
+
+// RemoteAddr implements the net.Conn RemoteAddr method.
+func (connection Connection) RemoteAddr() OnvmAddr {
+
+}
+
+// SetDeadline implements the net.Conn SetDeadline method.
+func (connection *Connection) SetDeadline(t time.Time) error {
+	return nil
+}
+
+// SetReadDeadline implements the net.Conn SetReadDeadline method.
+func (connection *Connection) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+// SetWriteDeadline implements the net.Conn SetWriteDeadline method.
+func (connection *Connection) SetWriteDeadline(t time.Time) error {
+	return nil
+}
+
 func (connection *Connection) Send(data HttpTransaction) {
 	txData := TxChannelData{transaction: data}
 	connection.txchan <- txData
@@ -167,12 +246,22 @@ func (connection *Connection) Recv() HttpTransaction {
 	return rxData.transaction
 }
 
-func (connection *Connection) Close() {
-	onvmpoll.Delete(connection.conn_id)
-}
-
-/* API for HTTP Server */
+/*********************************
+	API for HTTP Server
+*********************************/
 func CreateConnection() Connection {
 	conn := onvmpoll.Create()
 	return conn
+}
+
+func ListenONVM() (OnvmListner, error) {
+
+}
+
+func (ol OnvmListner) AcceptONVM() (Connection, error) {
+
+}
+
+func DialONVM(service_id uint8, ip_addr string, port uint16) (Connection, error) {
+
 }
