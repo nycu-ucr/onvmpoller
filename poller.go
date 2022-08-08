@@ -1,8 +1,10 @@
 package onvmpoller
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -16,9 +18,9 @@ const (
 	CONN_READY_TO_BOTH = 3
 	// For four_tuple
 	SRC_IP_ADDR_IDX = 0
-	SRC_IP_PORT_IDX = 1
+	SRC_PORT_IDX    = 1
 	DST_IP_ADDR_IDX = 2
-	DST_IP_PORT_IDX = 3
+	DST_PORT_IDX    = 3
 )
 
 type HttpTransaction struct {
@@ -44,12 +46,14 @@ type Connection struct {
 	four_tuple [4]string
 }
 
-type OnvmListner struct {
-	// TODO
+type OnvmListener struct {
+	laddr OnvmAddr   // Local Address
+	conn  Connection // This need to handle the incoming connection
 }
 
 type OnvmAddr struct {
 	srevice_id uint8 // Service ID of NF
+	network    string
 	ipv4_addr  string
 	port       uint16
 }
@@ -80,27 +84,37 @@ func init() {
 	logrus.SetLevel(logrus.DebugLevel)
 }
 
-/*********************************
-	Methods of OnvmPoll
-*********************************/
-// TODO: what parameters should Create need?
-func (onvmpoll *OnvmPoll) Create() Connection {
-	var conn Connection
+func GetConnID() uint16 {
+	// TODO: Perhaps there is a sync issue in here.
 	for {
 		if _, isExist := onvmpoll.conn_table[conn_id]; !isExist {
-			// Create a new connection with unique connection ID
-			conn.rxchan = make(chan RxChannelData)
-			conn.txchan = make(chan TxChannelData)
-			conn.conn_id = conn_id
-			conn.state = CONN_NULL
+			r := conn_id
 			conn_id++
-			logrus.Debug("Create a connection with ID: ", conn.conn_id)
-			break
+			return r
 		} else {
 			logrus.Info(conn_id, " ID is used.")
 			conn_id++
 		}
 	}
+}
+
+func AddEntryToTable(conn Connection) {
+	/* Add the connection to fourTuple_to_connID table */
+	fourTuple_to_connID[conn.four_tuple] = conn.conn_id
+}
+
+/*********************************
+	Methods of OnvmPoll
+*********************************/
+// TODO: what parameters should Create need?
+func (onvmpoll *OnvmPoll) Create() Connection {
+	// Create a new connection with unique connection ID
+	var conn Connection
+	conn.state = CONN_NULL
+	conn.rxchan = make(chan RxChannelData)
+	conn.txchan = make(chan TxChannelData)
+	conn.conn_id = GetConnID()
+
 	// Add the connection into the table
 	onvmpoll.conn_table[conn.conn_id] = conn
 
@@ -117,13 +131,15 @@ func (onvmpoll *OnvmPoll) Add(id uint16, conn Connection) bool {
 	return false
 }
 
-func (onvmpoll *OnvmPoll) Delete(id uint16) bool {
+func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 	if _, isExist := onvmpoll.conn_table[id]; !isExist {
-		logrus.Fatal(id, " is not exist")
-		return false
+		msg := fmt.Sprintf("This connID, %v, is not exist", id)
+		err := errors.New(msg)
+		logrus.Fatal(msg)
+		return err
 	}
 	delete(onvmpoll.conn_table, id)
-	return true
+	return nil
 }
 
 func (onvmpoll OnvmPoll) String() string {
@@ -176,11 +192,11 @@ func (onvmpoll OnvmPoll) polling() {
 	Methods of OnvmAddr
 *********************************/
 func (oa OnvmAddr) Network() string {
-	return "onvm"
+	return oa.network
 }
 
 func (oa OnvmAddr) String() string {
-	s := fmt.Sprintf("Service ID: %2d, IP Address: %s, Port: %5d.")
+	s := fmt.Sprintf("Network: %s, Service ID: %2d, IP Address: %s, Port: %5d.")
 	return s
 }
 
@@ -199,18 +215,32 @@ func (connection *Connection) Write(b []byte) (n int, err error) {
 
 // Close implements the net.Conn Close method.
 func (connection *Connection) Close() error {
-	onvmpoll.Delete(connection.conn_id)
-	return nil
+	err := onvmpoll.Delete(connection.conn_id)
+	return err
 }
 
 // LocalAddr implements the net.Conn LocalAddr method.
 func (connection Connection) LocalAddr() OnvmAddr {
+	var oa OnvmAddr
+	v, _ := strconv.ParseUint(connection.four_tuple[SRC_PORT_IDX], 10, 64)
+	oa.ipv4_addr = connection.four_tuple[SRC_IP_ADDR_IDX]
+	oa.port = uint16(v)
+	oa.network = "onvm"
+	//oa.srevice_id = TODO
 
+	return oa
 }
 
 // RemoteAddr implements the net.Conn RemoteAddr method.
 func (connection Connection) RemoteAddr() OnvmAddr {
+	var oa OnvmAddr
+	v, _ := strconv.ParseUint(connection.four_tuple[DST_PORT_IDX], 10, 64)
+	oa.ipv4_addr = connection.four_tuple[DST_IP_ADDR_IDX]
+	oa.port = uint16(v)
+	oa.network = "onvm"
+	//oa.srevice_id = TODO
 
+	return oa
 }
 
 // SetDeadline implements the net.Conn SetDeadline method.
@@ -247,6 +277,34 @@ func (connection *Connection) Recv() HttpTransaction {
 }
 
 /*********************************
+	Methods of OnvmListner
+*********************************/
+
+func (ol OnvmListener) Accept() (Connection, error) {
+	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
+	// Create a new connection
+	new_conn := onvmpoll.Create()
+	new_conn.four_tuple[SRC_IP_ADDR_IDX] = ol.laddr.ipv4_addr
+	new_conn.four_tuple[SRC_PORT_IDX] = string(ol.laddr.port)
+	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.transaction.four_tuple[SRC_IP_ADDR_IDX]
+	new_conn.four_tuple[DST_PORT_IDX] = rx_data.transaction.four_tuple[SRC_PORT_IDX]
+	// Add the connection to table
+	AddEntryToTable(new_conn)
+	// TODO: Should we send the ACK back to client?
+
+	return new_conn, nil
+}
+
+func (ol OnvmListener) Close() error {
+	err := ol.conn.Close()
+	return err
+}
+
+func (ol OnvmListener) Addr() OnvmAddr {
+	return ol.laddr
+}
+
+/*********************************
 	API for HTTP Server
 *********************************/
 func CreateConnection() Connection {
@@ -254,12 +312,24 @@ func CreateConnection() Connection {
 	return conn
 }
 
-func ListenONVM() (OnvmListner, error) {
+func ListenONVM(network, address string) (OnvmListener, error) {
+	var ol OnvmListener
+	if network != "onvm" {
+		err := errors.New(fmt.Sprintf("Unsppourt network type: %v", network))
+		return ol, err
+	}
+	addr := strings.Split(address, ":")
+	v, _ := strconv.ParseUint(addr[1], 10, 64)
+	ip_addr, port := addr[0], uint16(v)
 
-}
+	/* Initialize OnvmListener */
+	ol.conn = onvmpoll.Create()
+	ol.laddr.port = port
+	ol.laddr.network = network
+	ol.laddr.ipv4_addr = ip_addr
+	// ol.laddr.srevice_id = TODO
 
-func (ol OnvmListner) AcceptONVM() (Connection, error) {
-
+	return ol, nil
 }
 
 func DialONVM(service_id uint8, ip_addr string, port uint16) (Connection, error) {
