@@ -3,11 +3,14 @@ package onvmpoller
 import (
 	"errors"
 	"fmt"
+	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sirupsen/logrus"
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -22,6 +25,14 @@ const (
 	DST_IP_ADDR_IDX = 2
 	DST_PORT_IDX    = 3
 )
+
+type Config struct {
+	// Map the IP address to Service ID
+	IPIDMap []struct {
+		IP string `yaml:"IP"`
+		ID int32  `yaml:"ID"`
+	} `yaml:"IPIDMap"`
+}
 
 type HttpTransaction struct {
 	four_tuple  [4]string
@@ -65,6 +76,7 @@ type OnvmPoll struct {
 
 /* Global Variables */
 var (
+	config              Config
 	conn_id             uint16
 	onvmpoll            OnvmPoll
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
@@ -73,6 +85,7 @@ var (
 
 func init() {
 	/* Initialize Global Variable */
+	InitConfig()
 	conn_id = 0
 	onvmpoll.conn_table = make(map[uint16]Connection)
 	onvmpoll.ready_list = make([]uint16, 0)
@@ -82,6 +95,25 @@ func init() {
 	/* Setup Logger */
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 	logrus.SetLevel(logrus.DebugLevel)
+}
+
+func InitConfig() {
+	// Get absolute file name of ipid.yaml
+	var ipid_fname string
+	if dir, err := os.Getwd(); err != nil {
+		ipid_fname = "./ipid.yaml"
+	} else {
+		ipid_fname = dir + "/ipid.yaml"
+	}
+
+	// Read and decode the yaml content
+	if yaml_content, err := ioutil.ReadFile(ipid_fname); err != nil {
+		panic(err)
+	} else {
+		if unMarshalErr := yaml.Unmarshal(yaml_content, &config); unMarshalErr != nil {
+			panic(unMarshalErr)
+		}
+	}
 }
 
 func GetConnID() uint16 {
@@ -101,6 +133,20 @@ func GetConnID() uint16 {
 func AddEntryToTable(conn Connection) {
 	/* Add the connection to fourTuple_to_connID table */
 	fourTuple_to_connID[conn.four_tuple] = conn.conn_id
+}
+
+func IpToID(ip string) (id int32, err error) {
+	id = -1
+	for i := range config.IPIDMap {
+		if config.IPIDMap[i].IP == ip {
+			id = int32(config.IPIDMap[i].ID)
+			break
+		}
+	}
+	if id == -1 {
+		err = fmt.Errorf("no match id")
+	}
+	return
 }
 
 /*********************************
@@ -145,7 +191,7 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 func (onvmpoll OnvmPoll) String() string {
 	result := "OnvmPoll has following connections:\n"
 	for key, _ := range onvmpoll.conn_table {
-		result += "\tConnection ID: " + strconv.Itoa(int(key)) + "\n"
+		result += fmt.Sprintf("\tConnection ID: %d\n", key)
 	}
 
 	return result
@@ -168,6 +214,7 @@ func (onvmpoll *OnvmPoll) SendToONVM(id uint16, data TxChannelData) {
 
 }
 
+// TODO: Check logic
 func (onvmpoll OnvmPoll) polling() {
 	// GoRoutint for receiving packet from pakcet handler
 	go onvmpoll.RecvFromONVM()
