@@ -167,6 +167,19 @@ func AddEntryToTable(conn Connection) {
 	fourTuple_to_connID[conn.four_tuple] = conn.conn_id
 }
 
+func DeleteEntryFromTable(conn Connection) error {
+	/* Delete the connection from fourTuple_to_connID table */
+	if _, isExist := fourTuple_to_connID[conn.four_tuple]; !isExist {
+		msg := fmt.Sprintf("Delete connection from fourTuple_to_connID fail, %v is not exsit", conn.four_tuple)
+		err := errors.New(msg)
+		logrus.Fatal(msg)
+		return err
+	}
+	delete(fourTuple_to_connID, conn.four_tuple)
+
+	return nil
+}
+
 func IpToID(ip string) (id int32, err error) {
 	id = -1
 	for i := range config.IPIDMap {
@@ -234,7 +247,11 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 		logrus.Fatal(msg)
 		return err
 	}
+
+	conn := onvmpoll.conn_table[id]
+	DeleteEntryFromTable(conn)
 	delete(onvmpoll.conn_table, id)
+
 	return nil
 }
 
@@ -293,7 +310,7 @@ func (oa OnvmAddr) Network() string {
 }
 
 func (oa OnvmAddr) String() string {
-	s := fmt.Sprintf("Network: %s, Service ID: %2d, IP Address: %s, Port: %5d.")
+	s := fmt.Sprintf("Network: %s, Service ID: %2d, IP Address: %s, Port: %5d.", oa.network, oa.srevice_id, oa.ipv4_addr, oa.port)
 	return s
 }
 
@@ -301,13 +318,42 @@ func (oa OnvmAddr) String() string {
 	Methods of Connection
 *********************************/
 // Read implements the net.Conn Read method.
-func (connection *Connection) Read(b []byte) (n int, err error) {
+func (connection *Connection) Read(b []byte) (int, error) {
+	// Receive packet from onvmpoller
+	if connection.state == CONN_READY_TO_SEND {
+		connection.state = CONN_READY_TO_BOTH
+	} else {
+		connection.state = CONN_READY_TO_RECV
+	}
+	rx_data := <-connection.rxchan
 
+	// Get response
+	copy(b, rx_data.transaction.http_packet)
+
+	return len(b), nil
 }
 
 // Write implements the net.Conn Write method.
-func (connection *Connection) Write(b []byte) (n int, err error) {
+func (connection *Connection) Write(b []byte) (int, error) {
+	// Encapsulate buffer into HttpTransaction
+	var ht HttpTransaction
+	ht.four_tuple = connection.four_tuple
+	copy(ht.http_packet, b)
 
+	// Encapuslate HttpTransaction into TxChannelData
+	var tx_data TxChannelData
+	tx_data.transaction = ht
+
+	// Send packet to onvmpoller via channel
+	connection.txchan <- tx_data
+
+	if connection.state == CONN_READY_TO_RECV {
+		connection.state = CONN_READY_TO_BOTH
+	} else {
+		connection.state = CONN_READY_TO_SEND
+	}
+
+	return len(b), nil
 }
 
 // Close implements the net.Conn Close method.
@@ -355,24 +401,6 @@ func (connection *Connection) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
-func (connection *Connection) Send(data HttpTransaction) {
-	txData := TxChannelData{transaction: data}
-	connection.txchan <- txData
-
-	if connection.state == CONN_READY_TO_RECV {
-		connection.state = CONN_READY_TO_BOTH
-	} else {
-		connection.state = CONN_READY_TO_SEND
-	}
-}
-
-func (connection *Connection) Recv() HttpTransaction {
-	connection.state = CONN_READY_TO_RECV
-	rxData := <-connection.rxchan
-
-	return rxData.transaction
-}
-
 /*********************************
 	Methods of OnvmListner
 *********************************/
@@ -382,7 +410,7 @@ func (ol OnvmListener) Accept() (Connection, error) {
 
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
 
-	if bytes.Compare([]byte("SYN"), rx_data.transaction.http_packet) != 0 {
+	if !bytes.Equal([]byte("SYN"), rx_data.transaction.http_packet) {
 		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.transaction.http_packet)
 		err := errors.New(msg)
 		logrus.Fatal(msg)
@@ -392,7 +420,7 @@ func (ol OnvmListener) Accept() (Connection, error) {
 	// Initialize the new connection
 	new_conn = onvmpoll.Create()
 	new_conn.four_tuple[SRC_IP_ADDR_IDX] = ol.laddr.ipv4_addr
-	new_conn.four_tuple[SRC_PORT_IDX] = string(ol.laddr.port)
+	new_conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(ol.laddr.port)
 	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.transaction.four_tuple[SRC_IP_ADDR_IDX]
 	new_conn.four_tuple[DST_PORT_IDX] = rx_data.transaction.four_tuple[SRC_PORT_IDX]
 
@@ -432,7 +460,8 @@ func CreateConnection() Connection {
 func ListenONVM(network, address string) (OnvmListener, error) {
 	var ol OnvmListener
 	if network != "onvm" {
-		err := errors.New(fmt.Sprintf("Unsppourt network type: %v", network))
+		msg := fmt.Sprintf("Unsppourt network type: %v", network)
+		err := errors.New(msg)
 		return ol, err
 	}
 	ip_addr, port := ParseAddress(address)
@@ -440,7 +469,7 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 	/* Initialize OnvmListener */
 	ol.conn = onvmpoll.Create()
 	ol.conn.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
-	ol.conn.four_tuple[SRC_PORT_IDX] = string(port)
+	ol.conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(port)
 	ol.laddr.port = port
 	ol.laddr.network = network
 	ol.laddr.ipv4_addr = ip_addr
@@ -455,9 +484,9 @@ func DialONVM(network, address string) (Connection, error) {
 	// Initialize a connection
 	conn := onvmpoll.Create()
 	// conn.four_tuple[SRC_IP_ADDR_IDX] = TODO
-	conn.four_tuple[SRC_PORT_IDX] = string(GetUnusedPort())
+	conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(GetUnusedPort())
 	conn.four_tuple[DST_IP_ADDR_IDX] = ip_addr
-	conn.four_tuple[DST_PORT_IDX] = string(port)
+	conn.four_tuple[DST_PORT_IDX] = fmt.Sprint(port)
 
 	// Send connection request to server
 	var conn_request, conn_response []byte
@@ -469,6 +498,9 @@ func DialONVM(network, address string) (Connection, error) {
 		return conn, err
 	}
 
+	// Add the connection to table, otherwise it can't receive response
+	AddEntryToTable(conn)
+
 	// Wait for response
 	_, err = conn.Read(conn_response)
 	if err != nil {
@@ -476,9 +508,6 @@ func DialONVM(network, address string) (Connection, error) {
 		conn.Close()
 		return conn, err
 	}
-
-	// Establish connection sucessfully, Add the connection to table
-	AddEntryToTable(conn)
 
 	return conn, nil
 }
