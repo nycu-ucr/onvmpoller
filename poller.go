@@ -1,9 +1,11 @@
 package onvmpoller
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"os"
 	"strconv"
 	"strings"
@@ -48,11 +50,9 @@ type TxChannelData struct {
 }
 
 type Connection struct {
+	conn_id    uint16
 	rxchan     chan (RxChannelData)
 	txchan     chan (TxChannelData)
-	src_nf     uint8 // Source NF Service ID
-	dst_nf     uint8 // Destination NF Service ID
-	conn_id    uint16
 	state      uint8
 	four_tuple [4]string
 }
@@ -79,6 +79,7 @@ var (
 	config              Config
 	conn_id             uint16
 	onvmpoll            OnvmPoll
+	port_poll           map[uint16]bool      // The ports range from 49152 to 65535
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
 	fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 )
@@ -87,6 +88,7 @@ func init() {
 	/* Initialize Global Variable */
 	InitConfig()
 	conn_id = 0
+	port_poll = make(map[uint16]bool)
 	onvmpoll.conn_table = make(map[uint16]Connection)
 	onvmpoll.ready_list = make([]uint16, 0)
 	nf_pkt_handler_chan = make(chan RxChannelData)
@@ -130,6 +132,36 @@ func GetConnID() uint16 {
 	}
 }
 
+func GetUnusedPort() uint16 {
+	var base int32 = 49152
+	var upper_limit int32 = 65536 - base
+	var port uint16
+
+	for {
+		n := rand.Int31n(upper_limit)
+		port = uint16(base + n)
+		if _, isExist := port_poll[port]; !isExist {
+			port_poll[port] = true
+			break
+		} else {
+			continue
+		}
+	}
+
+	return port
+}
+
+func DeletePort(port uint16) error {
+	if _, isExist := port_poll[port]; !isExist {
+		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
+		err := errors.New(msg)
+		logrus.Fatal(msg)
+		return err
+	}
+	delete(port_poll, port)
+	return nil
+}
+
 func AddEntryToTable(conn Connection) {
 	/* Add the connection to fourTuple_to_connID table */
 	fourTuple_to_connID[conn.four_tuple] = conn.conn_id
@@ -147,6 +179,24 @@ func IpToID(ip string) (id int32, err error) {
 		err = fmt.Errorf("no match id")
 	}
 	return
+}
+
+func ParseAddress(address string) (string, uint16) {
+	addr := strings.Split(address, ":")
+	v, _ := strconv.ParseUint(addr[1], 10, 64)
+	ip_addr, port := addr[0], uint16(v)
+
+	return ip_addr, port
+}
+
+func MakeConnectionRequest(buf []byte) {
+	req := []byte("SYN")
+	copy(buf, req)
+}
+
+func MakeConnectionResponse(buf []byte) {
+	res := []byte("ACK")
+	copy(buf, res)
 }
 
 /*********************************
@@ -328,16 +378,36 @@ func (connection *Connection) Recv() HttpTransaction {
 *********************************/
 
 func (ol OnvmListener) Accept() (Connection, error) {
+	var new_conn Connection
+
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
-	// Create a new connection
-	new_conn := onvmpoll.Create()
+
+	if bytes.Compare([]byte("SYN"), rx_data.transaction.http_packet) != 0 {
+		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.transaction.http_packet)
+		err := errors.New(msg)
+		logrus.Fatal(msg)
+		return new_conn, err
+	}
+
+	// Initialize the new connection
+	new_conn = onvmpoll.Create()
 	new_conn.four_tuple[SRC_IP_ADDR_IDX] = ol.laddr.ipv4_addr
 	new_conn.four_tuple[SRC_PORT_IDX] = string(ol.laddr.port)
 	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.transaction.four_tuple[SRC_IP_ADDR_IDX]
 	new_conn.four_tuple[DST_PORT_IDX] = rx_data.transaction.four_tuple[SRC_PORT_IDX]
+
+	// Send ACK back to client
+	var conn_response []byte
+	MakeConnectionResponse(conn_response)
+	_, err := new_conn.Write(conn_response)
+	if err != nil {
+		logrus.Fatal(err.Error())
+		new_conn.Close()
+		return new_conn, err
+	}
+
 	// Add the connection to table
 	AddEntryToTable(new_conn)
-	// TODO: Should we send the ACK back to client?
 
 	return new_conn, nil
 }
@@ -365,12 +435,12 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 		err := errors.New(fmt.Sprintf("Unsppourt network type: %v", network))
 		return ol, err
 	}
-	addr := strings.Split(address, ":")
-	v, _ := strconv.ParseUint(addr[1], 10, 64)
-	ip_addr, port := addr[0], uint16(v)
+	ip_addr, port := ParseAddress(address)
 
 	/* Initialize OnvmListener */
 	ol.conn = onvmpoll.Create()
+	ol.conn.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
+	ol.conn.four_tuple[SRC_PORT_IDX] = string(port)
 	ol.laddr.port = port
 	ol.laddr.network = network
 	ol.laddr.ipv4_addr = ip_addr
@@ -379,6 +449,36 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 	return ol, nil
 }
 
-func DialONVM(service_id uint8, ip_addr string, port uint16) (Connection, error) {
+func DialONVM(network, address string) (Connection, error) {
+	ip_addr, port := ParseAddress(address)
 
+	// Initialize a connection
+	conn := onvmpoll.Create()
+	// conn.four_tuple[SRC_IP_ADDR_IDX] = TODO
+	conn.four_tuple[SRC_PORT_IDX] = string(GetUnusedPort())
+	conn.four_tuple[DST_IP_ADDR_IDX] = ip_addr
+	conn.four_tuple[DST_PORT_IDX] = string(port)
+
+	// Send connection request to server
+	var conn_request, conn_response []byte
+	MakeConnectionRequest(conn_request)
+	_, err := conn.Write(conn_request)
+	if err != nil {
+		logrus.Fatal(err.Error())
+		conn.Close()
+		return conn, err
+	}
+
+	// Wait for response
+	_, err = conn.Read(conn_response)
+	if err != nil {
+		logrus.Fatal(err.Error())
+		conn.Close()
+		return conn, err
+	}
+
+	// Establish connection sucessfully, Add the connection to table
+	AddEntryToTable(conn)
+
+	return conn, nil
 }
