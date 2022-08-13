@@ -37,8 +37,8 @@ type Config struct {
 }
 
 type HttpTransaction struct {
-	four_tuple  [4]string
-	http_packet []byte
+	four_tuple   [4]string
+	http_message []byte // Request or Response
 }
 
 type RxChannelData struct {
@@ -120,16 +120,20 @@ func InitConfig() {
 
 func GetConnID() uint16 {
 	// TODO: Perhaps there is a sync issue in here.
+	// TODO: Reserve conn_id = 0 to listener
+	var result uint16
 	for {
 		if _, isExist := onvmpoll.conn_table[conn_id]; !isExist {
-			r := conn_id
+			result = conn_id
 			conn_id++
-			return r
+			break
 		} else {
 			logrus.Info(conn_id, " ID is used.")
 			conn_id++
 		}
 	}
+
+	return result
 }
 
 func GetUnusedPort() uint16 {
@@ -162,9 +166,21 @@ func DeletePort(port uint16) error {
 	return nil
 }
 
-func AddEntryToTable(conn Connection) {
+func AddEntryToTable(caller string, conn Connection) {
 	/* Add the connection to fourTuple_to_connID table */
-	fourTuple_to_connID[conn.four_tuple] = conn.conn_id
+	var four_tuple [4]string
+
+	// If it is invoked by dialONVM, it should swap SRC and DST.
+	if caller == "dial" {
+		four_tuple[SRC_IP_ADDR_IDX] = conn.four_tuple[DST_IP_ADDR_IDX]
+		four_tuple[SRC_PORT_IDX] = conn.four_tuple[DST_PORT_IDX]
+		four_tuple[DST_IP_ADDR_IDX] = conn.four_tuple[SRC_IP_ADDR_IDX]
+		four_tuple[DST_PORT_IDX] = conn.four_tuple[SRC_PORT_IDX]
+	} else {
+		four_tuple = conn.four_tuple
+	}
+
+	fourTuple_to_connID[four_tuple] = conn.conn_id
 }
 
 func DeleteEntryFromTable(conn Connection) error {
@@ -264,42 +280,50 @@ func (onvmpoll OnvmPoll) String() string {
 	return result
 }
 
-func (onvmpoll *OnvmPoll) RecvFromONVM() {
+func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
 	for rxData := range nf_pkt_handler_chan {
-		conn_id := fourTuple_to_connID[rxData.transaction.four_tuple]
-		conn := onvmpoll.conn_table[conn_id]
-		conn.rxchan <- rxData
+		conn_id, isExist := fourTuple_to_connID[rxData.transaction.four_tuple]
+		if isExist {
+			conn := onvmpoll.conn_table[conn_id]
+			conn.rxchan <- rxData
+		} else {
+			// Deliver to litsener's connection
+			conn := onvmpoll.conn_table[0]
+			conn.rxchan <- rxData
+		}
 	}
 }
 
-func (onvmpoll *OnvmPoll) SendToONVM(id uint16, data TxChannelData) {
+func (onvmpoll *OnvmPoll) WriteToONVM(conn_id uint16, data TxChannelData) {
 	// conn := onvmpoll.conn_table[id]
 
 	// TODO: Use CGO to call functions of NFLib
 
 }
 
-// TODO: Check logic
-func (onvmpoll OnvmPoll) polling() {
-	// GoRoutint for receiving packet from pakcet handler
-	go onvmpoll.RecvFromONVM()
-
+func (onvmpoll OnvmPoll) Polling() {
 	// Infinite loop checks ecah connection's state
 	for {
 		for conn_id, conn := range onvmpoll.conn_table {
 			if conn.state == CONN_READY_TO_SEND {
 				txData := <-conn.txchan
-				onvmpoll.SendToONVM(conn_id, txData)
+				onvmpoll.WriteToONVM(conn_id, txData)
 				conn.state = CONN_NULL
 			} else if conn.state == CONN_READY_TO_BOTH {
 				txData := <-conn.txchan
-				onvmpoll.SendToONVM(conn_id, txData)
+				onvmpoll.WriteToONVM(conn_id, txData)
 				conn.state = CONN_READY_TO_RECV
 			}
 		}
 	}
+}
+
+func (onvmpoll OnvmPoll) Run() {
+	// GoRoutine for receiving packet from pakcet handler
+	go onvmpoll.ReadFromONVM()
+	go onvmpoll.Polling()
 }
 
 /*********************************
@@ -328,7 +352,7 @@ func (connection *Connection) Read(b []byte) (int, error) {
 	rx_data := <-connection.rxchan
 
 	// Get response
-	copy(b, rx_data.transaction.http_packet)
+	copy(b, rx_data.transaction.http_message)
 
 	return len(b), nil
 }
@@ -338,7 +362,7 @@ func (connection *Connection) Write(b []byte) (int, error) {
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
 	ht.four_tuple = connection.four_tuple
-	copy(ht.http_packet, b)
+	copy(ht.http_message, b)
 
 	// Encapuslate HttpTransaction into TxChannelData
 	var tx_data TxChannelData
@@ -369,7 +393,8 @@ func (connection Connection) LocalAddr() OnvmAddr {
 	oa.ipv4_addr = connection.four_tuple[SRC_IP_ADDR_IDX]
 	oa.port = uint16(v)
 	oa.network = "onvm"
-	//oa.srevice_id = TODO
+	id, _ := IpToID(oa.ipv4_addr)
+	oa.srevice_id = uint8(id)
 
 	return oa
 }
@@ -381,7 +406,8 @@ func (connection Connection) RemoteAddr() OnvmAddr {
 	oa.ipv4_addr = connection.four_tuple[DST_IP_ADDR_IDX]
 	oa.port = uint16(v)
 	oa.network = "onvm"
-	//oa.srevice_id = TODO
+	id, _ := IpToID(oa.ipv4_addr)
+	oa.srevice_id = uint8(id)
 
 	return oa
 }
@@ -410,8 +436,8 @@ func (ol OnvmListener) Accept() (Connection, error) {
 
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
 
-	if !bytes.Equal([]byte("SYN"), rx_data.transaction.http_packet) {
-		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.transaction.http_packet)
+	if !bytes.Equal([]byte("SYN"), rx_data.transaction.http_message) {
+		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.transaction.http_message)
 		err := errors.New(msg)
 		logrus.Fatal(msg)
 		return new_conn, err
@@ -435,7 +461,7 @@ func (ol OnvmListener) Accept() (Connection, error) {
 	}
 
 	// Add the connection to table
-	AddEntryToTable(new_conn)
+	AddEntryToTable("accept", new_conn)
 
 	return new_conn, nil
 }
@@ -467,13 +493,15 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 	ip_addr, port := ParseAddress(address)
 
 	/* Initialize OnvmListener */
+	id, _ := IpToID(ip_addr)
+
 	ol.conn = onvmpoll.Create()
 	ol.conn.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
 	ol.conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(port)
 	ol.laddr.port = port
 	ol.laddr.network = network
 	ol.laddr.ipv4_addr = ip_addr
-	// ol.laddr.srevice_id = TODO
+	ol.laddr.srevice_id = uint8(id)
 
 	return ol, nil
 }
@@ -499,7 +527,7 @@ func DialONVM(network, address string) (Connection, error) {
 	}
 
 	// Add the connection to table, otherwise it can't receive response
-	AddEntryToTable(conn)
+	AddEntryToTable("dial", conn)
 
 	// Wait for response
 	_, err = conn.Read(conn_response)
