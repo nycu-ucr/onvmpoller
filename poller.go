@@ -23,11 +23,6 @@ import (
 )
 
 const (
-	// For Connection.state
-	CONN_NULL          = 0
-	CONN_READY_TO_SEND = 1
-	CONN_READY_TO_RECV = 2
-	CONN_READY_TO_BOTH = 3
 	// For four_tuple
 	SRC_IP_ADDR_IDX = 0
 	SRC_PORT_IDX    = 1
@@ -62,7 +57,6 @@ type Connection struct {
 	conn_id    uint16
 	rxchan     chan (RxChannelData)
 	txchan     chan (TxChannelData)
-	state      uint8
 	four_tuple [4]string
 }
 
@@ -88,7 +82,7 @@ var (
 	config              Config
 	conn_id             uint16
 	onvmpoll            OnvmPoll
-	port_poll           map[uint16]bool      // The ports range from 49152 to 65535
+	port_pool           map[uint16]bool      // The ports range from 49152 to 65535
 	local_address       string               // Initialize at ListenONVM
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
 	fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
@@ -99,7 +93,7 @@ func init() {
 	/* Initialize Global Variable */
 	InitConfig()
 	conn_id = 0
-	port_poll = make(map[uint16]bool)
+	port_pool = make(map[uint16]bool)
 	onvmpoll.conn_table = make(map[uint16]Connection)
 	onvmpoll.ready_list = make([]uint16, 0)
 	nf_pkt_handler_chan = make(chan RxChannelData, 5)
@@ -141,6 +135,7 @@ func GetConnID() uint16 {
 	for {
 		// Reserve conn_id = 0 to listener
 		if conn_id == LISTENER_CONN_ID {
+			conn_id++
 			continue
 		}
 
@@ -165,8 +160,8 @@ func GetUnusedPort() uint16 {
 	for {
 		n := rand.Int31n(upper_limit)
 		port = uint16(base + n)
-		if _, isExist := port_poll[port]; !isExist {
-			port_poll[port] = true
+		if _, isExist := port_pool[port]; !isExist {
+			port_pool[port] = true
 			break
 		} else {
 			continue
@@ -177,17 +172,17 @@ func GetUnusedPort() uint16 {
 }
 
 func DeletePort(port uint16) error {
-	if _, isExist := port_poll[port]; !isExist {
+	if _, isExist := port_pool[port]; !isExist {
 		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
 		err := errors.New(msg)
 		logrus.Fatal(msg)
 		return err
 	}
-	delete(port_poll, port)
+	delete(port_pool, port)
 	return nil
 }
 
-func AddEntryToTable(caller string, conn Connection) {
+func AddEntryToTable(caller string, conn *Connection) {
 	/* Add the connection to fourTuple_to_connID table */
 	var four_tuple [4]string
 
@@ -204,7 +199,7 @@ func AddEntryToTable(caller string, conn Connection) {
 	fourTuple_to_connID[four_tuple] = conn.conn_id
 }
 
-func DeleteEntryFromTable(conn Connection) error {
+func DeleteEntryFromTable(conn *Connection) error {
 	/* Delete the connection from fourTuple_to_connID table */
 	if _, isExist := fourTuple_to_connID[conn.four_tuple]; !isExist {
 		msg := fmt.Sprintf("Delete connection from fourTuple_to_connID fail, %v is not exsit", conn.four_tuple)
@@ -282,7 +277,6 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 func (onvmpoll *OnvmPoll) Create() Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
-	conn.state = CONN_NULL
 	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
 	conn.txchan = make(chan TxChannelData, 1) // For non-blocking
 	conn.conn_id = GetConnID()
@@ -307,7 +301,7 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 	}
 
 	conn := onvmpoll.conn_table[id]
-	DeleteEntryFromTable(conn)
+	DeleteEntryFromTable(&conn)
 	delete(onvmpoll.conn_table, id)
 
 	return nil
@@ -340,7 +334,8 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 
 func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 	// Get destination NF ID
-	dst_id := C.int(IpToID(conn.four_tuple[DST_IP_ADDR_IDX]))
+	id, _ := IpToID(conn.four_tuple[DST_IP_ADDR_IDX])
+	dst_id := C.int(id)
 
 	// Translate Go structure to C char *
 	var buffer []byte
@@ -356,17 +351,12 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 }
 
 func (onvmpoll OnvmPoll) Polling() {
-	// Infinite loop checks ecah connection's state
+	// The infinite loop checks each connection for unsent data
 	for {
 		for _, conn := range onvmpoll.conn_table {
-			if conn.state == CONN_READY_TO_SEND {
-				txData := <-conn.txchan
+			select {
+			case txData := <-conn.txchan:
 				onvmpoll.WriteToONVM(&conn, txData)
-				conn.state = CONN_NULL
-			} else if conn.state == CONN_READY_TO_BOTH {
-				txData := <-conn.txchan
-				onvmpoll.WriteToONVM(&conn, txData)
-				conn.state = CONN_READY_TO_RECV
 			}
 		}
 	}
@@ -394,13 +384,8 @@ func (oa OnvmAddr) String() string {
 	Methods of Connection
 *********************************/
 // Read implements the net.Conn Read method.
-func (connection *Connection) Read(b []byte) (int, error) {
+func (connection Connection) Read(b []byte) (int, error) {
 	// Receive packet from onvmpoller
-	if connection.state == CONN_READY_TO_SEND {
-		connection.state = CONN_READY_TO_BOTH
-	} else {
-		connection.state = CONN_READY_TO_RECV
-	}
 	rx_data := <-connection.rxchan
 
 	// Get response
@@ -410,7 +395,7 @@ func (connection *Connection) Read(b []byte) (int, error) {
 }
 
 // Write implements the net.Conn Write method.
-func (connection *Connection) Write(b []byte) (int, error) {
+func (connection Connection) Write(b []byte) (int, error) {
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
 	ht.four_tuple = connection.four_tuple
@@ -420,12 +405,6 @@ func (connection *Connection) Write(b []byte) (int, error) {
 	var tx_data TxChannelData
 	tx_data.transaction = ht
 
-	if connection.state == CONN_READY_TO_RECV {
-		connection.state = CONN_READY_TO_BOTH
-	} else {
-		connection.state = CONN_READY_TO_SEND
-	}
-
 	// Send packet to onvmpoller via channel
 	connection.txchan <- tx_data
 
@@ -433,7 +412,7 @@ func (connection *Connection) Write(b []byte) (int, error) {
 }
 
 // Close implements the net.Conn Close method.
-func (connection *Connection) Close() error {
+func (connection Connection) Close() error {
 	err := onvmpoll.Delete(connection.conn_id)
 	return err
 }
@@ -465,17 +444,17 @@ func (connection Connection) RemoteAddr() OnvmAddr {
 }
 
 // SetDeadline implements the net.Conn SetDeadline method.
-func (connection *Connection) SetDeadline(t time.Time) error {
+func (connection Connection) SetDeadline(t time.Time) error {
 	return nil
 }
 
 // SetReadDeadline implements the net.Conn SetReadDeadline method.
-func (connection *Connection) SetReadDeadline(t time.Time) error {
+func (connection Connection) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
 // SetWriteDeadline implements the net.Conn SetWriteDeadline method.
-func (connection *Connection) SetWriteDeadline(t time.Time) error {
+func (connection Connection) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
@@ -513,7 +492,7 @@ func (ol OnvmListener) Accept() (Connection, error) {
 	}
 
 	// Add the connection to table
-	AddEntryToTable("accept", new_conn)
+	AddEntryToTable("accept", &new_conn)
 
 	return new_conn, nil
 }
@@ -548,7 +527,6 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 	/* Initialize OnvmListener */
 	id, _ := IpToID(ip_addr)
 	var conn Connection
-	conn.state = CONN_NULL
 	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
 	conn.txchan = make(chan TxChannelData, 1) // For non-blocking
 	conn.conn_id = LISTENER_CONN_ID
@@ -587,7 +565,7 @@ func DialONVM(network, address string) (Connection, error) {
 	}
 
 	// Add the connection to table, otherwise it can't receive response
-	AddEntryToTable("dial", conn)
+	AddEntryToTable("dial", &conn)
 
 	// Wait for response
 	_, err = conn.Read(conn_response)
