@@ -1,7 +1,14 @@
 package onvmpoller
 
+/*
+extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx);
+extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buff, int buff_length);
+*/
+import "C"
+
 import (
 	"bytes"
+	"encoding/gob"
 	"errors"
 	"fmt"
 	"io/ioutil"
@@ -26,6 +33,8 @@ const (
 	SRC_PORT_IDX    = 1
 	DST_IP_ADDR_IDX = 2
 	DST_PORT_IDX    = 3
+	// For connection ID
+	LISTENER_CONN_ID = 0
 )
 
 type Config struct {
@@ -80,8 +89,10 @@ var (
 	conn_id             uint16
 	onvmpoll            OnvmPoll
 	port_poll           map[uint16]bool      // The ports range from 49152 to 65535
+	local_address       string               // Initialize at ListenONVM
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
 	fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
+	nf_ctx              *C.struct_onvm_nf_local_ctx
 )
 
 func init() {
@@ -91,12 +102,18 @@ func init() {
 	port_poll = make(map[uint16]bool)
 	onvmpoll.conn_table = make(map[uint16]Connection)
 	onvmpoll.ready_list = make([]uint16, 0)
-	nf_pkt_handler_chan = make(chan RxChannelData)
+	nf_pkt_handler_chan = make(chan RxChannelData, 5)
 	fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 	logrus.SetLevel(logrus.DebugLevel)
+
+	/* Initialize NF context */
+	C.onvm_init(&nf_ctx)
+
+	/* Run onvmpoller */
+	onvmpoll.Run()
 }
 
 func InitConfig() {
@@ -120,9 +137,13 @@ func InitConfig() {
 
 func GetConnID() uint16 {
 	// TODO: Perhaps there is a sync issue in here.
-	// TODO: Reserve conn_id = 0 to listener
 	var result uint16
 	for {
+		// Reserve conn_id = 0 to listener
+		if conn_id == LISTENER_CONN_ID {
+			continue
+		}
+
 		if _, isExist := onvmpoll.conn_table[conn_id]; !isExist {
 			result = conn_id
 			conn_id++
@@ -228,32 +249,53 @@ func MakeConnectionResponse(buf []byte) {
 	copy(buf, res)
 }
 
+func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
+	// Encode TxChannelData to bytes
+	var buf bytes.Buffer
+
+	enc := gob.NewEncoder(&buf)
+	err := enc.Encode(tx_data)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	return buf.Bytes()
+}
+
+func DecodeToRxChannelData(buf []byte) RxChannelData {
+	// Decode bytes to RxChannelData
+	var rx_data RxChannelData
+
+	dec := gob.NewDecoder(bytes.NewReader(buf))
+	err := dec.Decode(&rx_data)
+	if err != nil {
+		logrus.Fatal(err)
+	}
+
+	return rx_data
+}
+
 /*********************************
 	Methods of OnvmPoll
 *********************************/
-// TODO: what parameters should Create need?
+// TODO: Should return pointer to connection?
 func (onvmpoll *OnvmPoll) Create() Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	conn.state = CONN_NULL
-	conn.rxchan = make(chan RxChannelData)
-	conn.txchan = make(chan TxChannelData)
+	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
+	conn.txchan = make(chan TxChannelData, 1) // For non-blocking
 	conn.conn_id = GetConnID()
 
 	// Add the connection into the table
-	onvmpoll.conn_table[conn.conn_id] = conn
+	onvmpoll.Add(&conn)
 
 	return conn
 }
 
-func (onvmpoll *OnvmPoll) Add(id uint16, conn Connection) bool {
-	if _, isExist := onvmpoll.conn_table[id]; !isExist {
-		logrus.Debug("Add a connection to table")
-		onvmpoll.conn_table[id] = conn
-		return true
-	}
-	logrus.Fatal("Fail to add a connection to table")
-	return false
+func (onvmpoll *OnvmPoll) Add(conn *Connection) {
+	// Add connection to connection table
+	onvmpoll.conn_table[conn.conn_id] = *conn
 }
 
 func (onvmpoll *OnvmPoll) Delete(id uint16) error {
@@ -289,31 +331,41 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 			conn := onvmpoll.conn_table[conn_id]
 			conn.rxchan <- rxData
 		} else {
-			// Deliver to litsener's connection
-			conn := onvmpoll.conn_table[0]
+			// Deliver packet to litsener's connection
+			conn := onvmpoll.conn_table[LISTENER_CONN_ID]
 			conn.rxchan <- rxData
 		}
 	}
 }
 
-func (onvmpoll *OnvmPoll) WriteToONVM(conn_id uint16, data TxChannelData) {
-	// conn := onvmpoll.conn_table[id]
+func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
+	// Get destination NF ID
+	dst_id := C.int(IpToID(conn.four_tuple[DST_IP_ADDR_IDX]))
 
-	// TODO: Use CGO to call functions of NFLib
+	// Translate Go structure to C char *
+	var buffer []byte
+	var buffer_ptr *C.char
+	var buffer_length int
 
+	buffer = EncodeTxChannelDataToBytes(tx_data)
+	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	buffer_length = C.int(len(buffer))
+
+	// Use CGO to call functions of NFLib
+	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, buffer_length)
 }
 
 func (onvmpoll OnvmPoll) Polling() {
 	// Infinite loop checks ecah connection's state
 	for {
-		for conn_id, conn := range onvmpoll.conn_table {
+		for _, conn := range onvmpoll.conn_table {
 			if conn.state == CONN_READY_TO_SEND {
 				txData := <-conn.txchan
-				onvmpoll.WriteToONVM(conn_id, txData)
+				onvmpoll.WriteToONVM(&conn, txData)
 				conn.state = CONN_NULL
 			} else if conn.state == CONN_READY_TO_BOTH {
 				txData := <-conn.txchan
-				onvmpoll.WriteToONVM(conn_id, txData)
+				onvmpoll.WriteToONVM(&conn, txData)
 				conn.state = CONN_READY_TO_RECV
 			}
 		}
@@ -321,9 +373,9 @@ func (onvmpoll OnvmPoll) Polling() {
 }
 
 func (onvmpoll OnvmPoll) Run() {
-	// GoRoutine for receiving packet from pakcet handler
 	go onvmpoll.ReadFromONVM()
 	go onvmpoll.Polling()
+	go C.onvm_nflib_run(nf_ctx)
 }
 
 /*********************************
@@ -368,14 +420,14 @@ func (connection *Connection) Write(b []byte) (int, error) {
 	var tx_data TxChannelData
 	tx_data.transaction = ht
 
-	// Send packet to onvmpoller via channel
-	connection.txchan <- tx_data
-
 	if connection.state == CONN_READY_TO_RECV {
 		connection.state = CONN_READY_TO_BOTH
 	} else {
 		connection.state = CONN_READY_TO_SEND
 	}
+
+	// Send packet to onvmpoller via channel
+	connection.txchan <- tx_data
 
 	return len(b), nil
 }
@@ -491,17 +543,25 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 		return ol, err
 	}
 	ip_addr, port := ParseAddress(address)
+	local_address = ip_addr
 
 	/* Initialize OnvmListener */
 	id, _ := IpToID(ip_addr)
+	var conn Connection
+	conn.state = CONN_NULL
+	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
+	conn.txchan = make(chan TxChannelData, 1) // For non-blocking
+	conn.conn_id = LISTENER_CONN_ID
 
-	ol.conn = onvmpoll.Create()
+	ol.conn = conn
 	ol.conn.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
 	ol.conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(port)
 	ol.laddr.port = port
 	ol.laddr.network = network
 	ol.laddr.ipv4_addr = ip_addr
 	ol.laddr.srevice_id = uint8(id)
+
+	onvmpoll.Add(&ol.conn)
 
 	return ol, nil
 }
@@ -511,7 +571,7 @@ func DialONVM(network, address string) (Connection, error) {
 
 	// Initialize a connection
 	conn := onvmpoll.Create()
-	// conn.four_tuple[SRC_IP_ADDR_IDX] = TODO
+	conn.four_tuple[SRC_IP_ADDR_IDX] = local_address
 	conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(GetUnusedPort())
 	conn.four_tuple[DST_IP_ADDR_IDX] = ip_addr
 	conn.four_tuple[DST_PORT_IDX] = fmt.Sprint(port)
