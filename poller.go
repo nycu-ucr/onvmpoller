@@ -319,7 +319,7 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 }
 
 func (onvmpoll *OnvmPoll) Close() {
-	C.onvm_nflib_stop(*nf_ctx)
+	C.onvm_nflib_stop(nf_ctx)
 }
 
 func (onvmpoll OnvmPoll) String() string {
@@ -355,14 +355,12 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 	// Translate Go structure to C char *
 	var buffer []byte
 	var buffer_ptr *C.char
-	var buffer_length int
 
 	buffer = EncodeTxChannelDataToBytes(tx_data)
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
-	buffer_length = C.int(len(buffer))
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, buffer_length)
+	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
 }
 
 func (onvmpoll *OnvmPoll) Polling() {
