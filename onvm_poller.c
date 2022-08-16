@@ -1,4 +1,5 @@
 #include "onvm_nflib.h"
+#include "_cgo_export.h"
 
 #define NF_TAG "go-nf"
 
@@ -15,10 +16,16 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx) {
     nf_function_table = onvm_nflib_init_nf_function_table();
     nf_function_table->pkt_handler = &PacketHandler;
 
+    int argc = 3;
+    char cmd0[] = "./go.sh";
+    char cmd1[] = "-F";
+    char cmd2[] = "/home/johnson/go/src/onvmpoller/onvmConfig.json";
+    char *argv[] = {cmd0, cmd1, cmd2};
+
     // Initialize ONVM
-    arg_offset = onvm_nflib_init(argc, argv, NF_TAG, nf_local_ctx, nf_function_table);
+    arg_offset = onvm_nflib_init(argc, argv, NF_TAG, *nf_local_ctx, nf_function_table);
     if(arg_offset < 0) {
-        onvm_nflib_stop(nf_local_ctx);
+        onvm_nflib_stop(*nf_local_ctx);
         if (arg_offset == ONVM_SIGNAL_TERMINATION) {
                 printf("Exiting due to user termination\n");
                 return 0;

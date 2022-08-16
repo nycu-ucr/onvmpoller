@@ -1,6 +1,16 @@
 package onvmpoller
 
+// #cgo CFLAGS: -m64 -pthread -O3 -march=native
+// #cgo CFLAGS: -I<replace path>/onvm-upf/onvm/onvm_nflib
+// #cgo CFLAGS: -I<replace path>/onvm-upf/onvm/lib
+// #cgo CFLAGS: -I<replace path>/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/include
+// #cgo LDFLAGS: <replace path>/onvm-upf/onvm/onvm_nflib/x86_64-native-linuxapp-gcc/libonvm.a
+// #cgo LDFLAGS: <replace path>/onvm-upf/onvm/lib/x86_64-native-linuxapp-gcc/lib/libonvmhelper.a -lm
+// #cgo LDFLAGS: -L<replace path>/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/lib
+// #cgo LDFLAGS: -lrte_flow_classify -Wl,--whole-archive -lrte_pipeline -Wl,--no-whole-archive -Wl,--whole-archive -lrte_table -Wl,--no-whole-archive -Wl,--whole-archive -lrte_port -Wl,--no-whole-archive -lrte_pdump -lrte_distributor -lrte_ip_frag -lrte_meter -lrte_fib -lrte_rib -lrte_lpm -lrte_acl -lrte_jobstats -Wl,--whole-archive -lrte_metrics -Wl,--no-whole-archive -lrte_bitratestats -lrte_latencystats -lrte_power -lrte_efd -lrte_bpf -lrte_ipsec -Wl,--whole-archive -lrte_cfgfile -lrte_gro -lrte_gso -lrte_hash -lrte_member -lrte_vhost -lrte_kvargs -lrte_telemetry -lrte_mbuf -lrte_net -lrte_ethdev -lrte_bbdev -lrte_cryptodev -lrte_security -lrte_compressdev -lrte_eventdev -lrte_rawdev -lrte_timer -lrte_mempool -lrte_stack -lrte_mempool_ring -lrte_mempool_octeontx2 -lrte_ring -lrte_pci -lrte_eal -lrte_cmdline -lrte_reorder -lrte_sched -lrte_rcu -lrte_graph -lrte_node -lrte_kni -lrte_common_cpt -lrte_common_octeontx -lrte_common_octeontx2 -lrte_common_dpaax -lrte_bus_pci -lrte_bus_vdev -lrte_bus_dpaa -lrte_bus_fslmc -lrte_mempool_bucket -lrte_mempool_stack -lrte_mempool_dpaa -lrte_mempool_dpaa2 -lrte_pmd_af_packet -lrte_pmd_ark -lrte_pmd_atlantic -lrte_pmd_avp -lrte_pmd_axgbe -lrte_pmd_bnxt -lrte_pmd_bond -lrte_pmd_cxgbe -lrte_pmd_dpaa -lrte_pmd_dpaa2 -lrte_pmd_e1000 -lrte_pmd_ena -lrte_pmd_enetc -lrte_pmd_enic -lrte_pmd_fm10k -lrte_pmd_failsafe -lrte_pmd_hinic -lrte_pmd_hns3 -lrte_pmd_i40e -lrte_pmd_iavf -lrte_pmd_ice -lrte_common_iavf -lrte_pmd_igc -lrte_pmd_ionic -lrte_pmd_ixgbe -lrte_pmd_kni -lrte_pmd_lio -lrte_pmd_memif -lrte_pmd_nfp -lrte_pmd_null -lrte_pmd_octeontx2 -lrte_pmd_qede -lrte_pmd_ring -lrte_pmd_softnic -lrte_pmd_sfc_efx -lrte_pmd_tap -lrte_pmd_thunderx_nicvf -lrte_pmd_vdev_netvsc -lrte_pmd_virtio -lrte_pmd_vhost -lrte_pmd_ifc -lrte_pmd_vmxnet3_uio -lrte_bus_vmbus -lrte_pmd_netvsc -lrte_pmd_bbdev_null -lrte_pmd_bbdev_fpga_lte_fec -lrte_pmd_bbdev_fpga_5gnr_fec -lrte_pmd_bbdev_turbo_sw -lrte_pmd_null_crypto -lrte_pmd_nitrox -lrte_pmd_octeontx_crypto -lrte_pmd_octeontx2_crypto -lrte_pmd_crypto_scheduler -lrte_pmd_dpaa2_sec -lrte_pmd_dpaa_sec -lrte_pmd_caam_jr -lrte_pmd_virtio_crypto -lrte_pmd_octeontx_zip -lrte_pmd_qat -lrte_pmd_skeleton_event -lrte_pmd_sw_event -lrte_pmd_dsw_event -lrte_pmd_octeontx_ssovf -lrte_pmd_dpaa_event -lrte_pmd_dpaa2_event -lrte_mempool_octeontx -lrte_pmd_octeontx -lrte_pmd_octeontx2_event -lrte_pmd_opdl_event -lrte_rawdev_skeleton -lrte_rawdev_dpaa2_cmdif -lrte_rawdev_dpaa2_qdma -lrte_bus_ifpga -lrte_rawdev_ioat -lrte_rawdev_ntb -lrte_rawdev_octeontx2_dma -lrte_rawdev_octeontx2_ep -Wl,--no-whole-archive -lrt -lm -lnuma -ldl
 /*
+#include <onvm_nflib.h>
+
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buff, int buff_length);
 */
@@ -13,6 +23,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math/rand"
+	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -274,7 +285,7 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 	Methods of OnvmPoll
 *********************************/
 // TODO: Should return pointer to connection?
-func (onvmpoll *OnvmPoll) Create() Connection {
+func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
@@ -284,7 +295,7 @@ func (onvmpoll *OnvmPoll) Create() Connection {
 	// Add the connection into the table
 	onvmpoll.Add(&conn)
 
-	return conn
+	return &conn
 }
 
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
@@ -305,6 +316,10 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 	delete(onvmpoll.conn_table, id)
 
 	return nil
+}
+
+func (onvmpoll *OnvmPoll) Close() {
+	C.onvm_nflib_stop(*nf_ctx)
 }
 
 func (onvmpoll OnvmPoll) String() string {
@@ -350,7 +365,7 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, buffer_length)
 }
 
-func (onvmpoll OnvmPoll) Polling() {
+func (onvmpoll *OnvmPoll) Polling() {
 	// The infinite loop checks each connection for unsent data
 	for {
 		for _, conn := range onvmpoll.conn_table {
@@ -362,7 +377,7 @@ func (onvmpoll OnvmPoll) Polling() {
 	}
 }
 
-func (onvmpoll OnvmPoll) Run() {
+func (onvmpoll *OnvmPoll) Run() {
 	go onvmpoll.ReadFromONVM()
 	go onvmpoll.Polling()
 	go C.onvm_nflib_run(nf_ctx)
@@ -418,7 +433,7 @@ func (connection Connection) Close() error {
 }
 
 // LocalAddr implements the net.Conn LocalAddr method.
-func (connection Connection) LocalAddr() OnvmAddr {
+func (connection Connection) LocalAddr() net.Addr {
 	var oa OnvmAddr
 	v, _ := strconv.ParseUint(connection.four_tuple[SRC_PORT_IDX], 10, 64)
 	oa.ipv4_addr = connection.four_tuple[SRC_IP_ADDR_IDX]
@@ -431,7 +446,7 @@ func (connection Connection) LocalAddr() OnvmAddr {
 }
 
 // RemoteAddr implements the net.Conn RemoteAddr method.
-func (connection Connection) RemoteAddr() OnvmAddr {
+func (connection Connection) RemoteAddr() net.Addr {
 	var oa OnvmAddr
 	v, _ := strconv.ParseUint(connection.four_tuple[DST_PORT_IDX], 10, 64)
 	oa.ipv4_addr = connection.four_tuple[DST_IP_ADDR_IDX]
@@ -462,8 +477,8 @@ func (connection Connection) SetWriteDeadline(t time.Time) error {
 	Methods of OnvmListner
 *********************************/
 
-func (ol OnvmListener) Accept() (Connection, error) {
-	var new_conn Connection
+func (ol OnvmListener) Accept() (net.Conn, error) {
+	var new_conn *Connection
 
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
 
@@ -492,7 +507,7 @@ func (ol OnvmListener) Accept() (Connection, error) {
 	}
 
 	// Add the connection to table
-	AddEntryToTable("accept", &new_conn)
+	AddEntryToTable("accept", new_conn)
 
 	return new_conn, nil
 }
@@ -502,20 +517,20 @@ func (ol OnvmListener) Close() error {
 	return err
 }
 
-func (ol OnvmListener) Addr() OnvmAddr {
+func (ol OnvmListener) Addr() net.Addr {
 	return ol.laddr
 }
 
 /*********************************
 	API for HTTP Server
 *********************************/
-func CreateConnection() Connection {
+func CreateConnection() net.Conn {
 	conn := onvmpoll.Create()
 	return conn
 }
 
-func ListenONVM(network, address string) (OnvmListener, error) {
-	var ol OnvmListener
+func ListenONVM(network, address string) (net.Listener, error) {
+	var ol *OnvmListener
 	if network != "onvm" {
 		msg := fmt.Sprintf("Unsppourt network type: %v", network)
 		err := errors.New(msg)
@@ -544,7 +559,7 @@ func ListenONVM(network, address string) (OnvmListener, error) {
 	return ol, nil
 }
 
-func DialONVM(network, address string) (Connection, error) {
+func DialONVM(network, address string) (net.Conn, error) {
 	ip_addr, port := ParseAddress(address)
 
 	// Initialize a connection
@@ -565,7 +580,7 @@ func DialONVM(network, address string) (Connection, error) {
 	}
 
 	// Add the connection to table, otherwise it can't receive response
-	AddEntryToTable("dial", &conn)
+	AddEntryToTable("dial", conn)
 
 	// Wait for response
 	_, err = conn.Read(conn_response)

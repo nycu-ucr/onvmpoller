@@ -17,6 +17,7 @@ import (
 	"unsafe"
 )
 
+//export PacketHandler
 func PacketHandler(pkt *C.struct_rte_mbuf, meta *C.struct_onvm_pkt_meta, nf_local_ctx *C.struct_onvm_nf_local_ctx) int32 {
 	// Change to Go bytes from C char pointer
 	recv_len := int(C.pktmbuf_data_len_wrapper(pkt))
