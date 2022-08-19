@@ -1,15 +1,9 @@
+# IP Address: Service ID
 IPIDMap:
-  - IP: 127.0.0.18  # AMF
-    ID: 1
-  - IP: 127.0.0.9   # AUSF
-    ID: 2
-  - IP: 127.0.0.10  # NRF
-    ID: 3
-  - IP: 127.0.0.31  # NSSF
-    ID: 4
-  - IP: 127.0.0.7   # PCF
-    ID: 5
-  - IP: 127.0.0.2   # SMF
-    ID: 6
-  - IP: 127.0.0.4   # UDR
-    ID: 7
+  127.0.0.18: 1  # AMF
+  127.0.0.9: 2   # AUSF
+  127.0.0.10: 3  # NRF
+  127.0.0.31: 4  # NSSF
+  127.0.0.7: 5   # PCF
+  127.0.0.2: 6   # SMF
+  127.0.0.4: 7   # UDR

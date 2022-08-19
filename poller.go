@@ -27,6 +27,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -45,10 +46,7 @@ const (
 
 type Config struct {
 	// Map the IP address to Service ID
-	IPIDMap []struct {
-		IP string `yaml:"IP"`
-		ID int32  `yaml:"ID"`
-	} `yaml:"IPIDMap"`
+	IPIDMap map[string]int32 `yaml:"IPIDMap,omitempty"`
 }
 
 type HttpTransaction struct {
@@ -84,8 +82,12 @@ type OnvmAddr struct {
 }
 
 type OnvmPoll struct {
-	conn_table map[uint16]Connection // Connection_ID: Connection
-	ready_list []uint16              // Store the connections ready to i/o
+	/*
+		tables contain two tables, connection table and four-tuple table:
+			conn_table: uint16: *Connection (conn_id: *Connection)
+			four-tuple table: [4]string: *Connection
+	*/
+	tables sync.Map
 }
 
 /* Global Variables */
@@ -96,8 +98,8 @@ var (
 	port_pool           map[uint16]bool      // The ports range from 49152 to 65535
 	local_address       string               // Initialize at ListenONVM
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
-	fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
-	nf_ctx              *C.struct_onvm_nf_local_ctx
+	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
+	nf_ctx *C.struct_onvm_nf_local_ctx
 )
 
 func init() {
@@ -105,10 +107,9 @@ func init() {
 	InitConfig()
 	conn_id = 0
 	port_pool = make(map[uint16]bool)
-	onvmpoll.conn_table = make(map[uint16]Connection)
-	onvmpoll.ready_list = make([]uint16, 0)
+	onvmpoll.tables = sync.Map{}
 	nf_pkt_handler_chan = make(chan RxChannelData, 5)
-	fourTuple_to_connID = make(map[[4]string]uint16)
+	// fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
 	logrus.SetFormatter(&logrus.JSONFormatter{})
@@ -150,7 +151,7 @@ func GetConnID() uint16 {
 			continue
 		}
 
-		if _, isExist := onvmpoll.conn_table[conn_id]; !isExist {
+		if _, isExist := onvmpoll.tables.Load(conn_id); !isExist {
 			result = conn_id
 			conn_id++
 			break
@@ -193,47 +194,13 @@ func DeletePort(port uint16) error {
 	return nil
 }
 
-func AddEntryToTable(caller string, conn *Connection) {
-	/* Add the connection to fourTuple_to_connID table */
-	var four_tuple [4]string
-
-	// If it is invoked by dialONVM, it should swap SRC and DST.
-	if caller == "dial" {
-		four_tuple[SRC_IP_ADDR_IDX] = conn.four_tuple[DST_IP_ADDR_IDX]
-		four_tuple[SRC_PORT_IDX] = conn.four_tuple[DST_PORT_IDX]
-		four_tuple[DST_IP_ADDR_IDX] = conn.four_tuple[SRC_IP_ADDR_IDX]
-		four_tuple[DST_PORT_IDX] = conn.four_tuple[SRC_PORT_IDX]
-	} else {
-		four_tuple = conn.four_tuple
-	}
-
-	fourTuple_to_connID[four_tuple] = conn.conn_id
-}
-
-func DeleteEntryFromTable(conn *Connection) error {
-	/* Delete the connection from fourTuple_to_connID table */
-	if _, isExist := fourTuple_to_connID[conn.four_tuple]; !isExist {
-		msg := fmt.Sprintf("Delete connection from fourTuple_to_connID fail, %v is not exsit", conn.four_tuple)
-		err := errors.New(msg)
-		logrus.Fatal(msg)
-		return err
-	}
-	delete(fourTuple_to_connID, conn.four_tuple)
-
-	return nil
-}
-
 func IpToID(ip string) (id int32, err error) {
-	id = -1
-	for i := range config.IPIDMap {
-		if config.IPIDMap[i].IP == ip {
-			id = int32(config.IPIDMap[i].ID)
-			break
-		}
-	}
-	if id == -1 {
+	id, ok := config.IPIDMap[ip]
+
+	if !ok {
 		err = fmt.Errorf("no match id")
 	}
+
 	return
 }
 
@@ -284,7 +251,6 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 /*********************************
 	Methods of OnvmPoll
 *********************************/
-// TODO: Should return pointer to connection?
 func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
@@ -300,20 +266,53 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	onvmpoll.conn_table[conn.conn_id] = *conn
+	onvmpoll.tables.Store(conn.conn_id, conn)
 }
 
 func (onvmpoll *OnvmPoll) Delete(id uint16) error {
-	if _, isExist := onvmpoll.conn_table[id]; !isExist {
+	if _, isExist := onvmpoll.tables.Load(id); !isExist {
 		msg := fmt.Sprintf("This connID, %v, is not exist", id)
 		err := errors.New(msg)
 		logrus.Fatal(msg)
 		return err
 	}
 
-	conn := onvmpoll.conn_table[id]
-	DeleteEntryFromTable(&conn)
-	delete(onvmpoll.conn_table, id)
+	c, _ := onvmpoll.tables.Load(id)
+	conn := c.(*Connection)
+	onvmpoll.DeleteEntryFromTable(conn)
+	onvmpoll.tables.Delete(id)
+
+	return nil
+}
+
+func (onvmpoll *OnvmPoll) AddEntryToTable(caller string, conn *Connection) {
+	/* Add the connection to four-tuple table */
+	var four_tuple [4]string
+
+	// If it is invoked by dialONVM, it should swap SRC and DST.
+	if caller == "dial" {
+		four_tuple[SRC_IP_ADDR_IDX] = conn.four_tuple[DST_IP_ADDR_IDX]
+		four_tuple[SRC_PORT_IDX] = conn.four_tuple[DST_PORT_IDX]
+		four_tuple[DST_IP_ADDR_IDX] = conn.four_tuple[SRC_IP_ADDR_IDX]
+		four_tuple[DST_PORT_IDX] = conn.four_tuple[SRC_PORT_IDX]
+	} else {
+		four_tuple = conn.four_tuple
+	}
+
+	// fourTuple_to_connID[four_tuple] = conn.conn_id
+	onvmpoll.tables.Store(four_tuple, conn)
+}
+
+func (onvmpoll *OnvmPoll) DeleteEntryFromTable(conn *Connection) error {
+	/* Delete the connection from four-tuple table */
+	if _, isExist := onvmpoll.tables.Load(conn.four_tuple); !isExist {
+		msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", conn.four_tuple)
+		err := errors.New(msg)
+		logrus.Fatal(msg)
+		return err
+	}
+	// delete(fourTuple_to_connID, conn.four_tuple)
+	onvmpoll.tables.Delete(conn.four_tuple)
 
 	return nil
 }
@@ -324,9 +323,16 @@ func (onvmpoll *OnvmPoll) Close() {
 
 func (onvmpoll OnvmPoll) String() string {
 	result := "OnvmPoll has following connections:\n"
-	for key, _ := range onvmpoll.conn_table {
-		result += fmt.Sprintf("\tConnection ID: %d\n", key)
-	}
+	// for key, _ := range onvmpoll.conn_table {
+	// 	result += fmt.Sprintf("\tConnection ID: %d\n", key)
+	// }
+
+	onvmpoll.tables.Range(func(k, v interface{}) bool {
+		if _, ok := k.(int32); ok {
+			result += fmt.Sprintf("\tConnection ID: %d\n", k)
+		}
+		return true
+	})
 
 	return result
 }
@@ -335,14 +341,16 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
 	for rxData := range nf_pkt_handler_chan {
-		conn_id, isExist := fourTuple_to_connID[rxData.transaction.four_tuple]
+		// conn_id, isExist := fourTuple_to_connID[rxData.transaction.four_tuple]
+		c, isExist := onvmpoll.tables.Load(rxData.transaction.four_tuple)
 		if isExist {
-			conn := onvmpoll.conn_table[conn_id]
+			conn := c.(*Connection)
 			conn.rxchan <- rxData
 		} else {
 			// Deliver packet to litsener's connection
-			conn := onvmpoll.conn_table[LISTENER_CONN_ID]
-			conn.rxchan <- rxData
+			lc, _ := onvmpoll.tables.Load(LISTENER_CONN_ID)
+			listener_conn := lc.(*Connection)
+			listener_conn.rxchan <- rxData
 		}
 	}
 }
@@ -366,12 +374,22 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 func (onvmpoll *OnvmPoll) Polling() {
 	// The infinite loop checks each connection for unsent data
 	for {
-		for _, conn := range onvmpoll.conn_table {
-			select {
-			case txData := <-conn.txchan:
-				onvmpoll.WriteToONVM(&conn, txData)
+		// for _, conn := range onvmpoll.conn_table {
+		// 	select {
+		// 	case txData := <-conn.txchan:
+		// 		onvmpoll.WriteToONVM(&conn, txData)
+		// 	}
+		// }
+		onvmpoll.tables.Range(func(k, v interface{}) bool {
+			if _, ok := k.(uint16); ok {
+				conn := v.(*Connection)
+				select {
+				case txData := <-conn.txchan:
+					onvmpoll.WriteToONVM(conn, txData)
+				}
 			}
-		}
+			return true
+		})
 	}
 }
 
@@ -427,6 +445,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 // Close implements the net.Conn Close method.
 func (connection Connection) Close() error {
 	err := onvmpoll.Delete(connection.conn_id)
+	// TODO: Notify peer connection
 	return err
 }
 
@@ -505,7 +524,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	}
 
 	// Add the connection to table
-	AddEntryToTable("accept", new_conn)
+	onvmpoll.AddEntryToTable("accept", new_conn)
 
 	return new_conn, nil
 }
@@ -578,7 +597,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	}
 
 	// Add the connection to table, otherwise it can't receive response
-	AddEntryToTable("dial", conn)
+	onvmpoll.AddEntryToTable("dial", conn)
 
 	// Wait for response
 	_, err = conn.Read(conn_response)
