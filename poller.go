@@ -11,7 +11,7 @@ package onvmpoller
 /*
 #include <onvm_nflib.h>
 
-extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx);
+extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buff, int buff_length);
 */
 import "C"
@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -115,11 +116,26 @@ func init() {
 	logrus.SetFormatter(&logrus.JSONFormatter{})
 	logrus.SetLevel(logrus.DebugLevel)
 
+	/* Parse NF Name */
+	NfName := ParseNfName(os.Args[0])
+	var char_ptr *C.char
+	char_ptr = C.CString(NfName)
+
 	/* Initialize NF context */
-	C.onvm_init(&nf_ctx)
+	C.onvm_init(&nf_ctx, char_ptr)
+	C.free(unsafe.Pointer(char_ptr))
 
 	/* Run onvmpoller */
 	onvmpoll.Run()
+}
+
+func ParseNfName(args string) string {
+	nfName := strings.Split(args, "/")
+	return nfName[1]
+}
+
+func CloseONVM() {
+	C.onvm_nflib_stop(nf_ctx)
 }
 
 func InitConfig() {
