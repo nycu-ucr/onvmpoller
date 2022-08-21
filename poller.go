@@ -1,12 +1,12 @@
 package onvmpoller
 
 // #cgo CFLAGS: -m64 -pthread -O3 -march=native
-// #cgo CFLAGS: -I<replace path>/onvm-upf/onvm/onvm_nflib
-// #cgo CFLAGS: -I<replace path>/onvm-upf/onvm/lib
-// #cgo CFLAGS: -I<replace path>/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/include
-// #cgo LDFLAGS: <replace path>/onvm-upf/onvm/onvm_nflib/x86_64-native-linuxapp-gcc/libonvm.a
-// #cgo LDFLAGS: <replace path>/onvm-upf/onvm/lib/x86_64-native-linuxapp-gcc/lib/libonvmhelper.a -lm
-// #cgo LDFLAGS: -L<replace path>/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/lib
+// #cgo CFLAGS: -I/home/johnson/l25gc/onvm-upf/onvm/onvm_nflib
+// #cgo CFLAGS: -I/home/johnson/l25gc/onvm-upf/onvm/lib
+// #cgo CFLAGS: -I/home/johnson/l25gc/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/include
+// #cgo LDFLAGS: /home/johnson/l25gc/onvm-upf/onvm/onvm_nflib/x86_64-native-linuxapp-gcc/libonvm.a
+// #cgo LDFLAGS: /home/johnson/l25gc/onvm-upf/onvm/lib/x86_64-native-linuxapp-gcc/lib/libonvmhelper.a -lm
+// #cgo LDFLAGS: -L/home/johnson/l25gc/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/lib
 // #cgo LDFLAGS: -lrte_flow_classify -Wl,--whole-archive -lrte_pipeline -Wl,--no-whole-archive -Wl,--whole-archive -lrte_table -Wl,--no-whole-archive -Wl,--whole-archive -lrte_port -Wl,--no-whole-archive -lrte_pdump -lrte_distributor -lrte_ip_frag -lrte_meter -lrte_fib -lrte_rib -lrte_lpm -lrte_acl -lrte_jobstats -Wl,--whole-archive -lrte_metrics -Wl,--no-whole-archive -lrte_bitratestats -lrte_latencystats -lrte_power -lrte_efd -lrte_bpf -lrte_ipsec -Wl,--whole-archive -lrte_cfgfile -lrte_gro -lrte_gso -lrte_hash -lrte_member -lrte_vhost -lrte_kvargs -lrte_telemetry -lrte_mbuf -lrte_net -lrte_ethdev -lrte_bbdev -lrte_cryptodev -lrte_security -lrte_compressdev -lrte_eventdev -lrte_rawdev -lrte_timer -lrte_mempool -lrte_stack -lrte_mempool_ring -lrte_mempool_octeontx2 -lrte_ring -lrte_pci -lrte_eal -lrte_cmdline -lrte_reorder -lrte_sched -lrte_rcu -lrte_graph -lrte_node -lrte_kni -lrte_common_cpt -lrte_common_octeontx -lrte_common_octeontx2 -lrte_common_dpaax -lrte_bus_pci -lrte_bus_vdev -lrte_bus_dpaa -lrte_bus_fslmc -lrte_mempool_bucket -lrte_mempool_stack -lrte_mempool_dpaa -lrte_mempool_dpaa2 -lrte_pmd_af_packet -lrte_pmd_ark -lrte_pmd_atlantic -lrte_pmd_avp -lrte_pmd_axgbe -lrte_pmd_bnxt -lrte_pmd_bond -lrte_pmd_cxgbe -lrte_pmd_dpaa -lrte_pmd_dpaa2 -lrte_pmd_e1000 -lrte_pmd_ena -lrte_pmd_enetc -lrte_pmd_enic -lrte_pmd_fm10k -lrte_pmd_failsafe -lrte_pmd_hinic -lrte_pmd_hns3 -lrte_pmd_i40e -lrte_pmd_iavf -lrte_pmd_ice -lrte_common_iavf -lrte_pmd_igc -lrte_pmd_ionic -lrte_pmd_ixgbe -lrte_pmd_kni -lrte_pmd_lio -lrte_pmd_memif -lrte_pmd_nfp -lrte_pmd_null -lrte_pmd_octeontx2 -lrte_pmd_qede -lrte_pmd_ring -lrte_pmd_softnic -lrte_pmd_sfc_efx -lrte_pmd_tap -lrte_pmd_thunderx_nicvf -lrte_pmd_vdev_netvsc -lrte_pmd_virtio -lrte_pmd_vhost -lrte_pmd_ifc -lrte_pmd_vmxnet3_uio -lrte_bus_vmbus -lrte_pmd_netvsc -lrte_pmd_bbdev_null -lrte_pmd_bbdev_fpga_lte_fec -lrte_pmd_bbdev_fpga_5gnr_fec -lrte_pmd_bbdev_turbo_sw -lrte_pmd_null_crypto -lrte_pmd_nitrox -lrte_pmd_octeontx_crypto -lrte_pmd_octeontx2_crypto -lrte_pmd_crypto_scheduler -lrte_pmd_dpaa2_sec -lrte_pmd_dpaa_sec -lrte_pmd_caam_jr -lrte_pmd_virtio_crypto -lrte_pmd_octeontx_zip -lrte_pmd_qat -lrte_pmd_skeleton_event -lrte_pmd_sw_event -lrte_pmd_dsw_event -lrte_pmd_octeontx_ssovf -lrte_pmd_dpaa_event -lrte_pmd_dpaa2_event -lrte_mempool_octeontx -lrte_pmd_octeontx -lrte_pmd_octeontx2_event -lrte_pmd_opdl_event -lrte_rawdev_skeleton -lrte_rawdev_dpaa2_cmdif -lrte_rawdev_dpaa2_qdma -lrte_bus_ifpga -lrte_rawdev_ioat -lrte_rawdev_ntb -lrte_rawdev_octeontx2_dma -lrte_rawdev_octeontx2_ep -Wl,--no-whole-archive -lrt -lm -lnuma -ldl
 /*
 #include <onvm_nflib.h>
@@ -43,6 +43,11 @@ const (
 	DST_PORT_IDX    = 3
 	// For connection ID
 	LISTENER_CONN_ID = 0
+	// Distinguish packet type
+	HTTP_FRAME     = 0
+	ESTABLISH_CONN = 1
+	CLOSE_CONN     = 2
+	REPLY_CONN     = 3
 )
 
 type Config struct {
@@ -57,10 +62,12 @@ type HttpTransaction struct {
 
 type RxChannelData struct {
 	transaction HttpTransaction
+	pkt_type    int
 }
 
 type TxChannelData struct {
 	transaction HttpTransaction
+	pkt_type    int
 }
 
 type Connection struct {
@@ -228,14 +235,34 @@ func ParseAddress(address string) (string, uint16) {
 	return ip_addr, port
 }
 
-func MakeConnectionRequest(buf []byte) {
-	req := []byte("SYN")
-	copy(buf, req)
+func MakeConnCtrlMsg(msg_type int) []byte {
+	var msg []byte
+	switch msg_type {
+	case ESTABLISH_CONN:
+		msg = []byte("SYN")
+	case REPLY_CONN:
+		msg = []byte("ACK")
+	case CLOSE_CONN:
+		msg = []byte("FIN")
+	}
+
+	return msg
 }
 
-func MakeConnectionResponse(buf []byte) {
-	res := []byte("ACK")
-	copy(buf, res)
+func GetPacketType(buf []byte) int {
+	var pkt_type int
+
+	if bytes.Equal(buf, []byte("SYN")) {
+		pkt_type = ESTABLISH_CONN
+	} else if bytes.Equal(buf, []byte("ACK")) {
+		pkt_type = REPLY_CONN
+	} else if bytes.Equal(buf, []byte("FIN")) {
+		pkt_type = CLOSE_CONN
+	} else {
+		pkt_type = HTTP_FRAME
+	}
+
+	return pkt_type
 }
 
 func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
@@ -286,6 +313,8 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 }
 
 func (onvmpoll *OnvmPoll) Delete(id uint16) error {
+	// TODO: Try to use pointer to Connection instead of connection id
+
 	if _, isExist := onvmpoll.tables.Load(id); !isExist {
 		msg := fmt.Sprintf("This connID, %v, is not exist", id)
 		err := errors.New(msg)
@@ -357,16 +386,22 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
 	for rxData := range nf_pkt_handler_chan {
-		// conn_id, isExist := fourTuple_to_connID[rxData.transaction.four_tuple]
-		c, isExist := onvmpoll.tables.Load(rxData.transaction.four_tuple)
-		if isExist {
-			conn := c.(*Connection)
-			conn.rxchan <- rxData
-		} else {
+		switch rxData.pkt_type {
+		case ESTABLISH_CONN:
 			// Deliver packet to litsener's connection
 			lc, _ := onvmpoll.tables.Load(LISTENER_CONN_ID)
 			listener_conn := lc.(*Connection)
 			listener_conn.rxchan <- rxData
+		case CLOSE_CONN:
+			// Let onvmpoller delete the connection
+			c, _ := onvmpoll.tables.Load(rxData.transaction.four_tuple)
+			conn := c.(*Connection)
+			onvmpoll.Delete(conn.conn_id)
+		case REPLY_CONN, HTTP_FRAME:
+			// TODO: REPLY_CONN may be removed
+			c, _ := onvmpoll.tables.Load(rxData.transaction.four_tuple)
+			conn := c.(*Connection)
+			conn.rxchan <- rxData
 		}
 	}
 }
@@ -418,6 +453,7 @@ func (onvmpoll *OnvmPoll) Run() {
 /*********************************
 	Methods of OnvmAddr
 *********************************/
+
 func (oa OnvmAddr) Network() string {
 	return oa.network
 }
@@ -430,12 +466,14 @@ func (oa OnvmAddr) String() string {
 /*********************************
 	Methods of Connection
 *********************************/
+
 // Read implements the net.Conn Read method.
 func (connection Connection) Read(b []byte) (int, error) {
 	// Receive packet from onvmpoller
 	rx_data := <-connection.rxchan
 
 	// Get response
+	// TODO: Here my has problem, can't copy data
 	copy(b, rx_data.transaction.http_message)
 
 	return len(b), nil
@@ -446,10 +484,12 @@ func (connection Connection) Write(b []byte) (int, error) {
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
 	ht.four_tuple = connection.four_tuple
+	// TODO: Here my has problem, can't copy data
 	copy(ht.http_message, b)
 
 	// Encapuslate HttpTransaction into TxChannelData
 	var tx_data TxChannelData
+	tx_data.pkt_type = GetPacketType(b)
 	tx_data.transaction = ht
 
 	// Send packet to onvmpoller via channel
@@ -460,8 +500,13 @@ func (connection Connection) Write(b []byte) (int, error) {
 
 // Close implements the net.Conn Close method.
 func (connection Connection) Close() error {
+	// Notify peer connection can be closed
+	var msg []byte = MakeConnCtrlMsg(CLOSE_CONN)
+	connection.Write(msg)
+
+	// Close local connection
 	err := onvmpoll.Delete(connection.conn_id)
-	// TODO: Notify peer connection
+
 	return err
 }
 
@@ -530,8 +575,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	new_conn.four_tuple[DST_PORT_IDX] = rx_data.transaction.four_tuple[SRC_PORT_IDX]
 
 	// Send ACK back to client
-	var conn_response []byte
-	MakeConnectionResponse(conn_response)
+	var conn_response []byte = MakeConnCtrlMsg(REPLY_CONN)
 	_, err := new_conn.Write(conn_response)
 	if err != nil {
 		logrus.Fatal(err.Error())
@@ -575,8 +619,8 @@ func ListenONVM(network, address string) (net.Listener, error) {
 	/* Initialize OnvmListener */
 	id, _ := IpToID(ip_addr)
 	var conn Connection
-	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
-	conn.txchan = make(chan TxChannelData, 1) // For non-blocking
+	conn.rxchan = make(chan RxChannelData, 1) // Listener's rxchan must be block, wait for incoming connection
+	conn.txchan = make(chan TxChannelData, 1) // This won't be used
 	conn.conn_id = LISTENER_CONN_ID
 
 	ol.conn = conn
@@ -604,7 +648,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 
 	// Send connection request to server
 	var conn_request, conn_response []byte
-	MakeConnectionRequest(conn_request)
+	conn_request = MakeConnCtrlMsg(ESTABLISH_CONN)
 	_, err := conn.Write(conn_request)
 	if err != nil {
 		logrus.Fatal(err.Error())
