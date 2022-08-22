@@ -473,10 +473,14 @@ func (connection Connection) Read(b []byte) (int, error) {
 	rx_data := <-connection.rxchan
 
 	// Get response
-	// TODO: Here my has problem, can't copy data
-	copy(b, rx_data.transaction.http_message)
+	if len(b) < len(rx_data.transaction.http_message) {
+		// TODO: Fix this problem
+		logrus.Fatal("Read buffer length is not sufficient")
+	} else {
+		copy(b, rx_data.transaction.http_message)
+	}
 
-	return len(b), nil
+	return len(rx_data.transaction.http_message), nil
 }
 
 // Write implements the net.Conn Write method.
@@ -484,7 +488,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
 	ht.four_tuple = connection.four_tuple
-	// TODO: Here my has problem, can't copy data
+	ht.http_message = make([]byte, len(b))
 	copy(ht.http_message, b)
 
 	// Encapuslate HttpTransaction into TxChannelData
