@@ -57,18 +57,18 @@ type Config struct {
 }
 
 type HttpTransaction struct {
-	four_tuple   [4]string
-	http_message []byte // Request or Response
+	FourTuple   [4]string
+	HttpMessage []byte // Request or Response
 }
 
 type RxChannelData struct {
-	transaction HttpTransaction
-	pkt_type    int
+	Transaction HttpTransaction
+	PacketType  int
 }
 
 type TxChannelData struct {
-	transaction HttpTransaction
-	pkt_type    int
+	Transaction HttpTransaction
+	PacketType  int
 }
 
 type Connection struct {
@@ -389,7 +389,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
 	for rxData := range nf_pkt_handler_chan {
-		switch rxData.pkt_type {
+		switch rxData.PacketType {
 		case ESTABLISH_CONN:
 			// Deliver packet to litsener's connection
 			lc, _ := onvmpoll.tables.Load(LISTENER_CONN_ID)
@@ -397,12 +397,12 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 			listener_conn.rxchan <- rxData
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
-			c, _ := onvmpoll.tables.Load(rxData.transaction.four_tuple)
+			c, _ := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
 			conn := c.(*Connection)
 			onvmpoll.Delete(conn.conn_id)
 		case REPLY_CONN, HTTP_FRAME:
 			// TODO: REPLY_CONN may be removed
-			c, _ := onvmpoll.tables.Load(rxData.transaction.four_tuple)
+			c, _ := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
 			conn := c.(*Connection)
 			conn.rxchan <- rxData
 		}
@@ -477,28 +477,28 @@ func (connection Connection) Read(b []byte) (int, error) {
 	rx_data := <-connection.rxchan
 
 	// Get response
-	if len(b) < len(rx_data.transaction.http_message) {
+	if len(b) < len(rx_data.Transaction.HttpMessage) {
 		// TODO: Fix this problem
 		logger.Log.Fatal("Read buffer length is not sufficient")
 	} else {
-		copy(b, rx_data.transaction.http_message)
+		copy(b, rx_data.Transaction.HttpMessage)
 	}
 
-	return len(rx_data.transaction.http_message), nil
+	return len(rx_data.Transaction.HttpMessage), nil
 }
 
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
-	ht.four_tuple = connection.four_tuple
-	ht.http_message = make([]byte, len(b))
-	copy(ht.http_message, b)
+	ht.FourTuple = connection.four_tuple
+	ht.HttpMessage = make([]byte, len(b))
+	copy(ht.HttpMessage, b)
 
 	// Encapuslate HttpTransaction into TxChannelData
 	var tx_data TxChannelData
-	tx_data.pkt_type = GetPacketType(b)
-	tx_data.transaction = ht
+	tx_data.PacketType = GetPacketType(b)
+	tx_data.Transaction = ht
 
 	// Send packet to onvmpoller via channel
 	connection.txchan <- tx_data
@@ -568,19 +568,21 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
 
-	if !bytes.Equal([]byte("SYN"), rx_data.transaction.http_message) {
-		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.transaction.http_message)
+	if !bytes.Equal([]byte("SYN"), rx_data.Transaction.HttpMessage) {
+		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.Transaction.HttpMessage)
 		err := errors.New(msg)
 		logger.Log.Fatal(msg)
 		return new_conn, err
+	} else {
+		logrus.Debug("Receive one connection request")
 	}
 
 	// Initialize the new connection
 	new_conn = onvmpoll.Create()
 	new_conn.four_tuple[SRC_IP_ADDR_IDX] = ol.laddr.ipv4_addr
 	new_conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(ol.laddr.port)
-	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.transaction.four_tuple[SRC_IP_ADDR_IDX]
-	new_conn.four_tuple[DST_PORT_IDX] = rx_data.transaction.four_tuple[SRC_PORT_IDX]
+	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.Transaction.FourTuple[SRC_IP_ADDR_IDX]
+	new_conn.four_tuple[DST_PORT_IDX] = rx_data.Transaction.FourTuple[SRC_PORT_IDX]
 
 	// Send ACK back to client
 	var conn_response []byte = MakeConnCtrlMsg(REPLY_CONN)
@@ -589,6 +591,10 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 		logger.Log.Fatal(err.Error())
 		new_conn.Close()
 		return new_conn, err
+	} else {
+		logrus.Debug(fmt.Sprintf("Write connection response to (%v, %v)",
+			new_conn.four_tuple[DST_IP_ADDR_IDX],
+			new_conn.four_tuple[DST_PORT_IDX]))
 	}
 
 	// Add the connection to table
@@ -637,7 +643,8 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.four_tuple[DST_PORT_IDX] = fmt.Sprint(port)
 
 	// Send connection request to server
-	var conn_request, conn_response []byte
+	conn_request := make([]byte, 3)
+	conn_response := make([]byte, 3)
 	conn_request = MakeConnCtrlMsg(ESTABLISH_CONN)
 	logger.Log.Traceln("Dial write connection create request")
 	_, err := conn.Write(conn_request)
@@ -645,6 +652,8 @@ func DialONVM(network, address string) (net.Conn, error) {
 		logger.Log.Fatal(err.Error())
 		conn.Close()
 		return conn, err
+	} else {
+		logrus.Debug(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
 	}
 
 	// Add the connection to table, otherwise it can't receive response
@@ -658,6 +667,8 @@ func DialONVM(network, address string) (net.Conn, error) {
 		logger.Log.Fatal(err.Error())
 		conn.Close()
 		return conn, err
+	} else {
+		logrus.Debug("Read connection response")
 	}
 
 	return conn, nil
