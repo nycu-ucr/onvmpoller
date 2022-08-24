@@ -182,7 +182,7 @@ func GetConnID() uint16 {
 			conn_id++
 			break
 		} else {
-			logger.Log.Infoln("ID:%d is used.", conn_id)
+			logger.Log.Infof("ID:%d is used.", conn_id)
 			conn_id++
 		}
 	}
@@ -411,6 +411,8 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 
 func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 	// Get destination NF ID
+	logger.Log.Tracef("Conn ID:%d, WriteToONVM()", conn.conn_id)
+
 	id, _ := IpToID(conn.four_tuple[DST_IP_ADDR_IDX])
 	dst_id := C.int(id)
 
@@ -422,6 +424,7 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
 
 	// Use CGO to call functions of NFLib
+	logger.Log.Tracef("Conn ID:%d, onvm_send_pkt()", conn.conn_id)
 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
 }
 
@@ -439,6 +442,7 @@ func (onvmpoll *OnvmPoll) Polling() {
 				conn := v.(*Connection)
 				select {
 				case txData := <-conn.txchan:
+					logger.Log.Tracef("Conn ID:%d, handle by Polling()", conn.conn_id)
 					onvmpoll.WriteToONVM(conn, txData)
 				}
 			}
@@ -473,6 +477,8 @@ func (oa OnvmAddr) String() string {
 
 // Read implements the net.Conn Read method.
 func (connection Connection) Read(b []byte) (int, error) {
+	logger.Log.Traceln("Start Connection.Read")
+
 	// Receive packet from onvmpoller
 	rx_data := <-connection.rxchan
 
@@ -489,6 +495,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
+	logger.Log.Traceln("Start Connection.Write")
+
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
 	ht.FourTuple = connection.four_tuple
@@ -564,6 +572,8 @@ func (connection Connection) SetWriteDeadline(t time.Time) error {
 *********************************/
 
 func (ol OnvmListener) Accept() (net.Conn, error) {
+	logger.Log.Traceln("Start OnvmListener.Accept")
+
 	var new_conn *Connection
 
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
@@ -574,7 +584,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 		logger.Log.Fatal(msg)
 		return new_conn, err
 	} else {
-		logrus.Debug("Receive one connection request")
+		logger.Log.Traceln("Receive one connection request")
 	}
 
 	// Initialize the new connection
@@ -592,9 +602,9 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 		new_conn.Close()
 		return new_conn, err
 	} else {
-		logrus.Debug(fmt.Sprintf("Write connection response to (%v, %v)",
+		logger.Log.Tracef("Write connection response to (%v, %v)",
 			new_conn.four_tuple[DST_IP_ADDR_IDX],
-			new_conn.four_tuple[DST_PORT_IDX]))
+			new_conn.four_tuple[DST_PORT_IDX])
 	}
 
 	// Add the connection to table
@@ -621,6 +631,8 @@ func CreateConnection() net.Conn {
 }
 
 func ListenONVM(network, address string) (net.Listener, error) {
+	logger.Log.Traceln("Start ListenONVM")
+
 	if network != "onvm" {
 		msg := fmt.Sprintf("Unsppourt network type: %v", network)
 		err := errors.New(msg)
@@ -633,6 +645,8 @@ func ListenONVM(network, address string) (net.Listener, error) {
 }
 
 func DialONVM(network, address string) (net.Conn, error) {
+	logger.Log.Traceln("Start DialONVM")
+
 	ip_addr, port := ParseAddress(address)
 
 	// Initialize a connection
@@ -646,6 +660,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn_request := make([]byte, 3)
 	conn_response := make([]byte, 3)
 	conn_request = MakeConnCtrlMsg(ESTABLISH_CONN)
+
 	logger.Log.Traceln("Dial write connection create request")
 	_, err := conn.Write(conn_request)
 	if err != nil {
@@ -653,7 +668,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 		conn.Close()
 		return conn, err
 	} else {
-		logrus.Debug(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
+		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
 	}
 
 	// Add the connection to table, otherwise it can't receive response
@@ -662,13 +677,12 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
 	_, err = conn.Read(conn_response)
-	logger.Log.Traceln("Dial get connection create response")
 	if err != nil {
 		logger.Log.Fatal(err.Error())
 		conn.Close()
 		return conn, err
 	} else {
-		logrus.Debug("Read connection response")
+		logger.Log.Traceln("Dial get connection create response")
 	}
 
 	return conn, nil
