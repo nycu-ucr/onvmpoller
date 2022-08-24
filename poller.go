@@ -31,6 +31,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/nycu-ucr/onvmpoller/logger"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
 )
@@ -121,8 +122,7 @@ func init() {
 	// fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
-	logrus.SetFormatter(&logrus.JSONFormatter{})
-	logrus.SetLevel(logrus.DebugLevel)
+	logger.SetLogLevel(logrus.TraceLevel)
 
 	/* Parse NF Name */
 	NfName := ParseNfName(os.Args[0])
@@ -130,10 +130,12 @@ func init() {
 	char_ptr = C.CString(NfName)
 
 	/* Initialize NF context */
+	logger.Log.Traceln("Start onvm init")
 	C.onvm_init(&nf_ctx, char_ptr)
 	C.free(unsafe.Pointer(char_ptr))
 
 	/* Run onvmpoller */
+	logger.Log.Traceln("Start onvmpoll run")
 	onvmpoll.Run()
 }
 
@@ -180,7 +182,7 @@ func GetConnID() uint16 {
 			conn_id++
 			break
 		} else {
-			logrus.Info(conn_id, " ID is used.")
+			logger.Log.Infoln("ID:%d is used.", conn_id)
 			conn_id++
 		}
 	}
@@ -211,7 +213,7 @@ func DeletePort(port uint16) error {
 	if _, isExist := port_pool[port]; !isExist {
 		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
 		err := errors.New(msg)
-		logrus.Fatal(msg)
+		logger.Log.Fatal(msg)
 		return err
 	}
 	delete(port_pool, port)
@@ -273,7 +275,7 @@ func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
 	enc := gob.NewEncoder(&buf)
 	err := enc.Encode(tx_data)
 	if err != nil {
-		logrus.Fatal(err)
+		logger.Log.Fatal(err)
 	}
 
 	return buf.Bytes()
@@ -286,7 +288,7 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 	dec := gob.NewDecoder(bytes.NewReader(buf))
 	err := dec.Decode(&rx_data)
 	if err != nil {
-		logrus.Fatal(err)
+		logger.Log.Fatal(err)
 	}
 
 	return rx_data
@@ -319,7 +321,7 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 	if _, isExist := onvmpoll.tables.Load(id); !isExist {
 		msg := fmt.Sprintf("This connID, %v, is not exist", id)
 		err := errors.New(msg)
-		logrus.Fatal(msg)
+		logger.Log.Fatal(msg)
 		return err
 	}
 
@@ -354,7 +356,7 @@ func (onvmpoll *OnvmPoll) DeleteEntryFromTable(conn *Connection) error {
 	if _, isExist := onvmpoll.tables.Load(conn.four_tuple); !isExist {
 		msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", conn.four_tuple)
 		err := errors.New(msg)
-		logrus.Fatal(msg)
+		logger.Log.Fatal(msg)
 		return err
 	}
 	// delete(fourTuple_to_connID, conn.four_tuple)
@@ -477,7 +479,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 	// Get response
 	if len(b) < len(rx_data.transaction.http_message) {
 		// TODO: Fix this problem
-		logrus.Fatal("Read buffer length is not sufficient")
+		logger.Log.Fatal("Read buffer length is not sufficient")
 	} else {
 		copy(b, rx_data.transaction.http_message)
 	}
@@ -569,7 +571,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	if !bytes.Equal([]byte("SYN"), rx_data.transaction.http_message) {
 		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.transaction.http_message)
 		err := errors.New(msg)
-		logrus.Fatal(msg)
+		logger.Log.Fatal(msg)
 		return new_conn, err
 	}
 
@@ -584,7 +586,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	var conn_response []byte = MakeConnCtrlMsg(REPLY_CONN)
 	_, err := new_conn.Write(conn_response)
 	if err != nil {
-		logrus.Fatal(err.Error())
+		logger.Log.Fatal(err.Error())
 		new_conn.Close()
 		return new_conn, err
 	}
@@ -637,9 +639,10 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// Send connection request to server
 	var conn_request, conn_response []byte
 	conn_request = MakeConnCtrlMsg(ESTABLISH_CONN)
+	logger.Log.Traceln("Dial write connection create request")
 	_, err := conn.Write(conn_request)
 	if err != nil {
-		logrus.Fatal(err.Error())
+		logger.Log.Fatal(err.Error())
 		conn.Close()
 		return conn, err
 	}
@@ -648,9 +651,11 @@ func DialONVM(network, address string) (net.Conn, error) {
 	onvmpoll.AddEntryToTable("dial", conn)
 
 	// Wait for response
+	logger.Log.Traceln("Dial wait connection create response")
 	_, err = conn.Read(conn_response)
+	logger.Log.Traceln("Dial get connection create response")
 	if err != nil {
-		logrus.Fatal(err.Error())
+		logger.Log.Fatal(err.Error())
 		conn.Close()
 		return conn, err
 	}
