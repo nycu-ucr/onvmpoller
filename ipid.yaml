@@ -7,3 +7,5 @@ IPIDMap:
   127.0.0.7: 5   # PCF
   127.0.0.2: 6   # SMF
   127.0.0.4: 7   # UDR
+  127.0.0.11: 11 # Test Server
+  127.0.0.1: 12  # Test Client

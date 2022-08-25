@@ -15,6 +15,8 @@ import "C"
 
 import (
 	"unsafe"
+
+	"github.com/nycu-ucr/onvmpoller/logger"
 )
 
 //export PacketHandler
@@ -29,6 +31,8 @@ func PacketHandler(pkt *C.struct_rte_mbuf, meta *C.struct_onvm_pkt_meta, nf_loca
 	nf_pkt_handler_chan <- rx_data
 
 	meta.action = C.ONVM_NF_ACTION_DROP
+
+	logger.Log.Tracef("PacketHandler, receive packet from NF: %d\n", uint16(meta.src))
 
 	return 0
 }
