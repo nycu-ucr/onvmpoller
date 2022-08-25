@@ -213,7 +213,7 @@ func DeletePort(port uint16) error {
 	if _, isExist := port_pool[port]; !isExist {
 		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
 		err := errors.New(msg)
-		logger.Log.Fatal(msg)
+		logger.Log.Errorf(msg)
 		return err
 	}
 	delete(port_pool, port)
@@ -277,7 +277,7 @@ func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
 	enc := gob.NewEncoder(&buf)
 	err := enc.Encode(tx_data)
 	if err != nil {
-		logger.Log.Fatal(err)
+		logger.Log.Errorf("EncodeTxChannelDataToBytes error:%+v", err)
 	}
 
 	return buf.Bytes()
@@ -290,7 +290,7 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 	dec := gob.NewDecoder(bytes.NewReader(buf))
 	err := dec.Decode(&rx_data)
 	if err != nil {
-		logger.Log.Fatal(err)
+		logger.Log.Errorf("DecodeToRxChannelData error:%+v", err)
 	}
 
 	logger.Log.Tracef("DecodeToRxChannelData, rx_data:%+v", rx_data)
@@ -326,7 +326,7 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 	if _, isExist := onvmpoll.tables.Load(id); !isExist {
 		msg := fmt.Sprintf("This connID, %v, is not exist", id)
 		err := errors.New(msg)
-		logger.Log.Fatal(msg)
+		logger.Log.Errorln(msg)
 		return err
 	}
 
@@ -361,7 +361,7 @@ func (onvmpoll *OnvmPoll) DeleteEntryFromTable(conn *Connection) error {
 	if _, isExist := onvmpoll.tables.Load(conn.four_tuple); !isExist {
 		msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", conn.four_tuple)
 		err := errors.New(msg)
-		logger.Log.Fatal(msg)
+		logger.Log.Errorln(msg)
 		return err
 	}
 	// delete(fourTuple_to_connID, conn.four_tuple)
@@ -454,6 +454,7 @@ func (onvmpoll *OnvmPoll) Polling() {
 				case txData := <-conn.txchan:
 					logger.Log.Tracef("Conn ID:%d, handle by Polling()", conn.conn_id)
 					onvmpoll.WriteToONVM(conn, txData)
+				default:
 				}
 			}
 			return true
@@ -487,7 +488,7 @@ func (oa OnvmAddr) String() string {
 
 // Read implements the net.Conn Read method.
 func (connection Connection) Read(b []byte) (int, error) {
-	logger.Log.Traceln("Start Connection.Read")
+	logger.Log.Tracef("Start Connection.Read, conn_id:%d", connection.conn_id)
 
 	// Receive packet from onvmpoller
 	rx_data := <-connection.rxchan
@@ -495,7 +496,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 	// Get response
 	if len(b) < len(rx_data.Transaction.HttpMessage) {
 		// TODO: Fix this problem
-		logger.Log.Fatal("Read buffer length is not sufficient")
+		logger.Log.Errorln("Read buffer length is not sufficient")
 	} else {
 		copy(b, rx_data.Transaction.HttpMessage)
 	}
@@ -505,7 +506,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
-	logger.Log.Traceln("Start Connection.Write")
+	logger.Log.Tracef("Start Connection.Write, conn_id:%d", connection.conn_id)
 
 	// Encapsulate buffer into HttpTransaction
 	var ht HttpTransaction
@@ -591,7 +592,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	if !bytes.Equal([]byte("SYN"), rx_data.Transaction.HttpMessage) {
 		msg := fmt.Sprintf("Payload is not SYN, is %v", rx_data.Transaction.HttpMessage)
 		err := errors.New(msg)
-		logger.Log.Fatal(msg)
+		logger.Log.Errorln(msg)
 		return new_conn, err
 	} else {
 		logger.Log.Traceln("Receive one connection request")
@@ -604,13 +605,16 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.Transaction.FourTuple[SRC_IP_ADDR_IDX]
 	new_conn.four_tuple[DST_PORT_IDX] = rx_data.Transaction.FourTuple[SRC_PORT_IDX]
 
+	// Add the connection to table
+	onvmpoll.AddEntryToTable("accept", new_conn)
+
 	// Send ACK back to client
 	conn_response := make([]byte, 3)
 	conn_response = MakeConnCtrlMsg(REPLY_CONN)
 
 	_, err := new_conn.Write(conn_response)
 	if err != nil {
-		logger.Log.Fatal(err.Error())
+		logger.Log.Errorln(err.Error())
 		new_conn.Close()
 		return new_conn, err
 	} else {
@@ -618,9 +622,6 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 			new_conn.four_tuple[DST_IP_ADDR_IDX],
 			new_conn.four_tuple[DST_PORT_IDX])
 	}
-
-	// Add the connection to table
-	onvmpoll.AddEntryToTable("accept", new_conn)
 
 	return new_conn, nil
 }
@@ -676,7 +677,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Dial write connection create request")
 	_, err := conn.Write(conn_request)
 	if err != nil {
-		logger.Log.Fatal(err.Error())
+		logger.Log.Errorln(err.Error())
 		conn.Close()
 		return conn, err
 	} else {
@@ -690,7 +691,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Dial wait connection create response")
 	_, err = conn.Read(conn_response)
 	if err != nil {
-		logger.Log.Fatal(err.Error())
+		logger.Log.Errorln(err.Error())
 		conn.Close()
 		return conn, err
 	} else {
