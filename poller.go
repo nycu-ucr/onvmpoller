@@ -283,18 +283,17 @@ func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
 	return buf.Bytes()
 }
 
-func DecodeToRxChannelData(buf []byte) RxChannelData {
+func DecodeToRxChannelData(buf []byte) (RxChannelData, error) {
 	// Decode bytes to RxChannelData
 	var rx_data RxChannelData
 
 	dec := gob.NewDecoder(bytes.NewReader(buf))
 	err := dec.Decode(&rx_data)
-	if err != nil {
-		logger.Log.Errorf("DecodeToRxChannelData error:%+v", err)
+	if err == nil {
+		logger.Log.Tracef("DecodeToRxChannelData, rx_data:%+v", rx_data)
 	}
 
-	logger.Log.Tracef("DecodeToRxChannelData, rx_data:%+v", rx_data)
-	return rx_data
+	return rx_data, err
 }
 
 /*********************************
