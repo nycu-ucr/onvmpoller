@@ -42,8 +42,6 @@ const (
 	SRC_PORT_IDX    = 1
 	DST_IP_ADDR_IDX = 2
 	DST_PORT_IDX    = 3
-	// For connection ID
-	LISTENER_CONN_ID = 0
 	// Distinguish packet type
 	HTTP_FRAME     = 0
 	ESTABLISH_CONN = 1
@@ -108,7 +106,8 @@ var (
 	local_address       string               // Initialize at ListenONVM
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
-	nf_ctx *C.struct_onvm_nf_local_ctx
+	nf_ctx           *C.struct_onvm_nf_local_ctx
+	listener_conn_id uint16
 )
 
 func init() {
@@ -119,6 +118,7 @@ func init() {
 	port_pool = make(map[uint16]bool)
 	onvmpoll.tables = sync.Map{}
 	nf_pkt_handler_chan = make(chan RxChannelData, 5)
+	listener_conn_id = 0
 	// fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
@@ -172,7 +172,7 @@ func GetConnID() uint16 {
 	var result uint16
 	for {
 		// Reserve conn_id = 0 to listener
-		if conn_id == LISTENER_CONN_ID {
+		if conn_id == listener_conn_id {
 			conn_id++
 			continue
 		}
@@ -300,6 +300,7 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 /*********************************
 	Methods of OnvmPoll
 *********************************/
+
 func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
@@ -316,6 +317,7 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
 	onvmpoll.tables.Store(conn.conn_id, conn)
+	logger.Log.Debugln(onvmpoll.String())
 }
 
 func (onvmpoll *OnvmPoll) Delete(id uint16) error {
@@ -379,8 +381,8 @@ func (onvmpoll OnvmPoll) String() string {
 	// }
 
 	onvmpoll.tables.Range(func(k, v interface{}) bool {
-		if _, ok := k.(int32); ok {
-			result += fmt.Sprintf("\tConnection ID: %d\n", k)
+		if _, ok := k.(uint16); ok {
+			result += fmt.Sprintf("\tConnection ID: %v\n", k)
 		}
 		return true
 	})
@@ -395,19 +397,24 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 		switch rxData.PacketType {
 		case ESTABLISH_CONN:
 			// Deliver packet to litsener's connection
-			lc, _ := onvmpoll.tables.Load(LISTENER_CONN_ID)
+			lc, _ := onvmpoll.tables.Load(listener_conn_id)
 			listener_conn := lc.(*Connection)
 			listener_conn.rxchan <- rxData
+			logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", listener_conn.conn_id)
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
 			c, _ := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
 			conn := c.(*Connection)
 			onvmpoll.Delete(conn.conn_id)
+			logger.Log.Infoln("ReadFromONVM, close connection, Conn ID: %v\n", conn.conn_id)
 		case REPLY_CONN, HTTP_FRAME:
 			// TODO: REPLY_CONN may be removed
 			c, _ := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
 			conn := c.(*Connection)
 			conn.rxchan <- rxData
+			logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", conn.conn_id)
+		default:
+			logger.Log.Errorf("Unknown packet type: %v\n", rxData.PacketType)
 		}
 	}
 }
@@ -598,7 +605,9 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	new_conn.four_tuple[DST_PORT_IDX] = rx_data.Transaction.FourTuple[SRC_PORT_IDX]
 
 	// Send ACK back to client
-	var conn_response []byte = MakeConnCtrlMsg(REPLY_CONN)
+	conn_response := make([]byte, 3)
+	conn_response = MakeConnCtrlMsg(REPLY_CONN)
+
 	_, err := new_conn.Write(conn_response)
 	if err != nil {
 		logger.Log.Fatal(err.Error())

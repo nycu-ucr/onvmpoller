@@ -18,7 +18,7 @@ func listen(ip_addr string, port uint16) (net.Listener, error) {
 
 func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 	c := &Connection{
-		conn_id: LISTENER_CONN_ID,
+		conn_id: listener_conn_id,
 		rxchan:  make(chan RxChannelData, 1),
 		txchan:  make(chan TxChannelData, 1),
 	}
