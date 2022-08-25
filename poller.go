@@ -270,6 +270,8 @@ func GetPacketType(buf []byte) int {
 
 func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
 	// Encode TxChannelData to bytes
+	logger.Log.Tracef("EncodeTxChannelDataToBytes, tx_data:%+v", tx_data)
+
 	var buf bytes.Buffer
 
 	enc := gob.NewEncoder(&buf)
@@ -291,6 +293,7 @@ func DecodeToRxChannelData(buf []byte) RxChannelData {
 		logger.Log.Fatal(err)
 	}
 
+	logger.Log.Tracef("DecodeToRxChannelData, rx_data:%+v", rx_data)
 	return rx_data
 }
 

@@ -15,11 +15,14 @@ import "C"
 
 import (
 	"unsafe"
+
+	"github.com/nycu-ucr/onvmpoller/logger"
 )
 
 //export PacketHandler
 func PacketHandler(pkt *C.struct_rte_mbuf, meta *C.struct_onvm_pkt_meta, nf_local_ctx *C.struct_onvm_nf_local_ctx) int32 {
 	// Change to Go bytes from C char pointer
+	logger.Log.Traceln("PacketHandler recv packet")
 	recv_len := int(C.pktmbuf_data_len_wrapper(pkt))
 	buf := C.GoBytes(unsafe.Pointer(C.pktmbuf_mtod_wrapper(pkt)), C.int(recv_len))
 
