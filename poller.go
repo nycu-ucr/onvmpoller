@@ -70,10 +70,12 @@ type TxChannelData struct {
 }
 
 type Connection struct {
-	conn_id    uint16
-	rxchan     chan (RxChannelData)
-	txchan     chan (TxChannelData)
-	four_tuple [4]string
+	conn_id          uint16
+	rxchan           chan (RxChannelData)
+	txchan           chan (TxChannelData)
+	four_tuple       [4]string
+	is_rxchan_closed bool
+	is_txchan_closed bool
 }
 
 type OnvmListener struct {
@@ -331,25 +333,18 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	onvmpoll.DebugConnectionTable()
 }
 
-func (onvmpoll *OnvmPoll) Delete(id uint16) error {
-	// TODO: Try to use pointer to Connection instead of connection id
+func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
+	// Delete the connection from connection and four-tuple tables
+	if conn.is_txchan_closed && conn.is_rxchan_closed {
+		onvmpoll.DeleteEntryFromTable(conn)
+		onvmpoll.tables.Delete(conn.conn_id)
 
-	if _, isExist := onvmpoll.tables.Load(id); !isExist {
-		msg := fmt.Sprintf("This connID, %v, is not exist", id)
-		err := errors.New(msg)
-		logger.Log.Errorln(msg)
-		return err
+		logger.Log.Infof("Close local connection, conn_id = %v, sucessfully.\n", conn.conn_id)
+		onvmpoll.DebugConnectionTable()
+	} else {
+		logger.Log.Tracef("Conn ID: %v\tis_txchan_closed: %v\tis_rxchan_closed: %v\n",
+			conn.conn_id, conn.is_txchan_closed, conn.is_rxchan_closed)
 	}
-
-	c, _ := onvmpoll.tables.Load(id)
-	conn := c.(*Connection)
-	close(conn.rxchan)
-	close(conn.txchan)
-	onvmpoll.DeleteEntryFromTable(conn)
-	onvmpoll.tables.Delete(id)
-
-	logger.Log.Infof("Close local connection, conn_id = %v, sucessfully.\n", id)
-	onvmpoll.DebugConnectionTable()
 
 	return nil
 }
@@ -450,7 +445,9 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 			} else {
 				conn := c.(*Connection)
 				logger.Log.Infof("ReadFromONVM, close connection, Conn ID: %v\n", conn.conn_id)
-				onvmpoll.Delete(conn.conn_id)
+				close(conn.rxchan)
+				conn.is_rxchan_closed = true
+				onvmpoll.Delete(conn)
 			}
 		case REPLY_CONN, HTTP_FRAME:
 			// TODO: REPLY_CONN may be removed
@@ -490,19 +487,15 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 func (onvmpoll *OnvmPoll) Polling() {
 	// The infinite loop checks each connection for unsent data
 	for {
-		// for _, conn := range onvmpoll.conn_table {
-		// 	select {
-		// 	case txData := <-conn.txchan:
-		// 		onvmpoll.WriteToONVM(&conn, txData)
-		// 	}
-		// }
 		onvmpoll.tables.Range(func(k, v interface{}) bool {
 			if _, ok := k.(uint16); ok {
 				conn := v.(*Connection)
 				select {
-				case txData := <-conn.txchan:
-					logger.Log.Tracef("Conn ID:%d, handle by Polling()", conn.conn_id)
-					onvmpoll.WriteToONVM(conn, txData)
+				case txData, ok := <-conn.txchan:
+					if ok {
+						logger.Log.Tracef("Conn ID:%d, handle by Polling()", conn.conn_id)
+						onvmpoll.WriteToONVM(conn, txData)
+					}
 				default:
 				}
 			}
@@ -582,13 +575,19 @@ func (connection Connection) Write(b []byte) (int, error) {
 
 // Close implements the net.Conn Close method.
 func (connection Connection) Close() error {
-	logger.Log.Tracef("Close connection conn_id: %v\n", connection.conn_id)
+	c, _ := onvmpoll.tables.Load(connection.conn_id)
+	conn_ptr := c.(*Connection)
+
+	logger.Log.Tracef("Close connection conn_id: %v\n", conn_ptr.conn_id)
+
 	// Notify peer connection can be closed
 	var msg []byte = MakeConnCtrlMsg(CLOSE_CONN)
-	connection.Write(msg)
+	conn_ptr.Write(msg)
 
 	// Close local connection
-	err := onvmpoll.Delete(connection.conn_id)
+	close(conn_ptr.txchan)
+	conn_ptr.is_txchan_closed = true
+	err := onvmpoll.Delete(conn_ptr)
 
 	return err
 }
