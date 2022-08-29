@@ -296,6 +296,17 @@ func DecodeToRxChannelData(buf []byte) (RxChannelData, error) {
 	return rx_data, err
 }
 
+func SwapFourTuple(four_tuple [4]string) [4]string {
+	var result [4]string
+
+	result[SRC_IP_ADDR_IDX] = four_tuple[DST_IP_ADDR_IDX]
+	result[SRC_PORT_IDX] = four_tuple[DST_PORT_IDX]
+	result[DST_IP_ADDR_IDX] = four_tuple[SRC_IP_ADDR_IDX]
+	result[DST_PORT_IDX] = four_tuple[SRC_PORT_IDX]
+
+	return result
+}
+
 /*********************************
 	Methods of OnvmPoll
 *********************************/
@@ -316,7 +327,8 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
 	onvmpoll.tables.Store(conn.conn_id, conn)
-	logger.Log.Debugln(onvmpoll.String())
+
+	onvmpoll.DebugConnectionTable()
 }
 
 func (onvmpoll *OnvmPoll) Delete(id uint16) error {
@@ -331,40 +343,38 @@ func (onvmpoll *OnvmPoll) Delete(id uint16) error {
 
 	c, _ := onvmpoll.tables.Load(id)
 	conn := c.(*Connection)
+	close(conn.rxchan)
+	close(conn.txchan)
 	onvmpoll.DeleteEntryFromTable(conn)
 	onvmpoll.tables.Delete(id)
+
+	logger.Log.Infof("Close local connection, conn_id = %v, sucessfully.\n", id)
+	onvmpoll.DebugConnectionTable()
 
 	return nil
 }
 
-func (onvmpoll *OnvmPoll) AddEntryToTable(caller string, conn *Connection) {
+func (onvmpoll *OnvmPoll) AddEntryToTable(conn *Connection) {
 	/* Add the connection to four-tuple table */
-	var four_tuple [4]string
+	var four_tuple [4]string = SwapFourTuple(conn.four_tuple)
 
-	// If it is invoked by dialONVM, it should swap SRC and DST.
-	if caller == "dial" {
-		four_tuple[SRC_IP_ADDR_IDX] = conn.four_tuple[DST_IP_ADDR_IDX]
-		four_tuple[SRC_PORT_IDX] = conn.four_tuple[DST_PORT_IDX]
-		four_tuple[DST_IP_ADDR_IDX] = conn.four_tuple[SRC_IP_ADDR_IDX]
-		four_tuple[DST_PORT_IDX] = conn.four_tuple[SRC_PORT_IDX]
-	} else {
-		four_tuple = conn.four_tuple
-	}
-
-	// fourTuple_to_connID[four_tuple] = conn.conn_id
 	onvmpoll.tables.Store(four_tuple, conn)
+
+	onvmpoll.DebugFourTupleTable()
 }
 
 func (onvmpoll *OnvmPoll) DeleteEntryFromTable(conn *Connection) error {
 	/* Delete the connection from four-tuple table */
-	if _, isExist := onvmpoll.tables.Load(conn.four_tuple); !isExist {
-		msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", conn.four_tuple)
+	var four_tuple [4]string = SwapFourTuple(conn.four_tuple)
+
+	if _, isExist := onvmpoll.tables.Load(four_tuple); !isExist {
+		msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
 		err := errors.New(msg)
 		logger.Log.Errorln(msg)
 		return err
 	}
 	// delete(fourTuple_to_connID, conn.four_tuple)
-	onvmpoll.tables.Delete(conn.four_tuple)
+	onvmpoll.tables.Delete(four_tuple)
 
 	return nil
 }
@@ -389,6 +399,34 @@ func (onvmpoll OnvmPoll) String() string {
 	return result
 }
 
+func (onvmpoll OnvmPoll) DebugConnectionTable() {
+	msg := "Connection Table:\n"
+
+	onvmpoll.tables.Range(func(k, v interface{}) bool {
+		if _, ok := k.(uint16); ok {
+			msg += fmt.Sprintf("\tConnection ID: %v\n", k)
+		}
+		return true
+	})
+
+	logger.Log.Debug(msg)
+}
+
+func (onvmpoll OnvmPoll) DebugFourTupleTable() {
+	msg := "Connection and Four Tuple\n"
+
+	onvmpoll.tables.Range(func(k, v interface{}) bool {
+		if four_tuple, key_ok := k.([4]string); key_ok {
+			if conn, val_ok := v.(*Connection); val_ok {
+				msg += fmt.Sprintf("\tConn ID: %v\tFour Tuple: %v\n", conn.conn_id, four_tuple)
+			}
+		}
+		return true
+	})
+
+	logger.Log.Debug(msg)
+}
+
 func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
@@ -396,22 +434,34 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 		switch rxData.PacketType {
 		case ESTABLISH_CONN:
 			// Deliver packet to litsener's connection
-			lc, _ := onvmpoll.tables.Load(listener_conn_id)
-			listener_conn := lc.(*Connection)
-			listener_conn.rxchan <- rxData
-			logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", listener_conn.conn_id)
+			lc, ok := onvmpoll.tables.Load(listener_conn_id)
+			if !ok {
+				logger.Log.Errorf("ReadFromONVM, can not get connection via listener's Conn ID: %v\n", listener_conn_id)
+			} else {
+				listener_conn := lc.(*Connection)
+				listener_conn.rxchan <- rxData
+				logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", listener_conn.conn_id)
+			}
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
-			c, _ := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
-			conn := c.(*Connection)
-			onvmpoll.Delete(conn.conn_id)
-			logger.Log.Infoln("ReadFromONVM, close connection, Conn ID: %v\n", conn.conn_id)
+			c, ok := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
+			if !ok {
+				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.Transaction.FourTuple)
+			} else {
+				conn := c.(*Connection)
+				logger.Log.Infof("ReadFromONVM, close connection, Conn ID: %v\n", conn.conn_id)
+				onvmpoll.Delete(conn.conn_id)
+			}
 		case REPLY_CONN, HTTP_FRAME:
 			// TODO: REPLY_CONN may be removed
-			c, _ := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
-			conn := c.(*Connection)
-			conn.rxchan <- rxData
-			logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", conn.conn_id)
+			c, ok := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
+			if !ok {
+				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.Transaction.FourTuple)
+			} else {
+				conn := c.(*Connection)
+				conn.rxchan <- rxData
+				logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", conn.conn_id)
+			}
 		default:
 			logger.Log.Errorf("Unknown packet type: %v\n", rxData.PacketType)
 		}
@@ -490,17 +540,23 @@ func (connection Connection) Read(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Read, conn_id:%d", connection.conn_id)
 
 	// Receive packet from onvmpoller
-	rx_data := <-connection.rxchan
+	rx_data, ok := <-connection.rxchan
 
-	// Get response
-	if len(b) < len(rx_data.Transaction.HttpMessage) {
-		// TODO: Fix this problem
-		logger.Log.Errorln("Read buffer length is not sufficient")
+	if ok {
+		// Get response
+		if len(b) < len(rx_data.Transaction.HttpMessage) {
+			// TODO: Fix this problem
+			logger.Log.Errorln("Read buffer length is not sufficient")
+		} else {
+			copy(b, rx_data.Transaction.HttpMessage)
+		}
+
+		return len(rx_data.Transaction.HttpMessage), nil
 	} else {
-		copy(b, rx_data.Transaction.HttpMessage)
-	}
+		err := fmt.Errorf("EOF")
 
-	return len(rx_data.Transaction.HttpMessage), nil
+		return 0, err
+	}
 }
 
 // Write implements the net.Conn Write method.
@@ -526,6 +582,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 
 // Close implements the net.Conn Close method.
 func (connection Connection) Close() error {
+	logger.Log.Tracef("Close connection conn_id: %v\n", connection.conn_id)
 	// Notify peer connection can be closed
 	var msg []byte = MakeConnCtrlMsg(CLOSE_CONN)
 	connection.Write(msg)
@@ -605,7 +662,7 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	new_conn.four_tuple[DST_PORT_IDX] = rx_data.Transaction.FourTuple[SRC_PORT_IDX]
 
 	// Add the connection to table
-	onvmpoll.AddEntryToTable("accept", new_conn)
+	onvmpoll.AddEntryToTable(new_conn)
 
 	// Send ACK back to client
 	conn_response := make([]byte, 3)
@@ -684,7 +741,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	}
 
 	// Add the connection to table, otherwise it can't receive response
-	onvmpoll.AddEntryToTable("dial", conn)
+	onvmpoll.AddEntryToTable(conn)
 
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
