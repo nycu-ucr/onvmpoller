@@ -28,7 +28,7 @@ func PacketHandler(pkt *C.struct_rte_mbuf, meta *C.struct_onvm_pkt_meta, nf_loca
 	// Deliver packet to onvmpoller
 	rx_data, err := DecodeToRxChannelData(buf)
 	if err != nil {
-		logger.Log.Errorf("DecodeToRxChannelData error:%+v", err)
+		logger.Log.Tracef("DecodeToRxChannelData error:%+v", err)
 	} else {
 		nf_pkt_handler_chan <- rx_data
 		logger.Log.Tracef("PacketHandler, receive packet from NF: %d\n", uint16(meta.src))

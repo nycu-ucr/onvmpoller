@@ -47,6 +47,8 @@ const (
 	ESTABLISH_CONN = 1
 	CLOSE_CONN     = 2
 	REPLY_CONN     = 3
+	// Logger level
+	LOG_LEVEL = logrus.InfoLevel
 )
 
 type Config struct {
@@ -124,7 +126,7 @@ func init() {
 	// fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
-	logger.SetLogLevel(logrus.TraceLevel)
+	logger.SetLogLevel(LOG_LEVEL)
 
 	/* Parse NF Name */
 	NfName := ParseNfName(os.Args[0])
@@ -330,7 +332,9 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
 	onvmpoll.tables.Store(conn.conn_id, conn)
 
-	onvmpoll.DebugConnectionTable()
+	if LOG_LEVEL >= 5 {
+		onvmpoll.DebugConnectionTable()
+	}
 }
 
 func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
@@ -340,7 +344,9 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 		onvmpoll.tables.Delete(conn.conn_id)
 
 		logger.Log.Infof("Close local connection, conn_id = %v, sucessfully.\n", conn.conn_id)
-		onvmpoll.DebugConnectionTable()
+		if LOG_LEVEL >= 5 {
+			onvmpoll.DebugConnectionTable()
+		}
 	} else {
 		logger.Log.Tracef("Conn ID: %v\tis_txchan_closed: %v\tis_rxchan_closed: %v\n",
 			conn.conn_id, conn.is_txchan_closed, conn.is_rxchan_closed)
@@ -355,7 +361,9 @@ func (onvmpoll *OnvmPoll) AddEntryToTable(conn *Connection) {
 
 	onvmpoll.tables.Store(four_tuple, conn)
 
-	onvmpoll.DebugFourTupleTable()
+	if LOG_LEVEL >= 5 {
+		onvmpoll.DebugFourTupleTable()
+	}
 }
 
 func (onvmpoll *OnvmPoll) DeleteEntryFromTable(conn *Connection) error {
@@ -404,7 +412,7 @@ func (onvmpoll OnvmPoll) DebugConnectionTable() {
 		return true
 	})
 
-	logger.Log.Debug(msg)
+	logger.Log.Debugln(msg)
 }
 
 func (onvmpoll OnvmPoll) DebugFourTupleTable() {
@@ -419,7 +427,7 @@ func (onvmpoll OnvmPoll) DebugFourTupleTable() {
 		return true
 	})
 
-	logger.Log.Debug(msg)
+	logger.Log.Debugln(msg)
 }
 
 func (onvmpoll *OnvmPoll) ReadFromONVM() {
@@ -556,16 +564,12 @@ func (connection Connection) Read(b []byte) (int, error) {
 func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, conn_id:%d", connection.conn_id)
 
-	// Encapsulate buffer into HttpTransaction
-	var ht HttpTransaction
-	ht.FourTuple = connection.four_tuple
-	ht.HttpMessage = make([]byte, len(b))
-	copy(ht.HttpMessage, b)
-
 	// Encapuslate HttpTransaction into TxChannelData
 	var tx_data TxChannelData
 	tx_data.PacketType = GetPacketType(b)
-	tx_data.Transaction = ht
+	tx_data.Transaction.FourTuple = connection.four_tuple
+	tx_data.Transaction.HttpMessage = make([]byte, len(b))
+	copy(tx_data.Transaction.HttpMessage, b)
 
 	// Send packet to onvmpoller via channel
 	connection.txchan <- tx_data

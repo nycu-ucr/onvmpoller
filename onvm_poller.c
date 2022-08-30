@@ -98,5 +98,5 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buffer, 
     // Send out the generated packet
     onvm_nflib_return_pkt(ctx->nf, pkt);
 
-    printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
+    // printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
 }
