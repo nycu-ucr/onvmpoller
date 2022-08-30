@@ -72,9 +72,9 @@ type TxChannelData struct {
 }
 
 type Connection struct {
-	conn_id          uint16
-	rxchan           chan (RxChannelData)
-	txchan           chan (TxChannelData)
+	conn_id uint16
+	rxchan  chan (RxChannelData)
+	// txchan           chan (TxChannelData)
 	four_tuple       [4]string
 	is_rxchan_closed bool
 	is_txchan_closed bool
@@ -153,6 +153,10 @@ func init() {
 	/* Run onvmpoller */
 	logger.Log.Traceln("Start onvmpoll run")
 	onvmpoll.Run()
+}
+
+func SetLocalAddress(addr string) {
+	local_address = addr
 }
 
 func ParseNfName(args string) string {
@@ -334,7 +338,7 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
-	conn.txchan = make(chan TxChannelData, 1) // For non-blocking
+	// conn.txchan = make(chan TxChannelData, 1) // For non-blocking
 	conn.conn_id = GetConnID()
 
 	// Add the connection into the table
@@ -507,29 +511,29 @@ func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
 }
 
-func (onvmpoll *OnvmPoll) Polling() {
-	// The infinite loop checks each connection for unsent data
-	for {
-		onvmpoll.tables.Range(func(k, v interface{}) bool {
-			if _, ok := k.(uint16); ok {
-				conn := v.(*Connection)
-				select {
-				case txData, ok := <-conn.txchan:
-					if ok {
-						logger.Log.Tracef("Conn ID:%d, handle by Polling()", conn.conn_id)
-						onvmpoll.WriteToONVM(conn, txData)
-					}
-				default:
-				}
-			}
-			return true
-		})
-	}
-}
+// func (onvmpoll *OnvmPoll) Polling() {
+// 	// The infinite loop checks each connection for unsent data
+// 	for {
+// 		onvmpoll.tables.Range(func(k, v interface{}) bool {
+// 			if _, ok := k.(uint16); ok {
+// 				conn := v.(*Connection)
+// 				select {
+// 				case txData, ok := <-conn.txchan:
+// 					if ok {
+// 						logger.Log.Tracef("Conn ID:%d, handle by Polling()", conn.conn_id)
+// 						onvmpoll.WriteToONVM(conn, txData)
+// 					}
+// 				default:
+// 				}
+// 			}
+// 			return true
+// 		})
+// 	}
+// }
 
 func (onvmpoll *OnvmPoll) Run() {
 	go onvmpoll.ReadFromONVM()
-	go onvmpoll.Polling()
+	// go onvmpoll.Polling()
 	go C.onvm_nflib_run(nf_ctx)
 }
 
@@ -587,8 +591,8 @@ func (connection Connection) Write(b []byte) (int, error) {
 	copy(tx_data.Transaction.HttpMessage, b)
 
 	// Send packet to onvmpoller via channel
-	connection.txchan <- tx_data
-
+	// connection.txchan <- tx_data
+	onvmpoll.WriteToONVM(&connection, tx_data)
 	return len(b), nil
 }
 
@@ -604,7 +608,7 @@ func (connection Connection) Close() error {
 	conn_ptr.Write(msg)
 
 	// Close local connection
-	close(conn_ptr.txchan)
+	// close(conn_ptr.txchan)
 	conn_ptr.is_txchan_closed = true
 	err := onvmpoll.Delete(conn_ptr)
 
