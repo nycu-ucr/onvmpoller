@@ -48,7 +48,7 @@ const (
 	CLOSE_CONN     = 2
 	REPLY_CONN     = 3
 	// Logger level
-	LOG_LEVEL = logrus.InfoLevel
+	LOG_LEVEL = logrus.WarnLevel
 )
 
 type Config struct {
@@ -101,12 +101,22 @@ type OnvmPoll struct {
 	tables sync.Map
 }
 
+type connID struct {
+	m  *sync.Mutex
+	ID uint16
+}
+
+type portPool struct {
+	m    *sync.Mutex
+	pool map[uint16]bool
+}
+
 /* Global Variables */
 var (
 	config              Config
-	conn_id             uint16
+	conn_id             connID
 	onvmpoll            OnvmPoll
-	port_pool           map[uint16]bool      // The ports range from 49152 to 65535
+	port_pool           portPool             // The ports range from 49152 to 65535
 	local_address       string               // Initialize at ListenONVM
 	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
@@ -117,9 +127,11 @@ var (
 func init() {
 	/* Initialize Global Variable */
 	InitConfig()
-	conn_id = 0
+	conn_id.ID = 0
+	conn_id.m = new(sync.Mutex)
 	local_address = "127.0.0.1"
-	port_pool = make(map[uint16]bool)
+	port_pool.pool = make(map[uint16]bool)
+	port_pool.m = new(sync.Mutex)
 	onvmpoll.tables = sync.Map{}
 	nf_pkt_handler_chan = make(chan RxChannelData, 5)
 	listener_conn_id = 0
@@ -173,21 +185,23 @@ func InitConfig() {
 
 func GetConnID() uint16 {
 	// TODO: Perhaps there is a sync issue in here.
+	conn_id.m.Lock()
+	defer conn_id.m.Unlock()
 	var result uint16
 	for {
 		// Reserve conn_id = 0 to listener
-		if conn_id == listener_conn_id {
-			conn_id++
+		if conn_id.ID == listener_conn_id {
+			conn_id.ID++
 			continue
 		}
 
 		if _, isExist := onvmpoll.tables.Load(conn_id); !isExist {
-			result = conn_id
-			conn_id++
+			result = conn_id.ID
+			conn_id.ID++
 			break
 		} else {
 			logger.Log.Infof("ID:%d is used.", conn_id)
-			conn_id++
+			conn_id.ID++
 		}
 	}
 
@@ -198,12 +212,13 @@ func GetUnusedPort() uint16 {
 	var base int32 = 49152
 	var upper_limit int32 = 65536 - base
 	var port uint16
-
+	port_pool.m.Lock()
+	defer port_pool.m.Unlock()
 	for {
 		n := rand.Int31n(upper_limit)
 		port = uint16(base + n)
-		if _, isExist := port_pool[port]; !isExist {
-			port_pool[port] = true
+		if _, isExist := port_pool.pool[port]; !isExist {
+			port_pool.pool[port] = true
 			break
 		} else {
 			continue
@@ -214,13 +229,13 @@ func GetUnusedPort() uint16 {
 }
 
 func DeletePort(port uint16) error {
-	if _, isExist := port_pool[port]; !isExist {
+	if _, isExist := port_pool.pool[port]; !isExist {
 		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
 		err := errors.New(msg)
 		logger.Log.Errorf(msg)
 		return err
 	}
-	delete(port_pool, port)
+	delete(port_pool.pool, port)
 	return nil
 }
 
