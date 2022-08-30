@@ -56,25 +56,31 @@ type Config struct {
 	IPIDMap map[string]int32 `yaml:"IPIDMap,omitempty"`
 }
 
-type HttpTransaction struct {
-	FourTuple   [4]string
-	HttpMessage []byte // Request or Response
-}
+// type HttpTransaction struct {
+// 	FourTuple   [4]string
+// 	HttpMessage []byte // Request or Response
+// }
 
-type RxChannelData struct {
-	Transaction HttpTransaction
-	PacketType  int
-}
+// type RxChannelData struct {
+// 	Transaction HttpTransaction
+// 	PacketType  int
+// }
 
-type TxChannelData struct {
-	Transaction HttpTransaction
-	PacketType  int
+// type TxChannelData struct {
+// 	Transaction HttpTransaction
+// 	PacketType  int
+// }
+
+type ChannelData struct {
+	PacketType int
+	FourTuple  [4]string
+	Payload    []byte // Connection control message or HTTP Frame
 }
 
 type Connection struct {
 	dst_id uint8
 	// conn_id uint16
-	rxchan chan (RxChannelData)
+	rxchan chan (ChannelData)
 	// txchan           chan (TxChannelData)
 	four_tuple       [4]string
 	is_rxchan_closed bool
@@ -117,9 +123,9 @@ var (
 	config Config
 	// conn_id             connID
 	onvmpoll            OnvmPoll
-	port_pool           portPool             // The ports range from 49152 to 65535
-	local_address       string               // Initialize at ListenONVM
-	nf_pkt_handler_chan chan (RxChannelData) // data type may change to pointer to buffer
+	port_pool           portPool           // The ports range from 49152 to 65535
+	local_address       string             // Initialize at ListenONVM
+	nf_pkt_handler_chan chan (ChannelData) // data type may change to pointer to buffer
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 	nf_ctx              *C.struct_onvm_nf_local_ctx
 	listener_four_tuple *[4]string
@@ -134,7 +140,7 @@ func init() {
 	port_pool.pool = make(map[uint16]bool)
 	port_pool.m = new(sync.Mutex)
 	onvmpoll.tables = sync.Map{}
-	nf_pkt_handler_chan = make(chan RxChannelData, 1024)
+	nf_pkt_handler_chan = make(chan ChannelData, 1024)
 	// fourTuple_to_connID = make(map[[4]string]uint16)
 
 	/* Setup Logger */
@@ -291,7 +297,7 @@ func MakeConnCtrlMsg(msg_type int) []byte {
 // 	return pkt_type
 // }
 
-func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
+func EncodeTxChannelDataToBytes(tx_data ChannelData) []byte {
 	// Encode TxChannelData to bytes
 	logger.Log.Tracef("EncodeTxChannelDataToBytes, tx_data:%+v", tx_data)
 
@@ -306,9 +312,9 @@ func EncodeTxChannelDataToBytes(tx_data TxChannelData) []byte {
 	return buf.Bytes()
 }
 
-func DecodeToRxChannelData(buf []byte) (RxChannelData, error) {
+func DecodeToRxChannelData(buf []byte) (ChannelData, error) {
 	// Decode bytes to RxChannelData
-	var rx_data RxChannelData
+	var rx_data ChannelData
 
 	dec := gob.NewDecoder(bytes.NewReader(buf))
 	err := dec.Decode(&rx_data)
@@ -337,7 +343,7 @@ func SwapFourTuple(four_tuple [4]string) [4]string {
 func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
-	conn.rxchan = make(chan RxChannelData, 1) // For non-blocking
+	conn.rxchan = make(chan ChannelData, 1) // For non-blocking
 	// conn.txchan = make(chan TxChannelData, 1) // For non-blocking
 	// conn.conn_id = GetConnID()
 
@@ -496,9 +502,9 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
-			c, ok := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
+			c, ok := onvmpoll.tables.Load(rxData.FourTuple)
 			if !ok {
-				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.Transaction.FourTuple)
+				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.FourTuple)
 			} else {
 				conn := c.(*Connection)
 				logger.Log.Infof("ReadFromONVM, close connection, four-tuple: %v\n", conn.four_tuple)
@@ -508,9 +514,9 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 			}
 		case REPLY_CONN, HTTP_FRAME:
 			// TODO: REPLY_CONN may be removed
-			c, ok := onvmpoll.tables.Load(rxData.Transaction.FourTuple)
+			c, ok := onvmpoll.tables.Load(rxData.FourTuple)
 			if !ok {
-				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.Transaction.FourTuple)
+				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.FourTuple)
 			} else {
 				conn := c.(*Connection)
 				conn.rxchan <- rxData
@@ -522,7 +528,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	}
 }
 
-func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data TxChannelData) {
+func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data ChannelData) {
 	// Get destination NF ID
 	logger.Log.Tracef("Four-tuple: %v, WriteToONVM()", conn.four_tuple)
 
@@ -594,11 +600,11 @@ func (connection Connection) Read(b []byte) (int, error) {
 	if ok {
 		// Get response
 		var length int
-		if len(b) < len(rx_data.Transaction.HttpMessage) {
+		if len(b) < len(rx_data.Payload) {
 			// TODO: Fix this problem
 			logger.Log.Errorln("Read buffer length is not sufficient")
 		} else {
-			length = copy(b, rx_data.Transaction.HttpMessage)
+			length = copy(b, rx_data.Payload)
 		}
 
 		return length, nil
@@ -614,11 +620,11 @@ func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 
 	// Encapuslate HttpTransaction into TxChannelData
-	var tx_data TxChannelData
+	var tx_data ChannelData
 	tx_data.PacketType = HTTP_FRAME
-	tx_data.Transaction.FourTuple = connection.four_tuple
-	tx_data.Transaction.HttpMessage = make([]byte, len(b))
-	copy(tx_data.Transaction.HttpMessage, b)
+	tx_data.FourTuple = connection.four_tuple
+	tx_data.Payload = make([]byte, len(b))
+	copy(tx_data.Payload, b)
 
 	// Send packet to onvmpoller via channel
 	// connection.txchan <- tx_data
@@ -642,10 +648,10 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 
 	// Encapuslate HttpTransaction into TxChannelData
-	var tx_data TxChannelData
+	var tx_data ChannelData
 	tx_data.PacketType = msg_type
-	tx_data.Transaction.FourTuple = connection.four_tuple
-	tx_data.Transaction.HttpMessage = MakeConnCtrlMsg(msg_type)
+	tx_data.FourTuple = connection.four_tuple
+	tx_data.Payload = MakeConnCtrlMsg(msg_type)
 
 	// Send packet to onvmpoller via channel
 	// connection.txchan <- tx_data
@@ -661,7 +667,7 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
 
-	return len(tx_data.Transaction.HttpMessage), nil
+	return len(tx_data.Payload), nil
 }
 
 // Close implements the net.Conn Close method.
@@ -744,9 +750,9 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	new_conn = onvmpoll.Create()
 	new_conn.four_tuple[SRC_IP_ADDR_IDX] = ol.laddr.ipv4_addr
 	new_conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(ol.laddr.port)
-	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.Transaction.FourTuple[SRC_IP_ADDR_IDX]
-	new_conn.four_tuple[DST_PORT_IDX] = rx_data.Transaction.FourTuple[SRC_PORT_IDX]
-	dst_id, _ := IpToID(rx_data.Transaction.FourTuple[SRC_IP_ADDR_IDX])
+	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.FourTuple[SRC_IP_ADDR_IDX]
+	new_conn.four_tuple[DST_PORT_IDX] = rx_data.FourTuple[SRC_PORT_IDX]
+	dst_id, _ := IpToID(rx_data.FourTuple[SRC_IP_ADDR_IDX])
 	new_conn.dst_id = uint8(dst_id)
 
 	// Add the connection to table

@@ -19,7 +19,7 @@ func listen(ip_addr string, port uint16) (net.Listener, error) {
 func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 	c := &Connection{
 		// conn_id: listener_conn_id,
-		rxchan: make(chan RxChannelData, 1),
+		rxchan: make(chan ChannelData, 1),
 		// txchan:  make(chan TxChannelData, 1),
 	}
 	c.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
