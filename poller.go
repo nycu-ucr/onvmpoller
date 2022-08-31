@@ -297,30 +297,23 @@ func MakeConnCtrlMsg(msg_type int) []byte {
 // 	return pkt_type
 // }
 
-func EncodeTxChannelDataToBytes(tx_data ChannelData) []byte {
+func EncodeChannelDataToBytes(tx_data ChannelData) ([]byte, error) {
 	// Encode TxChannelData to bytes
-	logger.Log.Tracef("EncodeTxChannelDataToBytes, tx_data:%+v", tx_data)
-
+	// logger.Log.Tracef("EncodeChannelDataToBytes, tx_data:%+v", tx_data)
 	var buf bytes.Buffer
 
 	enc := gob.NewEncoder(&buf)
 	err := enc.Encode(tx_data)
-	if err != nil {
-		logger.Log.Errorf("EncodeTxChannelDataToBytes error:%+v", err)
-	}
 
-	return buf.Bytes()
+	return buf.Bytes(), err
 }
 
-func DecodeToRxChannelData(buf []byte) (ChannelData, error) {
+func DecodeToChannelData(buf []byte) (ChannelData, error) {
 	// Decode bytes to RxChannelData
 	var rx_data ChannelData
 
 	dec := gob.NewDecoder(bytes.NewReader(buf))
 	err := dec.Decode(&rx_data)
-	if err == nil {
-		logger.Log.Tracef("DecodeToRxChannelData, rx_data:%+v", rx_data)
-	}
 
 	return rx_data, err
 }
@@ -504,7 +497,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 			// Let onvmpoller delete the connection
 			c, ok := onvmpoll.tables.Load(rxData.FourTuple)
 			if !ok {
-				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.FourTuple)
+				logger.Log.Errorf("ReadFromONVM, close can not get the connection via four-tuple:%v\n", rxData.FourTuple)
 			} else {
 				conn := c.(*Connection)
 				logger.Log.Infof("ReadFromONVM, close connection, four-tuple: %v\n", conn.four_tuple)
@@ -528,23 +521,23 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	}
 }
 
-func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data ChannelData) {
-	// Get destination NF ID
-	logger.Log.Tracef("Four-tuple: %v, WriteToONVM()", conn.four_tuple)
+// func (onvmpoll *OnvmPoll) WriteToONVM(conn *Connection, tx_data ChannelData) {
+// 	// Get destination NF ID
+// 	logger.Log.Tracef("Four-tuple: %v, WriteToONVM()", conn.four_tuple)
 
-	// id, _ := IpToID(conn.four_tuple[DST_IP_ADDR_IDX])
-	dst_id := C.int(conn.dst_id)
+// 	// id, _ := IpToID(conn.four_tuple[DST_IP_ADDR_IDX])
+// 	dst_id := C.int(conn.dst_id)
 
-	// Translate Go structure to C char *
-	var buffer []byte
-	var buffer_ptr *C.char
+// 	// Translate Go structure to C char *
+// 	var buffer []byte
+// 	var buffer_ptr *C.char
 
-	buffer = EncodeTxChannelDataToBytes(tx_data)
-	buffer_ptr = (*C.char)(C.CBytes(buffer))
+// 	buffer = EncodeChannelDataToBytes(tx_data)
+// 	buffer_ptr = (*C.char)(C.CBytes(buffer))
 
-	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
-}
+// 	// Use CGO to call functions of NFLib
+// 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
+// }
 
 // func (onvmpoll *OnvmPoll) Polling() {
 // 	// The infinite loop checks each connection for unsent data
@@ -626,16 +619,21 @@ func (connection Connection) Write(b []byte) (int, error) {
 	tx_data.Payload = make([]byte, len(b))
 	copy(tx_data.Payload, b)
 
-	// Send packet to onvmpoller via channel
-	// connection.txchan <- tx_data
-	dst_id := C.int(connection.dst_id)
-
 	// Translate Go structure to C char *
 	var buffer []byte
 	var buffer_ptr *C.char
 
-	buffer = EncodeTxChannelDataToBytes(tx_data)
+	// t1 := time.Now()
+	buffer, err := EncodeChannelDataToBytes(tx_data)
+	// t2 := time.Now()
+	// logger.Log.Debugf("Encode time: %v\n", t2.Sub(t1).Seconds()*1000)
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		return len(buffer), err
+	}
+
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	dst_id := C.int(connection.dst_id)
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
@@ -645,7 +643,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 
 // For connection control message
 func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
-	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
+	logger.Log.Tracef("Start Connection.WriteControlMessage, four-tuple: %v", connection.four_tuple)
 
 	// Encapuslate HttpTransaction into TxChannelData
 	var tx_data ChannelData
@@ -653,16 +651,22 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	tx_data.FourTuple = connection.four_tuple
 	tx_data.Payload = MakeConnCtrlMsg(msg_type)
 
-	// Send packet to onvmpoller via channel
-	// connection.txchan <- tx_data
-	dst_id := C.int(connection.dst_id)
-
 	// Translate Go structure to C char *
 	var buffer []byte
 	var buffer_ptr *C.char
 
-	buffer = EncodeTxChannelDataToBytes(tx_data)
+	// t1 := time.Now()
+	buffer, err := EncodeChannelDataToBytes(tx_data)
+	// t2 := time.Now()
+	// logger.Log.Debugf("Encode time: %v\n", t2.Sub(t1).Seconds()*1000)
+
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		return len(buffer), err
+	}
+
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	dst_id := C.int(connection.dst_id)
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
@@ -820,10 +824,9 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.dst_id = uint8(dst_id)
 
 	// Send connection request to server
-	conn_response := make([]byte, 3)
-
-	logger.Log.Traceln("Dial write connection create request")
 	_, err := conn.WriteControlMessage(ESTABLISH_CONN)
+	logger.Log.Traceln("Dial write connection create request")
+
 	if err != nil {
 		logger.Log.Errorln(err.Error())
 		conn.Close()
@@ -837,6 +840,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	onvmpoll.Add(conn)
 
 	// Wait for response
+	conn_response := make([]byte, 3)
 	logger.Log.Traceln("Dial wait connection create response")
 	_, err = conn.Read(conn_response)
 	if err != nil {
