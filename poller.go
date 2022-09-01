@@ -73,7 +73,7 @@ type Config struct {
 
 type ChannelData struct {
 	PacketType int
-	FourTuple  [4]string
+	FourTuple  string
 	Payload    []byte // Connection control message or HTTP Frame
 }
 
@@ -82,9 +82,10 @@ type Connection struct {
 	// conn_id uint16
 	rxchan chan (ChannelData)
 	// txchan           chan (TxChannelData)
-	four_tuple       [4]string
 	is_rxchan_closed bool
 	is_txchan_closed bool
+	/* [src_ip, src_port, dst_ip, dst_port] */
+	four_tuple string
 }
 
 type OnvmListener struct {
@@ -128,7 +129,7 @@ var (
 	nf_pkt_handler_chan chan (ChannelData) // data type may change to pointer to buffer
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 	nf_ctx              *C.struct_onvm_nf_local_ctx
-	listener_four_tuple *[4]string
+	listener_four_tuple *string
 
 	//Control Message (bytes)
 	SYN = []byte("SYN")
@@ -320,15 +321,22 @@ func DecodeToChannelData(buf []byte) (ChannelData, error) {
 	return rx_data, err
 }
 
-func SwapFourTuple(four_tuple [4]string) [4]string {
-	var result [4]string
-
-	result[SRC_IP_ADDR_IDX] = four_tuple[DST_IP_ADDR_IDX]
-	result[SRC_PORT_IDX] = four_tuple[DST_PORT_IDX]
-	result[DST_IP_ADDR_IDX] = four_tuple[SRC_IP_ADDR_IDX]
-	result[DST_PORT_IDX] = four_tuple[SRC_PORT_IDX]
+func SwapFourTuple(four_tuple string) string {
+	/*
+		tuples[0] = src_ip
+		tuples[1] = src_port
+		tuples[2] = dst_ip
+		tuples[3] = dst_port
+	*/
+	tuples := strings.Split(four_tuple, ",")
+	result := fmt.Sprintf("%s,%s,%s,%s", tuples[2], tuples[3], tuples[0], tuples[1])
 
 	return result
+}
+
+func ParseFourTupleByIndex(four_tuple string, index int) string {
+	tuples := strings.Split(four_tuple, ",")
+	return tuples[index]
 }
 
 /*********************************
@@ -350,7 +358,7 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	var four_tuple [4]string = SwapFourTuple(conn.four_tuple)
+	var four_tuple string = SwapFourTuple(conn.four_tuple)
 
 	onvmpoll.tables.Store(four_tuple, conn)
 
@@ -362,7 +370,7 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
 	if conn.is_txchan_closed && conn.is_rxchan_closed {
-		var four_tuple [4]string = SwapFourTuple(conn.four_tuple)
+		var four_tuple string = SwapFourTuple(conn.four_tuple)
 
 		if _, isExist := onvmpoll.tables.Load(four_tuple); !isExist {
 			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
@@ -382,7 +390,7 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	return nil
 }
 
-func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *[4]string) (*Connection, error) {
+func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *string) (*Connection, error) {
 	swap_four_tuple := SwapFourTuple(*four_tuple)
 	c, ok := onvmpoll.tables.Load(swap_four_tuple)
 
@@ -699,8 +707,8 @@ func (connection Connection) Close() error {
 // LocalAddr implements the net.Conn LocalAddr method.
 func (connection Connection) LocalAddr() net.Addr {
 	var oa OnvmAddr
-	v, _ := strconv.ParseUint(connection.four_tuple[SRC_PORT_IDX], 10, 64)
-	oa.ipv4_addr = connection.four_tuple[SRC_IP_ADDR_IDX]
+	v, _ := strconv.ParseUint(ParseFourTupleByIndex(connection.four_tuple, SRC_PORT_IDX), 10, 64)
+	oa.ipv4_addr = ParseFourTupleByIndex(connection.four_tuple, SRC_IP_ADDR_IDX)
 	oa.port = uint16(v)
 	oa.network = "onvm"
 	id, _ := IpToID(oa.ipv4_addr)
@@ -712,8 +720,8 @@ func (connection Connection) LocalAddr() net.Addr {
 // RemoteAddr implements the net.Conn RemoteAddr method.
 func (connection Connection) RemoteAddr() net.Addr {
 	var oa OnvmAddr
-	v, _ := strconv.ParseUint(connection.four_tuple[DST_PORT_IDX], 10, 64)
-	oa.ipv4_addr = connection.four_tuple[DST_IP_ADDR_IDX]
+	v, _ := strconv.ParseUint(ParseFourTupleByIndex(connection.four_tuple, DST_PORT_IDX), 10, 64)
+	oa.ipv4_addr = ParseFourTupleByIndex(connection.four_tuple, DST_IP_ADDR_IDX)
 	oa.port = uint16(v)
 	oa.network = "onvm"
 	id, _ := IpToID(oa.ipv4_addr)
@@ -752,11 +760,9 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 
 	// Initialize the new connection
 	new_conn = onvmpoll.Create()
-	new_conn.four_tuple[SRC_IP_ADDR_IDX] = ol.laddr.ipv4_addr
-	new_conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(ol.laddr.port)
-	new_conn.four_tuple[DST_IP_ADDR_IDX] = rx_data.FourTuple[SRC_IP_ADDR_IDX]
-	new_conn.four_tuple[DST_PORT_IDX] = rx_data.FourTuple[SRC_PORT_IDX]
-	dst_id, _ := IpToID(rx_data.FourTuple[SRC_IP_ADDR_IDX])
+	new_conn.four_tuple = fmt.Sprintf("%s,%s,%s,%s", ol.laddr.ipv4_addr, fmt.Sprint(ol.laddr.port),
+		ParseFourTupleByIndex(rx_data.FourTuple, SRC_IP_ADDR_IDX), ParseFourTupleByIndex(rx_data.FourTuple, SRC_PORT_IDX))
+	dst_id, _ := IpToID(ParseFourTupleByIndex(rx_data.FourTuple, SRC_IP_ADDR_IDX))
 	new_conn.dst_id = uint8(dst_id)
 
 	// Add the connection to table
@@ -816,10 +822,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 
 	// Initialize a connection
 	conn := onvmpoll.Create()
-	conn.four_tuple[SRC_IP_ADDR_IDX] = local_address
-	conn.four_tuple[SRC_PORT_IDX] = fmt.Sprint(GetUnusedPort())
-	conn.four_tuple[DST_IP_ADDR_IDX] = ip_addr
-	conn.four_tuple[DST_PORT_IDX] = fmt.Sprint(port)
+	conn.four_tuple = fmt.Sprintf("%s,%s,%s,%s", local_address, fmt.Sprint(GetUnusedPort()), ip_addr, fmt.Sprint(port))
 	dst_id, _ := IpToID(ip_addr)
 	conn.dst_id = uint8(dst_id)
 

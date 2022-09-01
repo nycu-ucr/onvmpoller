@@ -21,11 +21,8 @@ func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 		// conn_id: listener_conn_id,
 		rxchan: make(chan ChannelData, 1),
 		// txchan:  make(chan TxChannelData, 1),
+		four_tuple: fmt.Sprintf("%s,%s,%s,%s", ip_addr, fmt.Sprint(port), "", 0),
 	}
-	c.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
-	c.four_tuple[SRC_PORT_IDX] = fmt.Sprint(port)
-	c.four_tuple[DST_IP_ADDR_IDX] = ""
-	c.four_tuple[DST_PORT_IDX] = "0"
 	listener_four_tuple = &c.four_tuple
 	onvmpoll.Add(c)
 
