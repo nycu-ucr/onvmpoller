@@ -129,6 +129,11 @@ var (
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 	nf_ctx              *C.struct_onvm_nf_local_ctx
 	listener_four_tuple *[4]string
+
+	//Control Message (bytes)
+	SYN = []byte("SYN")
+	ACK = []byte("ACK")
+	FIN = []byte("FIN")
 )
 
 func init() {
@@ -268,17 +273,14 @@ func ParseAddress(address string) (string, uint16) {
 }
 
 func MakeConnCtrlMsg(msg_type int) []byte {
-	var msg []byte
 	switch msg_type {
 	case ESTABLISH_CONN:
-		msg = []byte("SYN")
+		return SYN
 	case REPLY_CONN:
-		msg = []byte("ACK")
-	case CLOSE_CONN:
-		msg = []byte("FIN")
+		return ACK
+	default:
+		return FIN
 	}
-
-	return msg
 }
 
 // func GetPacketType(buf []byte) int {
@@ -633,10 +635,9 @@ func (connection Connection) Write(b []byte) (int, error) {
 	}
 
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
-	dst_id := C.int(connection.dst_id)
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), buffer_ptr, C.int(len(buffer)))
 
 	return len(b), nil
 }
@@ -666,10 +667,9 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	}
 
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
-	dst_id := C.int(connection.dst_id)
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, dst_id, buffer_ptr, C.int(len(buffer)))
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), buffer_ptr, C.int(len(buffer)))
 
 	return len(tx_data.Payload), nil
 }

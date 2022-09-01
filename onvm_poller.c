@@ -3,7 +3,7 @@
 
 // extern int PacketHandler(struct rte_mbuf*, struct onvm_pkt_meta*, struct onvm_nf_local_ctx*);
 
-int nfName_len(char *p)
+int string_len(char *p)
 {
     unsigned int count = 0;
 
@@ -20,7 +20,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
 {
     printf("[NF Name]: %s\n", nfName);
     const char *NF_TAG = nfName;
-    int nfName_size = nfName_len(nfName);
+    int nfName_size = string_len(nfName);
     char nf_name[nfName_size];
     memcpy(nf_name, nfName, sizeof(nfName));
 
@@ -91,7 +91,6 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buffer, 
     pkt->hash.rss = 0;
     pkt->port = 0;
     pkt->data_len = buffer_length;
-
     // Copy the packet into the rte_mbuf data section
     rte_memcpy(rte_pktmbuf_mtod(pkt, char *), buffer, buffer_length);
 
