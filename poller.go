@@ -505,6 +505,49 @@ func (onvmpoll OnvmPoll) DebugFourTupleTable() {
 	logger.Log.Debugln(msg)
 }
 
+//export DeliverPacket
+func (onvmpoll *OnvmPoll) DeliverPacket(packet_type int, buf []byte, src_ip uint32, src_port uint16, dst_ip uint32, dst_port uint16) {
+	// Deliver the packet to the right connection via four-tuple
+	four_tuple := Four_tuple_rte{Src_ip: src_ip, Src_port: src_port, Dst_ip: dst_ip, Dst_port: dst_port}
+	rxdata := ChannelData{PacketType: packet_type, FourTuple: four_tuple, Payload: buf}
+
+	switch packet_type {
+	case ESTABLISH_CONN:
+		// Deliver packet to litsener's connection
+		listener_conn, err := onvmpoll.GetConnByReverseFourTuple(listener_four_tuple)
+
+		if err != nil {
+			logger.Log.Errorln(err)
+		} else {
+			listener_conn.rxchan <- rxdata
+		}
+
+	case CLOSE_CONN:
+		// Let onvmpoller delete the connection
+		c, ok := onvmpoll.tables.Load(four_tuple)
+		if !ok {
+			logger.Log.Errorf("ReadFromONVM, close can not get the connection via four-tuple:%v\n", four_tuple)
+		} else {
+			conn := c.(*Connection)
+			logger.Log.Infof("ReadFromONVM, close connection, four-tuple: %v\n", conn.four_tuple)
+			close(conn.rxchan)
+			conn.is_rxchan_closed = true
+			onvmpoll.Delete(conn)
+		}
+	case REPLY_CONN, HTTP_FRAME:
+		c, ok := onvmpoll.tables.Load(four_tuple)
+		if !ok {
+			logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", four_tuple)
+		} else {
+			conn := c.(*Connection)
+			conn.rxchan <- rxdata
+			// logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", conn.conn_id)
+		}
+	default:
+		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
+	}
+}
+
 func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
