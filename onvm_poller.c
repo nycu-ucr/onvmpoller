@@ -1,9 +1,23 @@
 #include "onvm_nflib.h"
 #include "_cgo_export.h"
+#include "string.h"
 
 // extern int PacketHandler(struct rte_mbuf*, struct onvm_pkt_meta*, struct onvm_nf_local_ctx*);
 
-int string_len(char *p)
+struct four_tuple
+{
+    rte_be32_t src_addr; /**< source address */
+    rte_be16_t src_port; /**< TCP source port. */
+    rte_be32_t dst_addr; /**< destination address */
+    rte_be16_t dst_port; /**< TCP destination port. */
+};
+
+struct four_tuple_str
+{
+    char *tuples[4];
+};
+
+static inline int string_len(char *p)
 {
     unsigned int count = 0;
 
@@ -14,6 +28,23 @@ int string_len(char *p)
     }
 
     return count;
+}
+
+static inline void parseFourTuple(char *four_tuple)
+{
+    char *token = strtok(four_tuple, ",");
+
+    while (token != NULL)
+    {
+        // printf("%s\n", token);
+        token = strtok(NULL, ",");
+    }
+}
+
+static inline struct four_tuple *EncodeFourTuple(char *four_tuple)
+{
+    struct four_tuple *result;
+    return result;
 }
 
 int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
@@ -63,11 +94,15 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     return 0;
 }
 
-void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buffer, int buffer_length)
+void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
+                   uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
+                   char *buffer, int buffer_length)
 {
     struct rte_mbuf *pkt;
     struct onvm_pkt_meta *pmeta;
     struct rte_mempool *pktmbuf_pool;
+
+    // printf("[pkt_type]: %d\n", pkt_type);
 
     pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL)

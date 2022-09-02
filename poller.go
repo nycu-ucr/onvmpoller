@@ -12,12 +12,15 @@ package onvmpoller
 #include <onvm_nflib.h>
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
-extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, char *buff, int buff_length);
+extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
+                uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
+                char *buffer, int buffer_length);
 */
 import "C"
 
 import (
 	"bytes"
+	"encoding/binary"
 	"encoding/gob"
 	"errors"
 	"fmt"
@@ -73,7 +76,7 @@ type Config struct {
 
 type ChannelData struct {
 	PacketType int
-	FourTuple  string
+	FourTuple  Four_tuple_rte
 	Payload    []byte // Connection control message or HTTP Frame
 }
 
@@ -85,7 +88,14 @@ type Connection struct {
 	is_rxchan_closed bool
 	is_txchan_closed bool
 	/* [src_ip, src_port, dst_ip, dst_port] */
-	four_tuple string
+	four_tuple Four_tuple_rte
+}
+
+type Four_tuple_rte struct {
+	Src_ip   uint32
+	Src_port uint16
+	Dst_ip   uint32
+	Dst_port uint16
 }
 
 type OnvmListener struct {
@@ -115,7 +125,7 @@ type OnvmPoll struct {
 // }
 
 type portPool struct {
-	m    *sync.Mutex
+	m    *sync.RWMutex
 	pool map[uint16]bool
 }
 
@@ -129,7 +139,7 @@ var (
 	nf_pkt_handler_chan chan (ChannelData) // data type may change to pointer to buffer
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 	nf_ctx              *C.struct_onvm_nf_local_ctx
-	listener_four_tuple *string
+	listener_four_tuple *Four_tuple_rte
 
 	//Control Message (bytes)
 	SYN = []byte("SYN")
@@ -144,7 +154,7 @@ func init() {
 	// conn_id.m = new(sync.Mutex)
 	local_address = "127.0.0.1"
 	port_pool.pool = make(map[uint16]bool)
-	port_pool.m = new(sync.Mutex)
+	port_pool.m = new(sync.RWMutex)
 	onvmpoll.tables = sync.Map{}
 	nf_pkt_handler_chan = make(chan ChannelData, 1024)
 	// fourTuple_to_connID = make(map[[4]string]uint16)
@@ -284,6 +294,16 @@ func MakeConnCtrlMsg(msg_type int) []byte {
 	}
 }
 
+func unMarshalIP(ip uint32) string {
+	ipInt := int64(ip)
+	// need to do two bit shifting and “0xff” masking
+	b0 := strconv.FormatInt((ipInt>>24)&0xff, 10)
+	b1 := strconv.FormatInt((ipInt>>16)&0xff, 10)
+	b2 := strconv.FormatInt((ipInt>>8)&0xff, 10)
+	b3 := strconv.FormatInt((ipInt & 0xff), 10)
+	return b0 + "." + b1 + "." + b2 + "." + b3
+}
+
 // func GetPacketType(buf []byte) int {
 // 	var pkt_type int
 
@@ -321,17 +341,15 @@ func DecodeToChannelData(buf []byte) (ChannelData, error) {
 	return rx_data, err
 }
 
-func SwapFourTuple(four_tuple string) string {
-	/*
-		tuples[0] = src_ip
-		tuples[1] = src_port
-		tuples[2] = dst_ip
-		tuples[3] = dst_port
-	*/
-	tuples := strings.Split(four_tuple, ",")
-	result := fmt.Sprintf("%s,%s,%s,%s", tuples[2], tuples[3], tuples[0], tuples[1])
+func SwapFourTuple(four_tuple Four_tuple_rte) Four_tuple_rte {
+	result := &Four_tuple_rte{
+		Src_ip:   four_tuple.Dst_ip,
+		Src_port: four_tuple.Dst_port,
+		Dst_ip:   four_tuple.Src_ip,
+		Dst_port: four_tuple.Src_port,
+	}
 
-	return result
+	return *result
 }
 
 func ParseFourTupleByIndex(four_tuple string, index int) string {
@@ -358,7 +376,7 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	var four_tuple string = SwapFourTuple(conn.four_tuple)
+	var four_tuple Four_tuple_rte = SwapFourTuple(conn.four_tuple)
 
 	onvmpoll.tables.Store(four_tuple, conn)
 
@@ -370,7 +388,7 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
 	if conn.is_txchan_closed && conn.is_rxchan_closed {
-		var four_tuple string = SwapFourTuple(conn.four_tuple)
+		var four_tuple Four_tuple_rte = SwapFourTuple(conn.four_tuple)
 
 		if _, isExist := onvmpoll.tables.Load(four_tuple); !isExist {
 			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
@@ -390,7 +408,7 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	return nil
 }
 
-func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *string) (*Connection, error) {
+func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
 	swap_four_tuple := SwapFourTuple(*four_tuple)
 	c, ok := onvmpoll.tables.Load(swap_four_tuple)
 
@@ -645,7 +663,10 @@ func (connection Connection) Write(b []byte) (int, error) {
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), buffer_ptr, C.int(len(buffer)))
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
+		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
+		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
+		buffer_ptr, C.int(len(buffer)))
 
 	return len(b), nil
 }
@@ -677,7 +698,10 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), buffer_ptr, C.int(len(buffer)))
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
+		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
+		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
+		buffer_ptr, C.int(len(buffer)))
 
 	return len(tx_data.Payload), nil
 }
@@ -707,9 +731,8 @@ func (connection Connection) Close() error {
 // LocalAddr implements the net.Conn LocalAddr method.
 func (connection Connection) LocalAddr() net.Addr {
 	var oa OnvmAddr
-	v, _ := strconv.ParseUint(ParseFourTupleByIndex(connection.four_tuple, SRC_PORT_IDX), 10, 64)
-	oa.ipv4_addr = ParseFourTupleByIndex(connection.four_tuple, SRC_IP_ADDR_IDX)
-	oa.port = uint16(v)
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
+	oa.port = connection.four_tuple.Src_port
 	oa.network = "onvm"
 	id, _ := IpToID(oa.ipv4_addr)
 	oa.service_id = uint8(id)
@@ -720,9 +743,8 @@ func (connection Connection) LocalAddr() net.Addr {
 // RemoteAddr implements the net.Conn RemoteAddr method.
 func (connection Connection) RemoteAddr() net.Addr {
 	var oa OnvmAddr
-	v, _ := strconv.ParseUint(ParseFourTupleByIndex(connection.four_tuple, DST_PORT_IDX), 10, 64)
-	oa.ipv4_addr = ParseFourTupleByIndex(connection.four_tuple, DST_IP_ADDR_IDX)
-	oa.port = uint16(v)
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip) //ParseFourTupleByIndex(connection.four_tuple, DST_IP_ADDR_IDX)
+	oa.port = connection.four_tuple.Dst_port
 	oa.network = "onvm"
 	id, _ := IpToID(oa.ipv4_addr)
 	oa.service_id = uint8(id)
@@ -760,9 +782,12 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 
 	// Initialize the new connection
 	new_conn = onvmpoll.Create()
-	new_conn.four_tuple = fmt.Sprintf("%s,%s,%s,%s", ol.laddr.ipv4_addr, fmt.Sprint(ol.laddr.port),
-		ParseFourTupleByIndex(rx_data.FourTuple, SRC_IP_ADDR_IDX), ParseFourTupleByIndex(rx_data.FourTuple, SRC_PORT_IDX))
-	dst_id, _ := IpToID(ParseFourTupleByIndex(rx_data.FourTuple, SRC_IP_ADDR_IDX))
+	new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(ol.laddr.ipv4_addr)[12:16])
+	new_conn.four_tuple.Src_port = ol.laddr.port
+	new_conn.four_tuple.Dst_ip = rx_data.FourTuple.Src_ip
+	new_conn.four_tuple.Dst_port = rx_data.FourTuple.Src_port
+
+	dst_id, _ := IpToID(unMarshalIP(rx_data.FourTuple.Src_ip))
 	new_conn.dst_id = uint8(dst_id)
 
 	// Add the connection to table
@@ -777,8 +802,8 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 		return new_conn, err
 	} else {
 		logger.Log.Tracef("Write connection response to (%v, %v)",
-			new_conn.four_tuple[DST_IP_ADDR_IDX],
-			new_conn.four_tuple[DST_PORT_IDX])
+			new_conn.four_tuple.Dst_ip,
+			new_conn.four_tuple.Dst_port)
 	}
 
 	return new_conn, nil
@@ -819,10 +844,16 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Start DialONVM")
 
 	ip_addr, port := ParseAddress(address)
+	uint32_ip := binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	logger.Log.Warnf("uint32_ip: %d, uint16_port: %d", uint32_ip, port)
 
 	// Initialize a connection
 	conn := onvmpoll.Create()
-	conn.four_tuple = fmt.Sprintf("%s,%s,%s,%s", local_address, fmt.Sprint(GetUnusedPort()), ip_addr, fmt.Sprint(port))
+	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
+	conn.four_tuple.Src_port = GetUnusedPort()
+	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	conn.four_tuple.Dst_port = port
+
 	dst_id, _ := IpToID(ip_addr)
 	conn.dst_id = uint8(dst_id)
 
