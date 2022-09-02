@@ -304,6 +304,12 @@ func unMarshalIP(ip uint32) string {
 	return b0 + "." + b1 + "." + b2 + "." + b3
 }
 
+func hashV4Flow(four_tuple Four_tuple_rte) uint32 {
+	flowHash := (four_tuple.Src_ip * 59) ^ (four_tuple.Dst_ip) ^ (uint32(four_tuple.Src_port) << 16) ^ uint32(four_tuple.Dst_port) ^ uint32(6)
+
+	return flowHash
+}
+
 // func GetPacketType(buf []byte) int {
 // 	var pkt_type int
 
@@ -377,8 +383,8 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
 	var four_tuple Four_tuple_rte = SwapFourTuple(conn.four_tuple)
-
-	onvmpoll.tables.Store(four_tuple, conn)
+	key := hashV4Flow(four_tuple)
+	onvmpoll.tables.Store(key, conn)
 
 	if LOG_LEVEL >= 5 {
 		onvmpoll.DebugFourTupleTable()
@@ -389,15 +395,15 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
 	if conn.is_txchan_closed && conn.is_rxchan_closed {
 		var four_tuple Four_tuple_rte = SwapFourTuple(conn.four_tuple)
-
-		if _, isExist := onvmpoll.tables.Load(four_tuple); !isExist {
+		key := hashV4Flow(four_tuple)
+		if _, isExist := onvmpoll.tables.Load(key); !isExist {
 			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
 			err := errors.New(msg)
 			logger.Log.Errorln(msg)
 			return err
 		}
 
-		onvmpoll.tables.Delete(four_tuple)
+		onvmpoll.tables.Delete(key)
 
 		logger.Log.Info("Close connection sucessfully.\n")
 		if LOG_LEVEL >= 5 {
@@ -410,7 +416,8 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 
 func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
 	swap_four_tuple := SwapFourTuple(*four_tuple)
-	c, ok := onvmpoll.tables.Load(swap_four_tuple)
+	key := hashV4Flow(swap_four_tuple)
+	c, ok := onvmpoll.tables.Load(key)
 
 	if !ok {
 		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", *four_tuple)
@@ -502,6 +509,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 	// This function receives the packet from NF's packet handler function
 	// Then forward the packet to the HTTP server
 	for rxData := range nf_pkt_handler_chan {
+		key := hashV4Flow(rxData.FourTuple)
 		switch rxData.PacketType {
 		case ESTABLISH_CONN:
 			// Deliver packet to litsener's connection
@@ -523,7 +531,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
-			c, ok := onvmpoll.tables.Load(rxData.FourTuple)
+			c, ok := onvmpoll.tables.Load(key)
 			if !ok {
 				logger.Log.Errorf("ReadFromONVM, close can not get the connection via four-tuple:%v\n", rxData.FourTuple)
 			} else {
@@ -535,7 +543,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 			}
 		case REPLY_CONN, HTTP_FRAME:
 			// TODO: REPLY_CONN may be removed
-			c, ok := onvmpoll.tables.Load(rxData.FourTuple)
+			c, ok := onvmpoll.tables.Load(key)
 			if !ok {
 				logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", rxData.FourTuple)
 			} else {
