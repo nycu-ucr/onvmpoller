@@ -44,21 +44,12 @@ static inline int string_len(char *p)
     return count;
 }
 
-static inline void parseFourTuple(char *four_tuple)
+static inline struct rte_tcp_hdr *
+pkt_tcp_hdr(struct rte_mbuf *pkt)
 {
-    char *token = strtok(four_tuple, ",");
-
-    while (token != NULL)
-    {
-        // printf("%s\n", token);
-        token = strtok(NULL, ",");
-    }
-}
-
-static inline struct four_tuple *EncodeFourTuple(char *four_tuple)
-{
-    struct four_tuple *result;
-    return result;
+    uint8_t *pkt_data =
+        rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr);
+    return (struct rte_tcp_hdr *)pkt_data;
 }
 
 int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
@@ -120,8 +111,8 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     struct rte_ipv4_hdr *pkt_iph;
     struct rte_ether_hdr *pkt_eth_hdr;
 
-    printf("[service_id]: %d\n[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
-           service_id, pkt_type, src_ip, src_port, dst_ip, dst_port);
+    // printf("[service_id]: %d\n[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
+    //        service_id, pkt_type, src_ip, src_port, dst_ip, dst_port);
 
     pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL)
@@ -148,19 +139,20 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         if (pkt_payload == NULL)
         {
             printf("Failed to prepend payload. Consider splitting up the packet.\n");
+            return;
         }
         rte_memcpy(pkt_payload, buffer, buffer_length);
     }
 
     /* Set TCP header */
-    printf("TCP SIZE -> %lu\n", sizeof(*pkt_tcp_hdr));
     pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
     if (pkt_tcp_hdr == NULL)
     {
         printf("Failed to prepend TCP header. Consider splitting up the packet.\n");
+        return;
     }
-    pkt_tcp_hdr->src_port = rte_le_to_cpu_16(src_port);
-    pkt_tcp_hdr->dst_port = rte_le_to_cpu_16(dst_port);
+    pkt_tcp_hdr->src_port = src_port;
+    pkt_tcp_hdr->dst_port = dst_port;
     switch (pkt_type)
     {
     case ESTABLISH_CONN:
@@ -182,9 +174,12 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     if (pkt_iph == NULL)
     {
         printf("Failed to prepend IP header. Consider splitting up the packet.\n");
+        return;
     }
-    pkt_iph->src_addr = rte_cpu_to_be_32(src_ip);
-    pkt_iph->dst_addr = rte_cpu_to_be_32(dst_ip);
+    pkt_iph->src_addr = src_ip;
+    pkt_iph->dst_addr = dst_ip;
+    pkt_iph->next_proto_id = TCP_PROTO_NUM;
+    pkt_iph->version_ihl = IPV4_VERSION_IHL;
     // rte_memcpy(pkt_iph, pkt_iph, sizeof(IP_HDR_LEN));
 
     /* Set ethernet header */
@@ -192,15 +187,16 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     if (pkt_eth_hdr == NULL)
     {
         printf("Failed to prepend ethernet header. Consider splitting up the packet.\n");
+        return;
     }
     // rte_memcpy(pkt_eth_hdr, pkt_eth_hdr, sizeof(pkt_eth_hdr));
 
     pkt->pkt_len = pkt->data_len;
-    pkt_iph->total_length = rte_cpu_to_be_16(buffer_length + sizeof(struct rte_tcp_hdr) +
-                                             sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
-    printf("Pkt len %d, total iph len %lu\n", pkt->pkt_len,
-           buffer_length + sizeof(struct rte_tcp_hdr) +
-               sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
+    // pkt_iph->total_length = rte_cpu_to_be_16(buffer_length + sizeof(struct rte_tcp_hdr) +
+    //                                          sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
+    // printf("Pkt len %d, total iph len %lu\n", pkt->pkt_len,
+    //        buffer_length + sizeof(struct rte_tcp_hdr) +
+    //            sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
 
     /* Handle checksuming */
     // onvm_pkt_set_checksums(pkt);
@@ -222,34 +218,38 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
 }
 
-int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
-    struct rte_tcp_hdr   *tcp_hdr;
-    struct rte_ipv4_hdr  *ipv4_hdr;
+int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx)
+{
+    struct rte_tcp_hdr *tcp_hdr;
+    struct rte_ipv4_hdr *ipv4_hdr;
     struct rte_ether_hdr *eth_hdr;
     uint8_t *payload;
     int payload_len, pkt_type;
 
-	meta->action = ONVM_NF_ACTION_DROP;
+    meta->action = ONVM_NF_ACTION_DROP;
 
-    eth_hdr = onvm_pkt_ether_hdr(pkt);
-    if(eth_hdr == NULL) {
-        printf("Error packet is not Ethernet packet\n");
-        return -1;
-    }
+    // eth_hdr = onvm_pkt_ether_hdr(pkt);
+    // if (eth_hdr == NULL)
+    // {
+    //     printf("Error packet is not Ethernet packet\n");
+    //     return -1;
+    // }
 
     ipv4_hdr = onvm_pkt_ipv4_hdr(pkt);
-    if(ipv4_hdr == NULL) {
-        printf("Error packet is not IP packet\n");
+    if (ipv4_hdr == NULL)
+    {
+        // printf("Error packet is not IP packet\n");
         return -1;
     }
 
-    tcp_hdr = onvm_pkt_tcp_hdr(pkt);
-    if(tcp_hdr == NULL) {
-        printf("Error packet is not TCP packet\n");
+    if (ipv4_hdr->next_proto_id != IP_PROTOCOL_TCP)
+    {
+        // printf("Error packet is not TCP packet\n");
         return -1;
     }
+    tcp_hdr = pkt_tcp_hdr(pkt);
 
-    payload = rte_pktmbuf_mtod(pkt, uint8_t*) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr);
+    payload = rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr);
     payload_len = rte_pktmbuf_data_len(pkt) - (sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr));
 
     switch (tcp_hdr->tcp_flags)
@@ -267,6 +267,9 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         pkt_type = HTTP_FRAME;
         break;
     }
+
+    // printf("[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
+    //        pkt_type, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 
     DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 

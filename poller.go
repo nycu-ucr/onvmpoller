@@ -371,6 +371,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
 	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
+	key := hashV4Flow(four_tuple)
 
 	switch rxdata.PacketType {
 	case ESTABLISH_CONN:
@@ -385,7 +386,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 
 	case CLOSE_CONN:
 		// Let onvmpoller delete the connection
-		c, ok := onvmpoll.tables.Load(four_tuple)
+		c, ok := onvmpoll.tables.Load(key)
 		if !ok {
 			logger.Log.Errorf("ReadFromONVM, close can not get the connection via four-tuple:%v\n", four_tuple)
 		} else {
@@ -396,7 +397,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 			onvmpoll.Delete(conn)
 		}
 	case REPLY_CONN, HTTP_FRAME:
-		c, ok := onvmpoll.tables.Load(four_tuple)
+		c, ok := onvmpoll.tables.Load(key)
 		if !ok {
 			logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", four_tuple)
 		} else {
@@ -697,32 +698,32 @@ func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 
 	// Encapuslate HttpTransaction into TxChannelData
-	var tx_data ChannelData
-	tx_data.PacketType = HTTP_FRAME
-	tx_data.FourTuple = connection.four_tuple
-	tx_data.Payload = make([]byte, len(b))
-	copy(tx_data.Payload, b)
+	// var tx_data ChannelData
+	// tx_data.PacketType = HTTP_FRAME
+	// tx_data.FourTuple = connection.four_tuple
+	// tx_data.Payload = make([]byte, len(b))
+	// copy(tx_data.Payload, b)
 
 	// Translate Go structure to C char *
-	var buffer []byte
+	// var buffer []byte
 	var buffer_ptr *C.char
 
 	// t1 := time.Now()
-	buffer, err := EncodeChannelDataToBytes(tx_data)
+	// buffer, err := EncodeChannelDataToBytes(tx_data)
 	// t2 := time.Now()
 	// logger.Log.Debugf("Encode time: %v\n", t2.Sub(t1).Seconds()*1000)
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		return len(buffer), err
-	}
+	// if err != nil {
+	// 	logger.Log.Errorln(err.Error())
+	// 	return len(buffer), err
+	// }
 
-	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	buffer_ptr = (*C.char)(C.CBytes(b))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len(buffer)))
+		buffer_ptr, C.int(len(b)))
 
 	return len(b), nil
 }
@@ -732,34 +733,34 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	logger.Log.Tracef("Start Connection.WriteControlMessage, four-tuple: %v", connection.four_tuple)
 
 	// Encapuslate HttpTransaction into TxChannelData
-	var tx_data ChannelData
-	tx_data.PacketType = msg_type
-	tx_data.FourTuple = connection.four_tuple
-	tx_data.Payload = MakeConnCtrlMsg(msg_type)
+	// var tx_data ChannelData
+	// tx_data.PacketType = msg_type
+	// tx_data.FourTuple = connection.four_tuple
+	// tx_data.Payload = MakeConnCtrlMsg(msg_type)
 
 	// Translate Go structure to C char *
 	var buffer []byte
 	var buffer_ptr *C.char
-
+	buffer = MakeConnCtrlMsg(msg_type)
 	// t1 := time.Now()
-	buffer, err := EncodeChannelDataToBytes(tx_data)
+	// buffer, err := EncodeChannelDataToBytes(tx_data)
 	// t2 := time.Now()
 	// logger.Log.Debugf("Encode time: %v\n", t2.Sub(t1).Seconds()*1000)
 
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		return len(buffer), err
-	}
+	// if err != nil {
+	// 	logger.Log.Errorln(err.Error())
+	// 	return len(buffer), err
+	// }
 
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len(buffer)))
 
-	return len(tx_data.Payload), nil
+	return len(buffer), nil
 }
 
 // Close implements the net.Conn Close method.
@@ -900,8 +901,8 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Start DialONVM")
 
 	ip_addr, port := ParseAddress(address)
-	uint32_ip := binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
-	logger.Log.Warnf("uint32_ip: %d, uint16_port: %d", uint32_ip, port)
+	// uint32_ip := binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	// logger.Log.Warnf("uint32_ip: %d, uint16_port: %d", uint32_ip, port)
 
 	// Initialize a connection
 	conn := onvmpoll.Create()
