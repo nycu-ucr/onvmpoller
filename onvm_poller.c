@@ -2,7 +2,9 @@
 #include "_cgo_export.h"
 #include "string.h"
 
-// extern int PacketHandler(struct rte_mbuf*, struct onvm_pkt_meta*, struct onvm_nf_local_ctx*);
+// extern int DeliverPacket(int, char *, int, uint32, uint16, uint32, uint16)
+
+int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 
 #define HTTP_FRAME 0
 #define ESTABLISH_CONN 1
@@ -75,7 +77,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     onvm_nflib_start_signal_handler(*nf_local_ctx, NULL);
 
     nf_function_table = onvm_nflib_init_nf_function_table();
-    nf_function_table->pkt_handler = &PacketHandler;
+    nf_function_table->pkt_handler = &packet_handler;
 
     int argc = 3;
     char file_path[] = "/home/hstsai/onvm/";
@@ -145,17 +147,17 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         pkt_payload = (uint8_t *)rte_pktmbuf_prepend(pkt, buffer_length);
         if (pkt_payload == NULL)
         {
-            printf("Failed to prepend data. Consider splitting up the packet.\n");
+            printf("Failed to prepend payload. Consider splitting up the packet.\n");
         }
         rte_memcpy(pkt_payload, buffer, buffer_length);
     }
 
-    /* Set tcp hdr */
+    /* Set TCP header */
     printf("TCP SIZE -> %lu\n", sizeof(*pkt_tcp_hdr));
-    pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, sizeof(TCP_HDR_LEN));
+    pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
     if (pkt_tcp_hdr == NULL)
     {
-        printf("Failed to prepend data. Consider splitting up the packet.\n");
+        printf("Failed to prepend TCP header. Consider splitting up the packet.\n");
     }
     pkt_tcp_hdr->src_port = rte_le_to_cpu_16(src_port);
     pkt_tcp_hdr->dst_port = rte_le_to_cpu_16(dst_port);
@@ -175,21 +177,21 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     }
     // rte_memcpy(pkt_tcp_hdr, pkt_tcp_hdr, sizeof(TCP_HDR_LEN)); // + option_len);
 
-    /* Set ip hdr */
-    pkt_iph = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, sizeof(IP_HDR_LEN));
+    /* Set IP header */
+    pkt_iph = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, IP_HDR_LEN);
     if (pkt_iph == NULL)
     {
-        printf("Failed to prepend data. Consider splitting up the packet.\n");
+        printf("Failed to prepend IP header. Consider splitting up the packet.\n");
     }
     pkt_iph->src_addr = rte_cpu_to_be_32(src_ip);
     pkt_iph->dst_addr = rte_cpu_to_be_32(dst_ip);
     // rte_memcpy(pkt_iph, pkt_iph, sizeof(IP_HDR_LEN));
 
-    /* Set eth hdr */
-    pkt_eth_hdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, sizeof(ETH_HDR_LEN));
+    /* Set ethernet header */
+    pkt_eth_hdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, ETH_HDR_LEN);
     if (pkt_eth_hdr == NULL)
     {
-        printf("Failed to prepend data. Consider splitting up the packet.\n");
+        printf("Failed to prepend ethernet header. Consider splitting up the packet.\n");
     }
     // rte_memcpy(pkt_eth_hdr, pkt_eth_hdr, sizeof(pkt_eth_hdr));
 
@@ -218,4 +220,55 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     onvm_nflib_return_pkt(ctx->nf, pkt);
 
     // printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
+}
+
+int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx) {
+    struct rte_tcp_hdr   *tcp_hdr;
+    struct rte_ipv4_hdr  *ipv4_hdr;
+    struct rte_ether_hdr *eth_hdr;
+    uint8_t *payload;
+    int payload_len, pkt_type;
+
+	meta->action = ONVM_NF_ACTION_DROP;
+
+    eth_hdr = onvm_pkt_ether_hdr(pkt);
+    if(eth_hdr == NULL) {
+        printf("Error packet is not Ethernet packet\n");
+        return -1;
+    }
+
+    ipv4_hdr = onvm_pkt_ipv4_hdr(pkt);
+    if(ipv4_hdr == NULL) {
+        printf("Error packet is not IP packet\n");
+        return -1;
+    }
+
+    tcp_hdr = onvm_pkt_tcp_hdr(pkt);
+    if(tcp_hdr == NULL) {
+        printf("Error packet is not TCP packet\n");
+        return -1;
+    }
+
+    payload = rte_pktmbuf_mtod(pkt, uint8_t*) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr);
+    payload_len = rte_pktmbuf_data_len(pkt) - (sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr));
+
+    switch (tcp_hdr->tcp_flags)
+    {
+    case RTE_TCP_SYN_FLAG:
+        pkt_type = ESTABLISH_CONN;
+        break;
+    case RTE_TCP_ACK_FLAG:
+        pkt_type = REPLY_CONN;
+        break;
+    case RTE_TCP_FIN_FLAG:
+        pkt_type = CLOSE_CONN;
+        break;
+    default:
+        pkt_type = HTTP_FRAME;
+        break;
+    }
+
+    DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+
+    return 0;
 }
