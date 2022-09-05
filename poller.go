@@ -364,12 +364,15 @@ func ParseFourTupleByIndex(four_tuple string, index int) string {
 }
 
 //export DeliverPacket
-func DeliverPacket(packet_type int, buf []byte, src_ip uint32, src_port uint16, dst_ip uint32, dst_port uint16) {
+func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	// Deliver the packet to the right connection via four-tuple
-	four_tuple := Four_tuple_rte{Src_ip: src_ip, Src_port: src_port, Dst_ip: dst_ip, Dst_port: dst_port}
-	rxdata := ChannelData{PacketType: packet_type, FourTuple: four_tuple, Payload: buf}
 
-	switch packet_type {
+	payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
+
+	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
+	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
+
+	switch rxdata.PacketType {
 	case ESTABLISH_CONN:
 		// Deliver packet to litsener's connection
 		listener_conn, err := onvmpoll.GetConnByReverseFourTuple(listener_four_tuple)
@@ -404,6 +407,8 @@ func DeliverPacket(packet_type int, buf []byte, src_ip uint32, src_port uint16, 
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
+
+	return 0
 }
 
 /*********************************
