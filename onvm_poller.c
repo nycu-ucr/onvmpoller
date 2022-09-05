@@ -4,6 +4,18 @@
 
 // extern int PacketHandler(struct rte_mbuf*, struct onvm_pkt_meta*, struct onvm_nf_local_ctx*);
 
+#define HTTP_FRAME 0
+#define ESTABLISH_CONN 1
+#define CLOSE_CONN 2
+#define REPLY_CONN 3
+#define TCP_PROTO_NUM 0x06
+
+uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
+uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
+uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
+
+int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
+
 struct four_tuple
 {
     rte_be32_t src_addr; /**< source address */
@@ -101,8 +113,13 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     struct rte_mbuf *pkt;
     struct onvm_pkt_meta *pmeta;
     struct rte_mempool *pktmbuf_pool;
+    uint8_t *pkt_payload;
+    struct rte_tcp_hdr *pkt_tcp_hdr;
+    struct rte_ipv4_hdr *pkt_iph;
+    struct rte_ether_hdr *pkt_eth_hdr;
 
-    // printf("[pkt_type]: %d\n", pkt_type);
+    printf("[service_id]: %d\n[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
+           service_id, pkt_type, src_ip, src_port, dst_ip, dst_port);
 
     pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL)
@@ -118,6 +135,74 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         return;
     }
 
+    // pkt->ol_flags = PKT_TX_IP_CKSUM | PKT_TX_IPV4 | PKT_TX_TCP_CKSUM;
+    // pkt->l2_len = ETH_HDR_LEN;
+    // pkt->l3_len = IP_HDR_LEN;
+
+    if (buffer_length > 0)
+    {
+        /* Set payload data */
+        pkt_payload = (uint8_t *)rte_pktmbuf_prepend(pkt, buffer_length);
+        if (pkt_payload == NULL)
+        {
+            printf("Failed to prepend data. Consider splitting up the packet.\n");
+        }
+        rte_memcpy(pkt_payload, buffer, buffer_length);
+    }
+
+    /* Set tcp hdr */
+    printf("TCP SIZE -> %lu\n", sizeof(*pkt_tcp_hdr));
+    pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, sizeof(TCP_HDR_LEN));
+    if (pkt_tcp_hdr == NULL)
+    {
+        printf("Failed to prepend data. Consider splitting up the packet.\n");
+    }
+    pkt_tcp_hdr->src_port = rte_le_to_cpu_16(src_port);
+    pkt_tcp_hdr->dst_port = rte_le_to_cpu_16(dst_port);
+    switch (pkt_type)
+    {
+    case ESTABLISH_CONN:
+        pkt_tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG;
+        break;
+    case REPLY_CONN:
+        pkt_tcp_hdr->tcp_flags = RTE_TCP_ACK_FLAG;
+        break;
+    case CLOSE_CONN:
+        pkt_tcp_hdr->tcp_flags = RTE_TCP_FIN_FLAG;
+        break;
+    default:
+        break;
+    }
+    // rte_memcpy(pkt_tcp_hdr, pkt_tcp_hdr, sizeof(TCP_HDR_LEN)); // + option_len);
+
+    /* Set ip hdr */
+    pkt_iph = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, sizeof(IP_HDR_LEN));
+    if (pkt_iph == NULL)
+    {
+        printf("Failed to prepend data. Consider splitting up the packet.\n");
+    }
+    pkt_iph->src_addr = rte_cpu_to_be_32(src_ip);
+    pkt_iph->dst_addr = rte_cpu_to_be_32(dst_ip);
+    // rte_memcpy(pkt_iph, pkt_iph, sizeof(IP_HDR_LEN));
+
+    /* Set eth hdr */
+    pkt_eth_hdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, sizeof(ETH_HDR_LEN));
+    if (pkt_eth_hdr == NULL)
+    {
+        printf("Failed to prepend data. Consider splitting up the packet.\n");
+    }
+    // rte_memcpy(pkt_eth_hdr, pkt_eth_hdr, sizeof(pkt_eth_hdr));
+
+    pkt->pkt_len = pkt->data_len;
+    pkt_iph->total_length = rte_cpu_to_be_16(buffer_length + sizeof(struct rte_tcp_hdr) +
+                                             sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
+    printf("Pkt len %d, total iph len %lu\n", pkt->pkt_len,
+           buffer_length + sizeof(struct rte_tcp_hdr) +
+               sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
+
+    /* Handle checksuming */
+    // onvm_pkt_set_checksums(pkt);
+
     // Fill out the meta data of the packet
     pmeta = onvm_get_pkt_meta(pkt);
     pmeta->destination = service_id;
@@ -125,9 +210,9 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
 
     pkt->hash.rss = 0;
     pkt->port = 0;
-    pkt->data_len = buffer_length;
+    // pkt->data_len = buffer_length;
     // Copy the packet into the rte_mbuf data section
-    rte_memcpy(rte_pktmbuf_mtod(pkt, char *), buffer, buffer_length);
+    // rte_memcpy(rte_pktmbuf_mtod(pkt, char *), buffer, buffer_length);
 
     // Send out the generated packet
     onvm_nflib_return_pkt(ctx->nf, pkt);
