@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
-	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -50,6 +49,8 @@ const (
 	ESTABLISH_CONN = 1
 	CLOSE_CONN     = 2
 	REPLY_CONN     = 3
+	// Port manager setting
+	PM_CHANNEL_SIZE = 1024
 	// Logger level
 	LOG_LEVEL = logrus.WarnLevel
 )
@@ -124,22 +125,29 @@ type OnvmPoll struct {
 // 	ID uint16
 // }
 
-type portPool struct {
-	m    *sync.RWMutex
-	pool map[uint16]bool
+// type portPool struct {
+// 	m    *sync.RWMutex
+// 	pool map[uint16]bool
+// }
+
+type PortManager struct {
+	pool            map[uint16]bool
+	get_port_ch     chan uint16
+	release_port_ch chan uint16
 }
 
 /* Global Variables */
 var (
 	config Config
 	// conn_id             connID
-	onvmpoll            OnvmPoll
-	port_pool           portPool           // The ports range from 49152 to 65535
+	onvmpoll OnvmPoll
+	// port_pool           portPool           // The ports range from 49152 to 65535
 	local_address       string             // Initialize at ListenONVM
 	nf_pkt_handler_chan chan (ChannelData) // data type may change to pointer to buffer
 	// fourTuple_to_connID map[[4]string]uint16 // TODO: sync.Map or cmap
 	nf_ctx              *C.struct_onvm_nf_local_ctx
 	listener_four_tuple *Four_tuple_rte
+	port_manager        *PortManager
 
 	//Control Message (bytes)
 	SYN = []byte("SYN")
@@ -153,11 +161,17 @@ func init() {
 	// conn_id.ID = 0
 	// conn_id.m = new(sync.Mutex)
 	local_address = "127.0.0.1"
-	port_pool.pool = make(map[uint16]bool)
-	port_pool.m = new(sync.RWMutex)
+	// port_pool.pool = make(map[uint16]bool)
+	// port_pool.m = new(sync.RWMutex)
 	onvmpoll.tables = sync.Map{}
 	nf_pkt_handler_chan = make(chan ChannelData, 1024)
 	// fourTuple_to_connID = make(map[[4]string]uint16)
+
+	port_manager = &PortManager{
+		pool:            make(map[uint16]bool),
+		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
+		release_port_ch: make(chan uint16, PM_CHANNEL_SIZE),
+	}
 
 	/* Setup Logger */
 	logger.SetLogLevel(LOG_LEVEL)
@@ -171,6 +185,9 @@ func init() {
 	logger.Log.Traceln("Start onvm init")
 	C.onvm_init(&nf_ctx, char_ptr)
 	C.free(unsafe.Pointer(char_ptr))
+
+	/* Run port Manager */
+	port_manager.Run()
 
 	/* Run onvmpoller */
 	logger.Log.Traceln("Start onvmpoll run")
@@ -234,36 +251,36 @@ func InitConfig() {
 // 	return result
 // }
 
-func GetUnusedPort() uint16 {
-	var base int32 = 49152
-	var upper_limit int32 = 65536 - base
-	var port uint16
-	port_pool.m.Lock()
-	defer port_pool.m.Unlock()
-	for {
-		n := rand.Int31n(upper_limit)
-		port = uint16(base + n)
-		if _, isExist := port_pool.pool[port]; !isExist {
-			port_pool.pool[port] = true
-			break
-		} else {
-			continue
-		}
-	}
+// func GetUnusedPort() uint16 {
+// 	var base int32 = 49152
+// 	var upper_limit int32 = 65536 - base
+// 	var port uint16
+// 	port_pool.m.Lock()
+// 	defer port_pool.m.Unlock()
+// 	for {
+// 		n := rand.Int31n(upper_limit)
+// 		port = uint16(base + n)
+// 		if _, isExist := port_pool.pool[port]; !isExist {
+// 			port_pool.pool[port] = true
+// 			break
+// 		} else {
+// 			continue
+// 		}
+// 	}
 
-	return port
-}
+// 	return port
+// }
 
-func DeletePort(port uint16) error {
-	if _, isExist := port_pool.pool[port]; !isExist {
-		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
-		err := errors.New(msg)
-		logger.Log.Errorf(msg)
-		return err
-	}
-	delete(port_pool.pool, port)
-	return nil
-}
+// func DeletePort(port uint16) error {
+// 	if _, isExist := port_pool.pool[port]; !isExist {
+// 		msg := fmt.Sprintf("Delete port fail, %d is not exist.", port)
+// 		err := errors.New(msg)
+// 		logger.Log.Errorf(msg)
+// 		return err
+// 	}
+// 	delete(port_pool.pool, port)
+// 	return nil
+// }
 
 func IpToID(ip string) (id int32, err error) {
 	id, ok := config.IPIDMap[ip]
@@ -388,10 +405,10 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		// Let onvmpoller delete the connection
 		c, ok := onvmpoll.tables.Load(key)
 		if !ok {
-			logger.Log.Errorf("ReadFromONVM, close can not get the connection via four-tuple:%v\n", four_tuple)
+			logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", four_tuple)
 		} else {
 			conn := c.(*Connection)
-			logger.Log.Infof("ReadFromONVM, close connection, four-tuple: %v\n", conn.four_tuple)
+			logger.Log.Infof("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
 			close(conn.rxchan)
 			conn.is_rxchan_closed = true
 			onvmpoll.Delete(conn)
@@ -399,17 +416,64 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	case REPLY_CONN, HTTP_FRAME:
 		c, ok := onvmpoll.tables.Load(key)
 		if !ok {
-			logger.Log.Errorf("ReadFromONVM, can not get the connection via four-tuple:%v\n", four_tuple)
+			logger.Log.Errorf("DeliverPacket, can not get the connection via four-tuple:%v\n", four_tuple)
 		} else {
 			conn := c.(*Connection)
 			conn.rxchan <- rxdata
-			// logger.Log.Tracef("ReadFromONVM, deliver packet to Conn ID: %v\n", conn.conn_id)
+			// logger.Log.Tracef("DeliverPacket, deliver packet to Conn ID: %v\n", conn.conn_id)
 		}
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
 
 	return 0
+}
+
+/*********************************
+	Methods of Port Manager
+*********************************/
+
+func (pm *PortManager) DistributePort() {
+	// Infinitely fills up the get_port_channel with unused ports, blocked when the channel is full
+
+	var base, upper_limit int32 = 49152, 65536
+
+	for {
+		for p := base; p < upper_limit; p++ {
+			port := uint16(p)
+			if isUsed, isExist := pm.pool[port]; isExist {
+				if isUsed {
+					continue
+				} else {
+					pm.get_port_ch <- port
+					pm.pool[port] = true
+				}
+			} else {
+				// First use this port
+				pm.get_port_ch <- port
+				pm.pool[port] = true
+			}
+		}
+	}
+}
+
+func (pm *PortManager) RecyclePort() {
+	for port := range pm.release_port_ch {
+		pm.pool[port] = false
+	}
+}
+
+func (pm *PortManager) Run() {
+	go pm.DistributePort()
+	go pm.RecyclePort()
+}
+
+func (pm *PortManager) GetPort() uint16 {
+	return <-pm.get_port_ch
+}
+
+func (pm *PortManager) ReleasePort(port uint16) {
+	pm.release_port_ch <- port
 }
 
 /*********************************
@@ -452,7 +516,8 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 			return err
 		}
 
-		onvmpoll.tables.Delete(key)
+		port_manager.ReleasePort(conn.four_tuple.Src_port) // Release port
+		onvmpoll.tables.Delete(key)                        // Delete connection
 
 		logger.Log.Info("Close connection sucessfully.\n")
 		if LOG_LEVEL >= 5 {
@@ -907,7 +972,8 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// Initialize a connection
 	conn := onvmpoll.Create()
 	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
-	conn.four_tuple.Src_port = GetUnusedPort()
+	// conn.four_tuple.Src_port = GetUnusedPort()
+	conn.four_tuple.Src_port = port_manager.GetPort()
 	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	conn.four_tuple.Dst_port = port
 
