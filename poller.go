@@ -518,7 +518,6 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 
 		port_manager.ReleasePort(conn.four_tuple.Src_port) // Release port
 		onvmpoll.tables.Del(&four_tuple)                   // Delete connection
-
 		logger.Log.Info("Close connection sucessfully.\n")
 		// if LOG_LEVEL >= 5 {
 		// 	onvmpoll.DebugConnectionTable()

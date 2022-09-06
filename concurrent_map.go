@@ -81,6 +81,17 @@ func (im *innerMap) del(key Partitionable) {
 	im.lock.Unlock()
 }
 
+func (im *innerMap) get_del(key Partitionable) (interface{}, bool) {
+	keyVal := key.Value()
+	im.lock.Lock()
+	v, ok := im.m[keyVal]
+	if ok {
+		delete(im.m, keyVal)
+	}
+	im.lock.Unlock()
+	return v, ok
+}
+
 // CreateConcurrentMap is to create a ConcurrentMap with the setting number of the partitions
 func CreateConcurrentMap(numOfPartitions int) *ConcurrentMap {
 	var partitions []*innerMap
@@ -110,4 +121,9 @@ func (m *ConcurrentMap) Set(key Partitionable, v interface{}) {
 func (m *ConcurrentMap) Del(key Partitionable) {
 	im := m.getPartition(key)
 	im.del(key)
+}
+
+// GetAndDel is to first find if the entries exist then delete the entries by the key
+func (m *ConcurrentMap) GetAndDel(key Partitionable) (interface{}, bool) {
+	return m.getPartition(key).get_del(key)
 }
