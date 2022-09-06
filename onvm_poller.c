@@ -249,8 +249,8 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     }
     tcp_hdr = pkt_tcp_hdr(pkt);
 
-    payload = rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr);
-    payload_len = rte_pktmbuf_data_len(pkt) - (sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr) + sizeof(struct rte_tcp_hdr));
+    payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
 
     switch (tcp_hdr->tcp_flags)
     {
