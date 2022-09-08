@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -163,7 +164,7 @@ func init() {
 	local_address = "127.0.0.1"
 	// port_pool.pool = make(map[uint16]bool)
 	// port_pool.m = new(sync.RWMutex)
-	onvmpoll.tables = CreateConcurrentMap(128)
+	onvmpoll.tables = CreateConcurrentMap(255)
 	nf_pkt_handler_chan = make(chan ChannelData, 1024)
 	// fourTuple_to_connID = make(map[[4]string]uint16)
 
@@ -383,7 +384,7 @@ func ParseFourTupleByIndex(four_tuple string, index int) string {
 //export DeliverPacket
 func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	// Deliver the packet to the right connection via four-tuple
-
+	res_code := 0
 	payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
@@ -418,7 +419,8 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	case REPLY_CONN, HTTP_FRAME:
 		c, ok := onvmpoll.tables.Get(&four_tuple)
 		if !ok {
-			logger.Log.Errorf("DeliverPacket, can not get the connection via four-tuple:%v\n", four_tuple)
+			// logger.Log.Errorf("DeliverPacket, can not get the connection via four-tuple:%v\n", four_tuple)
+			res_code = -1
 		} else {
 			conn := c.(*Connection)
 			conn.rxchan <- rxdata
@@ -428,7 +430,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
 
-	return 0
+	return res_code
 }
 
 /*********************************
@@ -441,20 +443,20 @@ func (pm *PortManager) DistributePort() {
 	var base, upper_limit int32 = 49152, 65536
 
 	for {
-		for p := base; p < upper_limit; p++ {
-			port := uint16(p)
-			if isUsed, isExist := pm.pool[port]; isExist {
-				if isUsed {
-					continue
-				} else {
-					pm.get_port_ch <- port
-					pm.pool[port] = true
-				}
+		n := rand.Int31n(upper_limit)
+		port := uint16(base + n)
+
+		if isUsed, isExist := pm.pool[port]; isExist {
+			if isUsed {
+				continue
 			} else {
-				// First use this port
 				pm.get_port_ch <- port
 				pm.pool[port] = true
 			}
+		} else {
+			// First use this port
+			pm.get_port_ch <- port
+			pm.pool[port] = true
 		}
 	}
 }
@@ -734,25 +736,24 @@ func (oa OnvmAddr) String() string {
 func (connection Connection) Read(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
 
+	var length int
+	var err error
 	// Receive packet from onvmpoller
 	rx_data, ok := <-connection.rxchan
 
 	if ok {
 		// Get response
-		var length int
 		if len(b) < len(rx_data.Payload) {
 			// TODO: Fix this problem
 			logger.Log.Errorln("Read buffer length is not sufficient")
 		} else {
 			length = copy(b, rx_data.Payload)
 		}
-
-		return length, nil
 	} else {
-		err := fmt.Errorf("EOF")
-
-		return 0, err
+		err = fmt.Errorf("EOF")
 	}
+
+	return length, err
 }
 
 // Write implements the net.Conn Write method.
@@ -894,15 +895,15 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	logger.Log.Traceln("Start OnvmListener.Accept")
 
 	var new_conn *Connection
+	new_conn = onvmpoll.Create()
+	new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(ol.laddr.ipv4_addr)[12:16])
+	new_conn.four_tuple.Src_port = ol.laddr.port
 
 	rx_data := <-ol.conn.rxchan // Payload is our defined connection request, not HTTP payload
 
 	logger.Log.Traceln("Receive one connection request")
 
 	// Initialize the new connection
-	new_conn = onvmpoll.Create()
-	new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(ol.laddr.ipv4_addr)[12:16])
-	new_conn.four_tuple.Src_port = ol.laddr.port
 	new_conn.four_tuple.Dst_ip = rx_data.FourTuple.Src_ip
 	new_conn.four_tuple.Dst_port = rx_data.FourTuple.Src_port
 
@@ -914,16 +915,16 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	onvmpoll.Add(new_conn)
 
 	// Send ACK back to client
-	_, err := new_conn.WriteControlMessage(REPLY_CONN)
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		new_conn.Close()
-		return new_conn, err
-	} else {
-		logger.Log.Tracef("Write connection response to (%v, %v)",
-			new_conn.four_tuple.Dst_ip,
-			new_conn.four_tuple.Dst_port)
-	}
+	// _, err := new_conn.WriteControlMessage(REPLY_CONN)
+	// if err != nil {
+	// 	logger.Log.Errorln(err.Error())
+	// 	new_conn.Close()
+	// 	return new_conn, err
+	// } //else {
+	// // 	logger.Log.Tracef("Write connection response to (%v, %v)",
+	// // 		new_conn.four_tuple.Dst_ip,
+	// // 		new_conn.four_tuple.Dst_port)
+	// // }
 
 	return new_conn, nil
 }
@@ -937,9 +938,13 @@ func (ol OnvmListener) Addr() net.Addr {
 	return ol.laddr
 }
 
-/*********************************
+/*
+********************************
+
 	API for HTTP Server
-*********************************/
+
+********************************
+*/
 func CreateConnection() net.Conn {
 	conn := onvmpoll.Create()
 	return conn
@@ -963,6 +968,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Start DialONVM")
 
 	ip_addr, port := ParseAddress(address)
+
 	// uint32_ip := binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	// logger.Log.Warnf("uint32_ip: %d, uint16_port: %d", uint32_ip, port)
 
@@ -993,17 +999,21 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// onvmpoll.AddEntryToTable(conn)
 	onvmpoll.Add(conn)
 
-	// Wait for response
-	conn_response := make([]byte, 3)
-	logger.Log.Traceln("Dial wait connection create response")
-	_, err = conn.Read(conn_response)
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		conn.Close()
-		return conn, err
-	} else {
-		logger.Log.Traceln("Dial get connection create response")
-	}
+	// t1 = time.Now()
+	// // Wait for response
+	// conn_response := make([]byte, 3)
+	// // logger.Log.Traceln("Dial wait connection create response")
+	// _, err = conn.Read(conn_response)
+	// if err != nil {
+	// 	logger.Log.Errorln(err.Error())
+	// 	conn.Close()
+	// 	return conn, err
+	// } //else {
+	// // 	logger.Log.Traceln("Dial get connection create response")
+	// // }
+	// t2 = time.Now()
+	// t = t2.Sub(t1).Seconds() * 1000
+	// logger.Log.Warnf("Block5: %v", t)
 
 	return conn, nil
 }

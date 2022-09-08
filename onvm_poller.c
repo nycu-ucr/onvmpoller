@@ -218,7 +218,7 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
 }
 
-int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx)
+int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
 {
     struct rte_tcp_hdr *tcp_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
@@ -271,7 +271,12 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     // printf("[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
     //        pkt_type, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 
-    DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+    int res_code;
+    res_code = DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+
+    if(res_code != 0) {
+        meta->action = ONVM_NF_ACTION_TONF;
+    }
 
     return 0;
 }

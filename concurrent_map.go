@@ -35,9 +35,13 @@ type innerMap struct {
 	lock sync.RWMutex
 }
 
-/*********************************
+/*
+********************************
+
 	Partitionable interface
-*********************************/
+
+********************************
+*/
 func (four_tuple *Four_tuple_rte) Value() interface{} {
 	return *four_tuple
 }
@@ -50,9 +54,13 @@ func Key(four_tuple Four_tuple_rte) *Four_tuple_rte {
 	return &four_tuple
 }
 
-/*********************************
+/*
+********************************
+
 	Concurrent Map API
-*********************************/
+
+********************************
+*/
 func createInnerMap() *innerMap {
 	return &innerMap{
 		m: make(map[interface{}]interface{}),
@@ -71,6 +79,7 @@ func (im *innerMap) set(key Partitionable, v interface{}) {
 	keyVal := key.Value()
 	im.lock.Lock()
 	im.m[keyVal] = v
+	// logger.Log.Warnf("innerMap Size: %v", len(im.m))
 	im.lock.Unlock()
 }
 
