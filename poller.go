@@ -709,7 +709,7 @@ func (onvmpoll *OnvmPoll) ReadFromONVM() {
 // }
 
 func (onvmpoll *OnvmPoll) Run() {
-	go onvmpoll.ReadFromONVM()
+	// go onvmpoll.ReadFromONVM()
 	// go onvmpoll.Polling()
 	go C.onvm_nflib_run(nf_ctx)
 }
@@ -915,16 +915,16 @@ func (ol OnvmListener) Accept() (net.Conn, error) {
 	onvmpoll.Add(new_conn)
 
 	// Send ACK back to client
-	// _, err := new_conn.WriteControlMessage(REPLY_CONN)
-	// if err != nil {
-	// 	logger.Log.Errorln(err.Error())
-	// 	new_conn.Close()
-	// 	return new_conn, err
-	// } //else {
-	// // 	logger.Log.Tracef("Write connection response to (%v, %v)",
-	// // 		new_conn.four_tuple.Dst_ip,
-	// // 		new_conn.four_tuple.Dst_port)
-	// // }
+	_, err := new_conn.WriteControlMessage(REPLY_CONN)
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		new_conn.Close()
+		return new_conn, err
+	} else {
+		logger.Log.Tracef("Write connection response to (%v, %v)",
+			new_conn.four_tuple.Dst_ip,
+			new_conn.four_tuple.Dst_port)
+	}
 
 	return new_conn, nil
 }
@@ -999,21 +999,17 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// onvmpoll.AddEntryToTable(conn)
 	onvmpoll.Add(conn)
 
-	// t1 = time.Now()
-	// // Wait for response
-	// conn_response := make([]byte, 3)
-	// // logger.Log.Traceln("Dial wait connection create response")
-	// _, err = conn.Read(conn_response)
-	// if err != nil {
-	// 	logger.Log.Errorln(err.Error())
-	// 	conn.Close()
-	// 	return conn, err
-	// } //else {
-	// // 	logger.Log.Traceln("Dial get connection create response")
-	// // }
-	// t2 = time.Now()
-	// t = t2.Sub(t1).Seconds() * 1000
-	// logger.Log.Warnf("Block5: %v", t)
+	// Wait for response
+	conn_response := make([]byte, 3)
+	logger.Log.Traceln("Dial wait connection create response")
+	_, err = conn.Read(conn_response)
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		conn.Close()
+		return conn, err
+	} else {
+		logger.Log.Traceln("Dial get connection create response")
+	}
 
 	return conn, nil
 }
