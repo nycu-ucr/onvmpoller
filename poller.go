@@ -424,7 +424,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		} else {
 			conn := c
 			conn.rxchan <- rxdata
-			// logger.Log.Tracef("DeliverPacket, deliver packet to Conn ID: %v\n", conn.conn_id)
+			logger.Log.Tracef("DeliverPacket, deliver packet to Conn four-tuple: %v\n", conn.four_tuple)
 		}
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
@@ -785,7 +785,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 		// Get response
 		if len(b) < len(rx_data.Payload) {
 			// TODO: Fix this problem
-			logger.Log.Errorln("Read buffer length is not sufficient")
+			logger.Log.Errorf("Read buffer length is not sufficient. Need %v but got %v", len(rx_data.Payload), len(b))
 		} else {
 			length = copy(b, rx_data.Payload)
 		}

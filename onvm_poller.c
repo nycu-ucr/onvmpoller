@@ -135,10 +135,10 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     if (buffer_length > 0)
     {
         /* Set payload data */
-        pkt_payload = (uint8_t *)rte_pktmbuf_prepend(pkt, buffer_length);
+        pkt_payload = (uint8_t *)rte_pktmbuf_append(pkt, buffer_length);
         if (pkt_payload == NULL)
         {
-            printf("Failed to prepend payload. Consider splitting up the packet.\n");
+            printf("Failed to append payload. Consider splitting up the packet.\n");
             return;
         }
         rte_memcpy(pkt_payload, buffer, buffer_length);
