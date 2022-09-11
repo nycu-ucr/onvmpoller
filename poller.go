@@ -1005,21 +1005,17 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// onvmpoll.AddEntryToTable(conn)
 	onvmpoll.Add(conn)
 
-	// t1 = time.Now()
-	// // Wait for response
-	// conn_response := make([]byte, 3)
-	// // logger.Log.Traceln("Dial wait connection create response")
-	// _, err = conn.Read(conn_response)
-	// if err != nil {
-	// 	logger.Log.Errorln(err.Error())
-	// 	conn.Close()
-	// 	return conn, err
-	// } //else {
-	// // 	logger.Log.Traceln("Dial get connection create response")
-	// // }
-	// t2 = time.Now()
-	// t = t2.Sub(t1).Seconds() * 1000
-	// logger.Log.Warnf("Block5: %v", t)
+	// Wait for response
+	conn_response := make([]byte, 3)
+	logger.Log.Traceln("Dial wait connection create response")
+	_, err = conn.Read(conn_response)
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		conn.Close()
+		return conn, err
+	} else {
+		logger.Log.Traceln("Dial get connection create response")
+	}
 
 	return conn, nil
 }

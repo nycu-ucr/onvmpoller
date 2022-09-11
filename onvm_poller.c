@@ -274,9 +274,9 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     int res_code;
     res_code = DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 
-    if(res_code != 0) {
-        meta->action = ONVM_NF_ACTION_TONF;
-    }
+    // if(res_code != 0) {
+    //     meta->action = ONVM_NF_ACTION_TONF;
+    // }
 
     return 0;
 }
