@@ -58,7 +58,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     const char *NF_TAG = nfName;
     int nfName_size = string_len(nfName);
     char nf_name[nfName_size];
-    memcpy(nf_name, nfName, sizeof(nfName));
+    memcpy(nf_name, nfName, nfName_size);
 
     int arg_offset;
     struct onvm_nf_function_table *nf_function_table;
