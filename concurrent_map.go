@@ -16,7 +16,7 @@ type ConcurrentMap struct {
 // It is to define how to partition the entries.
 type Partitionable interface {
 	// Value is raw value of the key
-	Value() interface{}
+	Value() Four_tuple_rte
 
 	// PartitionKey is used for getting the partition to store the entry with the key.
 	// E.g. the key's hash could be used as its PartitionKey
@@ -31,7 +31,7 @@ type Partitionable interface {
 }
 
 type innerMap struct {
-	m    map[interface{}]interface{}
+	m    map[Four_tuple_rte]*Connection
 	lock sync.RWMutex
 }
 
@@ -39,15 +39,14 @@ type innerMap struct {
 ********************************
 
 	Partitionable interface
-
-********************************
-*/
-func (four_tuple *Four_tuple_rte) Value() interface{} {
+*********************************/
+func (four_tuple *Four_tuple_rte) Value() Four_tuple_rte {
 	return *four_tuple
 }
 
 func (four_tuple *Four_tuple_rte) PartitionKey() int64 {
-	return int64((four_tuple.Src_ip * 59) ^ (four_tuple.Dst_ip) ^ (uint32(four_tuple.Src_port) << 16) ^ uint32(four_tuple.Dst_port) ^ uint32(6))
+	// return int64((four_tuple.Src_ip * 59) ^ (four_tuple.Dst_ip) ^ (uint32(four_tuple.Src_port) << 16) ^ uint32(four_tuple.Dst_port) ^ uint32(6))
+	return int64(four_tuple.Dst_port + four_tuple.Src_port)
 }
 
 func Key(four_tuple Four_tuple_rte) *Four_tuple_rte {
@@ -63,11 +62,12 @@ func Key(four_tuple Four_tuple_rte) *Four_tuple_rte {
 */
 func createInnerMap() *innerMap {
 	return &innerMap{
-		m: make(map[interface{}]interface{}),
+		m:    make(map[Four_tuple_rte]*Connection),
+		lock: sync.RWMutex{},
 	}
 }
 
-func (im *innerMap) get(key Partitionable) (interface{}, bool) {
+func (im *innerMap) get(key Partitionable) (*Connection, bool) {
 	keyVal := key.Value()
 	im.lock.RLock()
 	v, ok := im.m[keyVal]
@@ -75,7 +75,7 @@ func (im *innerMap) get(key Partitionable) (interface{}, bool) {
 	return v, ok
 }
 
-func (im *innerMap) set(key Partitionable, v interface{}) {
+func (im *innerMap) set(key Partitionable, v *Connection) {
 	keyVal := key.Value()
 	im.lock.Lock()
 	im.m[keyVal] = v
@@ -90,7 +90,7 @@ func (im *innerMap) del(key Partitionable) {
 	im.lock.Unlock()
 }
 
-func (im *innerMap) get_del(key Partitionable) (interface{}, bool) {
+func (im *innerMap) get_del(key Partitionable) (*Connection, bool) {
 	keyVal := key.Value()
 	im.lock.Lock()
 	v, ok := im.m[keyVal]
@@ -116,12 +116,12 @@ func (m *ConcurrentMap) getPartition(key Partitionable) *innerMap {
 }
 
 // Get is to get the value by the key
-func (m *ConcurrentMap) Get(key Partitionable) (interface{}, bool) {
+func (m *ConcurrentMap) Get(key Partitionable) (*Connection, bool) {
 	return m.getPartition(key).get(key)
 }
 
 // Set is to store the KV entry to the map
-func (m *ConcurrentMap) Set(key Partitionable, v interface{}) {
+func (m *ConcurrentMap) Set(key Partitionable, v *Connection) {
 	im := m.getPartition(key)
 	im.set(key, v)
 }
@@ -133,6 +133,6 @@ func (m *ConcurrentMap) Del(key Partitionable) {
 }
 
 // GetAndDel is to first find if the entries exist then delete the entries by the key
-func (m *ConcurrentMap) GetAndDel(key Partitionable) (interface{}, bool) {
+func (m *ConcurrentMap) GetAndDel(key Partitionable) (*Connection, bool) {
 	return m.getPartition(key).get_del(key)
 }

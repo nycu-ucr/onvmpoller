@@ -40,5 +40,11 @@ func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 		return nil, err
 	}
 
-	return &OnvmListener{laddr: laddr, conn: &c}, nil
+	listener = &OnvmListener{
+		laddr:         laddr,
+		conn:          &c,
+		complete_chan: make(chan *Connection, 100),
+	}
+
+	return listener, nil
 }

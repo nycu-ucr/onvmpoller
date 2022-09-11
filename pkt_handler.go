@@ -27,14 +27,14 @@ func PacketHandler(pkt *C.struct_rte_mbuf, meta *C.struct_onvm_pkt_meta, nf_loca
 
 	// Deliver packet to onvmpoller
 	// t1 := time.Now()
-	rx_data, err := DecodeToChannelData(buf)
+	_, err := DecodeToChannelData(buf)
 	// t2 := time.Now()
 	// logger.Log.Debugf("Decode time: %v\n", t2.Sub(t1).Seconds()*1000)
 
 	if err != nil {
 		logger.Log.Tracef("DecodeToChannelData error:%+v", err)
 	} else {
-		nf_pkt_handler_chan <- rx_data
+		// nf_pkt_handler_chan <- rx_data
 		logger.Log.Tracef("PacketHandler, receive packet from NF: %d\n", uint16(meta.src))
 	}
 
