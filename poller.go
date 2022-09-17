@@ -33,7 +33,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/alphadose/haxmap"
+	"github.com/cornelk/hashmap"
 	"github.com/nycu-ucr/onvmpoller/logger"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -101,7 +101,7 @@ type OnvmPoll struct {
 		key: Use four-tuple to calculate this hash-key
 		value: pointer to the Connection
 	*/
-	tables *haxmap.HashMap[uint32, *Connection]
+	tables *hashmap.Map[uint32, *Connection]
 }
 
 type PortManager struct {
@@ -136,7 +136,7 @@ func init() {
 	/* Initialize Global Variable */
 	InitConfig()
 	local_address = "127.0.0.1"
-	onvmpoll.tables = haxmap.New[uint32, *Connection]()
+	onvmpoll.tables = hashmap.New[uint32, *Connection]()
 
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
@@ -433,13 +433,20 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 
 func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	onvmpoll.tables.Set(hashV4Flow(*SwapFourTuple(conn.four_tuple)), conn)
+	onvmpoll.tables.Insert(hashV4Flow(*SwapFourTuple(conn.four_tuple)), conn)
 }
 
 func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
 	if conn.is_txchan_closed && conn.is_rxchan_closed {
 		var four_tuple *Four_tuple_rte = SwapFourTuple(conn.four_tuple)
+		ok := onvmpoll.tables.Del(hashV4Flow(*four_tuple))
+		if !ok {
+			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
+			err := errors.New(msg)
+			logger.Log.Errorln(msg)
+			return err
+		}
 		// if _, ok := onvmpoll.tables.GetAndDel(four_tuple); !ok {
 		// 	msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
 		// 	err := errors.New(msg)
@@ -447,8 +454,7 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 		// 	return err
 		// }
 		// port_manager.ReleasePort(conn.four_tuple.Src_port)
-		// logger.Log.Info("Close connection sucessfully.\n")
-		onvmpoll.tables.Del(hashV4Flow(*four_tuple))
+		logger.Log.Info("Close connection sucessfully.\n")
 	}
 
 	return nil
