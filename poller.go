@@ -300,7 +300,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		if err != nil {
 			logger.Log.Errorln(err)
 		} else {
-			go connectionHandler(&four_tuple)
+			connectionHandler(&four_tuple)
 		}
 	case CLOSE_CONN:
 		// Let onvmpoller delete the connection
@@ -456,7 +456,7 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 
 func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
 	swap_four_tuple := SwapFourTuple(*four_tuple)
-	c, ok := onvmpoll.tables.Get(swap_four_tuple)
+	c, ok := onvmpoll.tables.Get(hashV4Flow(*swap_four_tuple))
 
 	if !ok {
 		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", *four_tuple)
@@ -569,20 +569,21 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 
 // Close implements the net.Conn Close method.
 func (connection Connection) Close() error {
-	conn, err := onvmpoll.GetConnByReverseFourTuple(&connection.four_tuple)
+	var err error
+	// conn, err := onvmpoll.GetConnByReverseFourTuple(&connection.four_tuple)
 
-	if err != nil {
-		return err
-	}
+	// if err != nil {
+	// 	return err
+	// }
 
-	logger.Log.Tracef("Close connection four-tuple: %v\n", conn.four_tuple)
+	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
 	// Notify peer connection can be closed
-	conn.WriteControlMessage(CLOSE_CONN)
+	connection.WriteControlMessage(CLOSE_CONN)
 
 	// Close local connection
-	conn.is_txchan_closed = true
-	err = onvmpoll.Delete(conn)
+	connection.is_txchan_closed = true
+	err = onvmpoll.Delete(&connection)
 
 	return err
 }
@@ -683,7 +684,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.four_tuple.Dst_port = port
 
 	// Add the connection to table, otherwise it can't receive response
-	go onvmpoll.Add(conn)
+	onvmpoll.Add(conn)
 
 	dst_id, _ := IpToID(ip_addr)
 	conn.dst_id = uint8(dst_id)
