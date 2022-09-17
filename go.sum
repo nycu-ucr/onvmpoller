@@ -1,3 +1,5 @@
+github.com/alphadose/haxmap v0.3.1 h1:P02INS0xIwY0R3E+KRJTPtrlwTvRPYoU2GgoeRk2KbU=
+github.com/alphadose/haxmap v0.3.1/go.mod h1:Fu37Wlmj7cR++vSLgRTu3fGy8wpjHGmMypM2aclkc1A=
 github.com/antonfisher/nested-logrus-formatter v1.3.1 h1:NFJIr+pzwv5QLHTPyKz9UMEoHck02Q9L0FP13b/xSbQ=
 github.com/antonfisher/nested-logrus-formatter v1.3.1/go.mod h1:6WTfyWFkBc9+zyBaKIqRrg/KwMqBbodBjgbHjDz7zjA=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

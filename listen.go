@@ -18,15 +18,13 @@ func listen(ip_addr string, port uint16) (net.Listener, error) {
 
 func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 	var c Connection
-	c.rxchan = make(chan ChannelData, 100)
+	c.rxchan = make(chan []byte, 100)
 	c.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	c.four_tuple.Src_port = port
 	c.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP("0.0.0.0")[12:16])
 	c.four_tuple.Dst_port = uint16(0)
 
-	listener_four_tuple = &c.four_tuple
 	onvmpoll.Add(&c)
-	listener_conn = &c
 
 	id, err := IpToID(ip_addr)
 	laddr := OnvmAddr{
