@@ -54,6 +54,8 @@ const (
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
 	LOG_LEVEL = logrus.WarnLevel
+	// Packet manager numbers
+	PKT_MANAGER_NUM = 4
 )
 
 type Config struct {
@@ -107,10 +109,7 @@ type OnvmPoll struct {
 		key: Use four-tuple to calculate this hash-key
 		value: pointer to the Connection
 	*/
-	tables         *hashmap.Map[uint32, *Connection]
-	syn_chan       chan (*Four_tuple_rte)
-	ack_chan       chan (*Four_tuple_rte)
-	fin_frame_chan chan (ChannelData)
+	tables *hashmap.Map[uint32, *Connection]
 }
 
 type PortManager struct {
@@ -129,6 +128,12 @@ type StatusFlag struct {
 	is_ready         bool
 }
 
+type pktManager struct {
+	syn_chan       chan (*Four_tuple_rte)
+	ack_chan       chan (*Four_tuple_rte)
+	fin_frame_chan chan (ChannelData)
+}
+
 /* Global Variables */
 var (
 	config        Config
@@ -137,6 +142,7 @@ var (
 	nf_ctx        *C.struct_onvm_nf_local_ctx
 	listener      *OnvmListener
 	port_manager  *PortManager
+	pkt_manager   []*pktManager
 	a_port        Port
 
 	//Control Message (bytes)
@@ -148,14 +154,11 @@ var (
 func init() {
 	/* Initialize Global Variable */
 	InitConfig()
+	initPktManager()
 	local_address = "127.0.0.1"
 	onvmpoll = OnvmPoll{
-		tables:         hashmap.New[uint32, *Connection](),
-		syn_chan:       make(chan *Four_tuple_rte, 128),
-		ack_chan:       make(chan *Four_tuple_rte, 128),
-		fin_frame_chan: make(chan ChannelData, 1024),
+		tables: hashmap.New[uint32, *Connection](),
 	}
-
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
@@ -178,6 +181,9 @@ func init() {
 
 	/* Run port Manager */
 	port_manager.Run()
+
+	/* Run pkt Manager */
+	runPktManager()
 
 	/* Run onvmpoller */
 	logger.Log.Traceln("Start onvmpoll run")
@@ -308,6 +314,25 @@ func ParseFourTupleByIndex(four_tuple string, index int) string {
 	Methods of packet handling
 *********************************/
 
+func initPktManager() {
+	pkt_manager = make([]*pktManager, PKT_MANAGER_NUM)
+	for i := 0; i < PKT_MANAGER_NUM; i++ {
+		pkt_manager[i] = &pktManager{
+			syn_chan:       make(chan *Four_tuple_rte, 128/PKT_MANAGER_NUM),
+			ack_chan:       make(chan *Four_tuple_rte, 128/PKT_MANAGER_NUM),
+			fin_frame_chan: make(chan ChannelData, 1024/PKT_MANAGER_NUM),
+		}
+	}
+}
+
+func runPktManager() {
+	for i := 0; i < PKT_MANAGER_NUM; i++ {
+		go pkt_manager[i].connectionHandler()
+		go pkt_manager[i].finFrameHandler()
+		go pkt_manager[i].replyHandler()
+	}
+}
+
 //export DeliverPacket
 func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	// Deliver the packet to the right connection via four-tuple
@@ -318,26 +343,28 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 	pktType := int(packet_type)
 
+	managerIndex := (int(four_tuple.Src_port) + int(four_tuple.Dst_port)) % PKT_MANAGER_NUM
+
 	switch pktType {
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
-		onvmpoll.syn_chan <- &four_tuple
+		pkt_manager[managerIndex].syn_chan <- &four_tuple
 	case HTTP_FRAME, CLOSE_CONN:
 		// Handle by finFrameHandler
-		onvmpoll.fin_frame_chan <- rxdata
+		pkt_manager[managerIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
-		onvmpoll.ack_chan <- &four_tuple
+		pkt_manager[managerIndex].ack_chan <- &four_tuple
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
 	return res_code
 }
 
-func connectionHandler() {
+func (manager *pktManager) connectionHandler() {
 	logger.Log.Traceln("Start connectionWorker")
 
-	for four_tuple := range onvmpoll.syn_chan {
+	for four_tuple := range manager.syn_chan {
 		var new_conn *Connection
 
 		logger.Log.Traceln("Receive one connection request")
@@ -370,8 +397,8 @@ func connectionHandler() {
 	}
 }
 
-func replyHandler() {
-	for four_tuple := range onvmpoll.ack_chan {
+func (manager *pktManager) replyHandler() {
+	for four_tuple := range manager.ack_chan {
 		conn, ok := onvmpoll.tables.Get(hashV4Flow(*four_tuple))
 		if !ok {
 			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
@@ -382,8 +409,8 @@ func replyHandler() {
 	}
 }
 
-func finFrameHandler() {
-	for channel_data := range onvmpoll.fin_frame_chan {
+func (manager *pktManager) finFrameHandler() {
+	for channel_data := range manager.fin_frame_chan {
 		switch channel_data.PacketType {
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
@@ -524,9 +551,6 @@ func (onvmpoll *OnvmPoll) Close() {
 }
 
 func (onvmpoll *OnvmPoll) Run() {
-	go connectionHandler()
-	go replyHandler()
-	go finFrameHandler()
 	go C.onvm_nflib_run(nf_ctx)
 }
 
