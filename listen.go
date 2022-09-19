@@ -1,7 +1,7 @@
 package onvmpoller
 
 import (
-	"fmt"
+	"encoding/binary"
 	"net"
 )
 
@@ -17,14 +17,14 @@ func listen(ip_addr string, port uint16) (net.Listener, error) {
 }
 
 func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
-	c := &Connection{
-		conn_id: listener_conn_id,
-		rxchan:  make(chan RxChannelData, 1),
-		// txchan:  make(chan TxChannelData, 1),
-	}
-	c.four_tuple[SRC_IP_ADDR_IDX] = ip_addr
-	c.four_tuple[SRC_PORT_IDX] = fmt.Sprint(port)
-	onvmpoll.Add(c)
+	var c Connection
+	c.rxchan = make(chan []byte, 100)
+	c.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	c.four_tuple.Src_port = port
+	c.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP("0.0.0.0")[12:16])
+	c.four_tuple.Dst_port = uint16(0)
+
+	onvmpoll.Add(&c)
 
 	id, err := IpToID(ip_addr)
 	laddr := OnvmAddr{
@@ -38,5 +38,11 @@ func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 		return nil, err
 	}
 
-	return &OnvmListener{laddr: laddr, conn: c}, nil
+	listener = &OnvmListener{
+		laddr:         laddr,
+		conn:          &c,
+		complete_chan: make(chan *Connection, 100),
+	}
+
+	return listener, nil
 }
