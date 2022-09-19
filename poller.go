@@ -71,7 +71,13 @@ type Connection struct {
 	dst_id     uint8
 	rxchan     chan ([]byte)
 	four_tuple Four_tuple_rte
-	status     *StatusFlag
+	state      *connState
+}
+
+type connState struct {
+	is_rxchan_closed atomic.Bool
+	is_txchan_closed atomic.Bool
+	is_ready         atomic.Bool
 }
 
 type Four_tuple_rte struct {
@@ -171,18 +177,21 @@ func init() {
 	onvmpoll.Run()
 }
 
+/*********************************
+	     onvmpoller API
+*********************************/
+
 func SetLocalAddress(addr string) {
 	local_address = addr
-}
-
-func ParseNfName(args string) string {
-	nfName := strings.Split(args, "/")
-	return nfName[1]
 }
 
 func CloseONVM() {
 	C.onvm_nflib_stop(nf_ctx)
 }
+
+/*********************************
+	     Hepler functions
+*********************************/
 
 func InitConfig() {
 	// Get absolute file name of ipid.yaml
@@ -201,6 +210,11 @@ func InitConfig() {
 			panic(unMarshalErr)
 		}
 	}
+}
+
+func ParseNfName(args string) string {
+	nfName := strings.Split(args, "/")
+	return nfName[1]
 }
 
 func IpToID(ip string) (id int32, err error) {
@@ -283,6 +297,10 @@ func ParseFourTupleByIndex(four_tuple string, index int) string {
 	return tuples[index]
 }
 
+/*********************************
+	Methods of packet handling
+*********************************/
+
 //export DeliverPacket
 func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	// Deliver the packet to the right connection via four-tuple
@@ -315,7 +333,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		} else {
 			logger.Log.Infof("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
 			close(conn.rxchan)
-			conn.status.is_rxchan_closed = true
+			conn.state.is_rxchan_closed.Store(true)
 			onvmpoll.Delete(conn)
 		}
 	case HTTP_FRAME:
@@ -431,8 +449,12 @@ func (port *Port) atomicPort() uint16 {
 func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
+	var cs connState
 	conn.rxchan = make(chan []byte, 5) // For non-blocking
-	conn.status = &StatusFlag{}
+	// cs.is_rxchan_closed.Store(false)
+	// cs.is_txchan_closed.Store(false)
+	// cs.is_ready.Store(false)
+	conn.state = &cs
 
 	return &conn
 }
@@ -444,7 +466,7 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 
 func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
-	if conn.status.is_txchan_closed && conn.status.is_rxchan_closed {
+	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
 		var four_tuple *Four_tuple_rte = SwapFourTuple(conn.four_tuple)
 		ok := onvmpoll.tables.Del(hashV4Flow(*four_tuple))
 		if !ok {
@@ -594,7 +616,7 @@ func (connection Connection) Close() error {
 	connection.WriteControlMessage(CLOSE_CONN)
 
 	// Close local connection
-	connection.status.is_txchan_closed = true
+	connection.state.is_rxchan_closed.Store(true)
 	err = onvmpoll.Delete(&connection)
 
 	return err
