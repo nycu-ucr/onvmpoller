@@ -616,7 +616,7 @@ func (connection Connection) Close() error {
 	connection.WriteControlMessage(CLOSE_CONN)
 
 	// Close local connection
-	connection.state.is_rxchan_closed.Store(true)
+	connection.state.is_txchan_closed.Store(true)
 	err = onvmpoll.Delete(&connection)
 
 	return err
