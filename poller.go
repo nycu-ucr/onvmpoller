@@ -68,11 +68,10 @@ type ChannelData struct {
 }
 
 type Connection struct {
-	dst_id           uint8
-	rxchan           chan ([]byte)
-	is_rxchan_closed bool
-	is_txchan_closed bool
-	four_tuple       Four_tuple_rte
+	dst_id     uint8
+	rxchan     chan ([]byte)
+	four_tuple Four_tuple_rte
+	status     *StatusFlag
 }
 
 type Four_tuple_rte struct {
@@ -112,6 +111,12 @@ type PortManager struct {
 
 type Port struct {
 	count uint32
+}
+
+type StatusFlag struct {
+	is_rxchan_closed bool
+	is_txchan_closed bool
+	is_ready         bool
 }
 
 /* Global Variables */
@@ -310,7 +315,7 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		} else {
 			logger.Log.Infof("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
 			close(conn.rxchan)
-			conn.is_rxchan_closed = true
+			conn.status.is_rxchan_closed = true
 			onvmpoll.Delete(conn)
 		}
 	case HTTP_FRAME:
@@ -427,6 +432,7 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	conn.rxchan = make(chan []byte, 5) // For non-blocking
+	conn.status = &StatusFlag{}
 
 	return &conn
 }
@@ -438,7 +444,7 @@ func (onvmpoll *OnvmPoll) Add(conn *Connection) {
 
 func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
-	if conn.is_txchan_closed && conn.is_rxchan_closed {
+	if conn.status.is_txchan_closed && conn.status.is_rxchan_closed {
 		var four_tuple *Four_tuple_rte = SwapFourTuple(conn.four_tuple)
 		ok := onvmpoll.tables.Del(hashV4Flow(*four_tuple))
 		if !ok {
@@ -588,7 +594,7 @@ func (connection Connection) Close() error {
 	connection.WriteControlMessage(CLOSE_CONN)
 
 	// Close local connection
-	connection.is_txchan_closed = true
+	connection.status.is_txchan_closed = true
 	err = onvmpoll.Delete(&connection)
 
 	return err
