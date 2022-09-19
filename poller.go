@@ -72,6 +72,7 @@ type Connection struct {
 	rxchan     chan ([]byte)
 	four_tuple Four_tuple_rte
 	state      *connState
+	sync_chan  chan (bool)
 }
 
 type connState struct {
@@ -106,7 +107,10 @@ type OnvmPoll struct {
 		key: Use four-tuple to calculate this hash-key
 		value: pointer to the Connection
 	*/
-	tables *hashmap.Map[uint32, *Connection]
+	tables         *hashmap.Map[uint32, *Connection]
+	syn_chan       chan (*Four_tuple_rte)
+	ack_chan       chan (*Four_tuple_rte)
+	fin_frame_chan chan (ChannelData)
 }
 
 type PortManager struct {
@@ -127,10 +131,8 @@ type StatusFlag struct {
 
 /* Global Variables */
 var (
-	config Config
-	// conn_id             connID
-	onvmpoll OnvmPoll
-	// port_pool           portPool           // The ports range from 49152 to 65535
+	config        Config
+	onvmpoll      OnvmPoll
 	local_address string // Initialize at ListenONVM
 	nf_ctx        *C.struct_onvm_nf_local_ctx
 	listener      *OnvmListener
@@ -147,7 +149,12 @@ func init() {
 	/* Initialize Global Variable */
 	InitConfig()
 	local_address = "127.0.0.1"
-	onvmpoll.tables = hashmap.New[uint32, *Connection]()
+	onvmpoll = OnvmPoll{
+		tables:         hashmap.New[uint32, *Connection](),
+		syn_chan:       make(chan *Four_tuple_rte, 128),
+		ack_chan:       make(chan *Four_tuple_rte, 128),
+		fin_frame_chan: make(chan ChannelData, 1024),
+	}
 
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
@@ -308,88 +315,98 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
-	// rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
+	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 	pktType := int(packet_type)
 
 	switch pktType {
 	case ESTABLISH_CONN:
-		var err error
-		// Deliver packet to litsener's connection
-		if (listener.conn.four_tuple.Src_ip != four_tuple.Dst_ip) || (listener.conn.four_tuple.Src_port != four_tuple.Dst_port) {
-			err = fmt.Errorf("DeliverPacket-%d, Can not get connection via four-tuple %v", pktType, four_tuple)
-		}
-		// listener_conn, err := onvmpoll.GetConnByReverseFourTuple(listener_four_tuple)
-
-		if err != nil {
-			logger.Log.Errorln(err)
-		} else {
-			connectionHandler(&four_tuple)
-		}
-	case CLOSE_CONN:
-		// Let onvmpoller delete the connection
-		conn, ok := onvmpoll.tables.Get(hashV4Flow(four_tuple))
-		if !ok {
-			logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", four_tuple)
-		} else {
-			logger.Log.Infof("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
-			close(conn.rxchan)
-			conn.state.is_rxchan_closed.Store(true)
-			onvmpoll.Delete(conn)
-		}
-	case HTTP_FRAME:
-		conn, ok := onvmpoll.tables.Get(hashV4Flow(four_tuple))
-		if !ok {
-			logger.Log.Errorf("DeliverPacket-%d, Can not get connection via four-tuple %v", pktType, four_tuple)
-		} else {
-			conn.rxchan <- payload
-			// logger.Log.Tracef("DeliverPacket, deliver packet to Conn ID: %v\n", conn.conn_id)
-		}
+		// Handle by connectionHandler
+		onvmpoll.syn_chan <- &four_tuple
+	case HTTP_FRAME, CLOSE_CONN:
+		// Handle by finFrameHandler
+		onvmpoll.fin_frame_chan <- rxdata
 	case REPLY_CONN:
-		conn, ok := onvmpoll.tables.Get(hashV4Flow(four_tuple))
-		if !ok {
-			logger.Log.Errorf("DeliverPacket-%d, Can not get connection via four-tuple %v", pktType, four_tuple)
-		} else {
-			conn.rxchan <- payload
-			// logger.Log.Tracef("DeliverPacket, deliver packet to Conn ID: %v\n", conn.conn_id)
-		}
+		// Handle by replyHandler
+		onvmpoll.ack_chan <- &four_tuple
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
 	return res_code
 }
 
-func connectionHandler(four_tuple *Four_tuple_rte) {
+func connectionHandler() {
 	logger.Log.Traceln("Start connectionWorker")
 
-	var new_conn *Connection
+	for four_tuple := range onvmpoll.syn_chan {
+		var new_conn *Connection
 
-	logger.Log.Traceln("Receive one connection request")
+		logger.Log.Traceln("Receive one connection request")
 
-	// Initialize the new connection
-	new_conn = onvmpoll.Create()
-	new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(listener.laddr.ipv4_addr)[12:16])
-	new_conn.four_tuple.Src_port = listener.laddr.port
-	new_conn.four_tuple.Dst_ip = four_tuple.Src_ip
-	new_conn.four_tuple.Dst_port = four_tuple.Src_port
+		// Initialize the new connection
+		new_conn = onvmpoll.Create()
+		new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(listener.laddr.ipv4_addr)[12:16])
+		new_conn.four_tuple.Src_port = listener.laddr.port
+		new_conn.four_tuple.Dst_ip = four_tuple.Src_ip
+		new_conn.four_tuple.Dst_port = four_tuple.Src_port
 
-	// Add the connection to table
-	onvmpoll.Add(new_conn)
+		// Add the connection to table
+		onvmpoll.Add(new_conn)
 
-	dst_id, _ := IpToID(unMarshalIP(four_tuple.Src_ip))
-	new_conn.dst_id = uint8(dst_id)
+		dst_id, _ := IpToID(unMarshalIP(four_tuple.Src_ip))
+		new_conn.dst_id = uint8(dst_id)
 
-	// Send ACK back to client
-	_, err := new_conn.WriteControlMessage(REPLY_CONN)
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		new_conn.Close()
-	} else {
-		logger.Log.Tracef("Write connection response to (%v, %v)",
-			new_conn.four_tuple.Dst_ip,
-			new_conn.four_tuple.Dst_port)
+		// Send ACK back to client
+		_, err := new_conn.WriteControlMessage(REPLY_CONN)
+		if err != nil {
+			logger.Log.Errorln(err.Error())
+			new_conn.Close()
+		} else {
+			logger.Log.Tracef("Write connection response to (%v, %v)",
+				new_conn.four_tuple.Dst_ip,
+				new_conn.four_tuple.Dst_port)
+		}
+
+		listener.complete_chan <- new_conn
+	}
+}
+
+func replyHandler() {
+	for four_tuple := range onvmpoll.ack_chan {
+		conn, ok := onvmpoll.tables.Get(hashV4Flow(*four_tuple))
+		if !ok {
+			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
+		} else {
+			conn.state.is_ready.Store(true)
+			conn.sync_chan <- true
+		}
+	}
+}
+
+func finFrameHandler() {
+	for channel_data := range onvmpoll.fin_frame_chan {
+		switch channel_data.PacketType {
+		case CLOSE_CONN:
+			// Let onvmpoller delete the connection
+			conn, ok := onvmpoll.tables.Get(hashV4Flow(channel_data.FourTuple))
+			if !ok {
+				logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
+			} else {
+				logger.Log.Infof("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
+				close(conn.rxchan)
+				conn.state.is_rxchan_closed.Store(true)
+				onvmpoll.Delete(conn)
+			}
+		case HTTP_FRAME:
+			conn, ok := onvmpoll.tables.Get(hashV4Flow(channel_data.FourTuple))
+			if !ok {
+				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
+			} else {
+				conn.rxchan <- channel_data.Payload
+				// logger.Log.Tracef("DeliverPacket, deliver packet to Conn ID: %v\n", conn.conn_id)
+			}
+		}
 	}
 
-	listener.complete_chan <- new_conn
 }
 
 /*********************************
@@ -455,6 +472,7 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 	// cs.is_txchan_closed.Store(false)
 	// cs.is_ready.Store(false)
 	conn.state = &cs
+	conn.sync_chan = make(chan bool, 1)
 
 	return &conn
 }
@@ -506,6 +524,9 @@ func (onvmpoll *OnvmPoll) Close() {
 }
 
 func (onvmpoll *OnvmPoll) Run() {
+	go connectionHandler()
+	go replyHandler()
+	go finFrameHandler()
 	go C.onvm_nflib_run(nf_ctx)
 }
 
@@ -557,7 +578,7 @@ func (connection Connection) ReadACK() error {
 
 	var err error
 	// Receive packet from onvmpoller
-	_, ok := <-connection.rxchan
+	_, ok := <-connection.sync_chan
 
 	if !ok {
 		err = fmt.Errorf("EOF")
