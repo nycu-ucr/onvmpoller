@@ -24,7 +24,7 @@ func listenONVM(ip_addr string, port uint16) (*OnvmListener, error) {
 	c.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP("0.0.0.0")[12:16])
 	c.four_tuple.Dst_port = uint16(0)
 
-	onvmpoll.Add(&c)
+	// onvmpoll.Add(&c)
 
 	id, err := IpToID(ip_addr)
 	laddr := OnvmAddr{

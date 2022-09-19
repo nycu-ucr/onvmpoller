@@ -55,7 +55,7 @@ const (
 	// Logger level
 	LOG_LEVEL = logrus.WarnLevel
 	// Packet manager numbers
-	PKT_MANAGER_NUM = 4
+	ONVM_POLLER_NUM = 4
 )
 
 type Config struct {
@@ -109,7 +109,10 @@ type OnvmPoll struct {
 		key: Use four-tuple to calculate this hash-key
 		value: pointer to the Connection
 	*/
-	tables *hashmap.Map[uint32, *Connection]
+	tables         *hashmap.Map[uint32, *Connection]
+	syn_chan       chan (*Four_tuple_rte)
+	ack_chan       chan (*Four_tuple_rte)
+	fin_frame_chan chan (ChannelData)
 }
 
 type PortManager struct {
@@ -128,21 +131,14 @@ type StatusFlag struct {
 	is_ready         bool
 }
 
-type pktManager struct {
-	syn_chan       chan (*Four_tuple_rte)
-	ack_chan       chan (*Four_tuple_rte)
-	fin_frame_chan chan (ChannelData)
-}
-
 /* Global Variables */
 var (
 	config        Config
-	onvmpoll      OnvmPoll
+	onvmpoll      []*OnvmPoll
 	local_address string // Initialize at ListenONVM
 	nf_ctx        *C.struct_onvm_nf_local_ctx
 	listener      *OnvmListener
 	port_manager  *PortManager
-	pkt_manager   []*pktManager
 	a_port        Port
 
 	//Control Message (bytes)
@@ -154,11 +150,9 @@ var (
 func init() {
 	/* Initialize Global Variable */
 	InitConfig()
-	initPktManager()
+	initOnvmPoll()
+
 	local_address = "127.0.0.1"
-	onvmpoll = OnvmPoll{
-		tables: hashmap.New[uint32, *Connection](),
-	}
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
@@ -182,12 +176,14 @@ func init() {
 	/* Run port Manager */
 	port_manager.Run()
 
-	/* Run pkt Manager */
-	runPktManager()
-
 	/* Run onvmpoller */
 	logger.Log.Traceln("Start onvmpoll run")
-	onvmpoll.Run()
+	runOnvmPoller()
+}
+
+func runOnvmPoller() {
+	go C.onvm_nflib_run(nf_ctx)
+	runPktWorker()
 }
 
 /*********************************
@@ -310,26 +306,32 @@ func ParseFourTupleByIndex(four_tuple string, index int) string {
 	return tuples[index]
 }
 
+/* Use four-tuple to get the poller-index to dispatch */
+func (four_tuple *Four_tuple_rte) getPollIndex() int {
+	return int(four_tuple.Src_port+four_tuple.Dst_port) % ONVM_POLLER_NUM
+}
+
 /*********************************
 	Methods of packet handling
 *********************************/
 
-func initPktManager() {
-	pkt_manager = make([]*pktManager, PKT_MANAGER_NUM)
-	for i := 0; i < PKT_MANAGER_NUM; i++ {
-		pkt_manager[i] = &pktManager{
-			syn_chan:       make(chan *Four_tuple_rte, 128/PKT_MANAGER_NUM),
-			ack_chan:       make(chan *Four_tuple_rte, 128/PKT_MANAGER_NUM),
-			fin_frame_chan: make(chan ChannelData, 1024/PKT_MANAGER_NUM),
+func initOnvmPoll() {
+	onvmpoll = make([]*OnvmPoll, ONVM_POLLER_NUM)
+	for i := 0; i < ONVM_POLLER_NUM; i++ {
+		onvmpoll[i] = &OnvmPoll{
+			tables:         hashmap.New[uint32, *Connection](),
+			syn_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
+			ack_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
+			fin_frame_chan: make(chan ChannelData, 1024/ONVM_POLLER_NUM),
 		}
 	}
 }
 
-func runPktManager() {
-	for i := 0; i < PKT_MANAGER_NUM; i++ {
-		go pkt_manager[i].connectionHandler()
-		go pkt_manager[i].finFrameHandler()
-		go pkt_manager[i].replyHandler()
+func runPktWorker() {
+	for i := 0; i < ONVM_POLLER_NUM; i++ {
+		go onvmpoll[i].connectionHandler()
+		go onvmpoll[i].finFrameHandler()
+		go onvmpoll[i].replyHandler()
 	}
 }
 
@@ -343,41 +345,41 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 	pktType := int(packet_type)
 
-	managerIndex := (int(four_tuple.Src_port) + int(four_tuple.Dst_port)) % PKT_MANAGER_NUM
+	pollIndex := four_tuple.getPollIndex()
 
 	switch pktType {
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
-		pkt_manager[managerIndex].syn_chan <- &four_tuple
+		onvmpoll[pollIndex].syn_chan <- &four_tuple
 	case HTTP_FRAME, CLOSE_CONN:
 		// Handle by finFrameHandler
-		pkt_manager[managerIndex].fin_frame_chan <- rxdata
+		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
-		pkt_manager[managerIndex].ack_chan <- &four_tuple
+		onvmpoll[pollIndex].ack_chan <- &four_tuple
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
 	return res_code
 }
 
-func (manager *pktManager) connectionHandler() {
+func (poll *OnvmPoll) connectionHandler() {
 	logger.Log.Traceln("Start connectionWorker")
 
-	for four_tuple := range manager.syn_chan {
+	for four_tuple := range poll.syn_chan {
 		var new_conn *Connection
 
 		logger.Log.Traceln("Receive one connection request")
 
 		// Initialize the new connection
-		new_conn = onvmpoll.Create()
+		new_conn = createConnection()
 		new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(listener.laddr.ipv4_addr)[12:16])
 		new_conn.four_tuple.Src_port = listener.laddr.port
 		new_conn.four_tuple.Dst_ip = four_tuple.Src_ip
 		new_conn.four_tuple.Dst_port = four_tuple.Src_port
 
 		// Add the connection to table
-		onvmpoll.Add(new_conn)
+		poll.Add(new_conn)
 
 		dst_id, _ := IpToID(unMarshalIP(four_tuple.Src_ip))
 		new_conn.dst_id = uint8(dst_id)
@@ -397,9 +399,9 @@ func (manager *pktManager) connectionHandler() {
 	}
 }
 
-func (manager *pktManager) replyHandler() {
-	for four_tuple := range manager.ack_chan {
-		conn, ok := onvmpoll.tables.Get(hashV4Flow(*four_tuple))
+func (poll *OnvmPoll) replyHandler() {
+	for four_tuple := range poll.ack_chan {
+		conn, ok := poll.tables.Get(hashV4Flow(*four_tuple))
 		if !ok {
 			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
 		} else {
@@ -409,22 +411,22 @@ func (manager *pktManager) replyHandler() {
 	}
 }
 
-func (manager *pktManager) finFrameHandler() {
-	for channel_data := range manager.fin_frame_chan {
+func (poll *OnvmPoll) finFrameHandler() {
+	for channel_data := range poll.fin_frame_chan {
 		switch channel_data.PacketType {
 		case CLOSE_CONN:
 			// Let onvmpoller delete the connection
-			conn, ok := onvmpoll.tables.Get(hashV4Flow(channel_data.FourTuple))
+			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
 			if !ok {
 				logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
 			} else {
 				logger.Log.Infof("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
 				close(conn.rxchan)
 				conn.state.is_rxchan_closed.Store(true)
-				onvmpoll.Delete(conn)
+				poll.Delete(conn)
 			}
 		case HTTP_FRAME:
-			conn, ok := onvmpoll.tables.Get(hashV4Flow(channel_data.FourTuple))
+			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
@@ -433,7 +435,6 @@ func (manager *pktManager) finFrameHandler() {
 			}
 		}
 	}
-
 }
 
 /*********************************
@@ -490,7 +491,7 @@ func (port *Port) atomicPort() uint16 {
 	Methods of OnvmPoll
 *********************************/
 
-func (onvmpoll *OnvmPoll) Create() *Connection {
+func createConnection() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	var cs connState
@@ -504,16 +505,16 @@ func (onvmpoll *OnvmPoll) Create() *Connection {
 	return &conn
 }
 
-func (onvmpoll *OnvmPoll) Add(conn *Connection) {
+func (poll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	onvmpoll.tables.Insert(hashV4Flow(*SwapFourTuple(conn.four_tuple)), conn)
+	poll.tables.Insert(hashV4Flow(*SwapFourTuple(conn.four_tuple)), conn)
 }
 
-func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
+func (poll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
 	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
 		var four_tuple *Four_tuple_rte = SwapFourTuple(conn.four_tuple)
-		ok := onvmpoll.tables.Del(hashV4Flow(*four_tuple))
+		ok := poll.tables.Del(hashV4Flow(*four_tuple))
 		if !ok {
 			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
 			err := errors.New(msg)
@@ -533,9 +534,9 @@ func (onvmpoll *OnvmPoll) Delete(conn *Connection) error {
 	return nil
 }
 
-func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
+func (poll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
 	swap_four_tuple := SwapFourTuple(*four_tuple)
-	c, ok := onvmpoll.tables.Get(hashV4Flow(*swap_four_tuple))
+	c, ok := poll.tables.Get(hashV4Flow(*swap_four_tuple))
 
 	if !ok {
 		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", *four_tuple)
@@ -548,10 +549,6 @@ func (onvmpoll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) 
 
 func (onvmpoll *OnvmPoll) Close() {
 	C.onvm_nflib_stop(nf_ctx)
-}
-
-func (onvmpoll *OnvmPoll) Run() {
-	go C.onvm_nflib_run(nf_ctx)
 }
 
 /*********************************
@@ -662,7 +659,9 @@ func (connection Connection) Close() error {
 
 	// Close local connection
 	connection.state.is_txchan_closed.Store(true)
-	err = onvmpoll.Delete(&connection)
+
+	pollIndex := connection.four_tuple.getPollIndex()
+	err = onvmpoll[pollIndex].Delete(&connection)
 
 	return err
 }
@@ -731,10 +730,6 @@ func (ol OnvmListener) Addr() net.Addr {
 
 ********************************
 */
-func CreateConnection() net.Conn {
-	conn := onvmpoll.Create()
-	return conn
-}
 
 func ListenONVM(network, address string) (net.Listener, error) {
 	logger.Log.Traceln("Start ListenONVM")
@@ -756,14 +751,15 @@ func DialONVM(network, address string) (net.Conn, error) {
 	ip_addr, port := ParseAddress(address)
 
 	// Initialize a connection
-	conn := onvmpoll.Create()
+	conn := createConnection()
 	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
 	conn.four_tuple.Src_port = port_manager.GetPort() //a_port.atomicPort()
 	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	conn.four_tuple.Dst_port = port
 
 	// Add the connection to table, otherwise it can't receive response
-	onvmpoll.Add(conn)
+	pollIndex := conn.four_tuple.getPollIndex()
+	onvmpoll[pollIndex].Add(conn)
 
 	dst_id, _ := IpToID(ip_addr)
 	conn.dst_id = uint8(dst_id)
