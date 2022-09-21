@@ -20,6 +20,7 @@ import "C"
 
 import (
 	"bytes"
+	"container/list"
 	"encoding/binary"
 	"encoding/gob"
 	"errors"
@@ -58,6 +59,12 @@ const (
 	ONVM_POLLER_NUM = 4
 )
 
+type Buffer struct {
+	buffer  []byte
+	counter int
+	is_done bool
+}
+
 type Config struct {
 	// Map the IP address to Service ID
 	IPIDMap map[string]int32 `yaml:"IPIDMap,omitempty"`
@@ -70,11 +77,13 @@ type ChannelData struct {
 }
 
 type Connection struct {
-	dst_id     uint8
-	rxchan     chan ([]byte)
-	four_tuple Four_tuple_rte
-	state      *connState
-	sync_chan  chan (bool)
+	dst_id         uint8
+	rxchan         chan ([]byte)
+	four_tuple     Four_tuple_rte
+	state          *connState
+	sync_chan      chan (bool)
+	read_sync_chan chan (bool)
+	buffer_list    *list.List
 }
 
 type connState struct {
@@ -430,7 +439,11 @@ func (poll *OnvmPoll) finFrameHandler() {
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
-				conn.rxchan <- channel_data.Payload
+				buffer := Buffer{buffer: channel_data.Payload, counter: 0, is_done: false}
+				conn.buffer_list.PushBack(&buffer)
+				conn.read_sync_chan <- true
+
+				// conn.rxchan <- channel_data.Payload
 				// logger.Log.Tracef("DeliverPacket, deliver packet to Conn ID: %v\n", conn.conn_id)
 			}
 		}
@@ -501,6 +514,8 @@ func createConnection() *Connection {
 	// cs.is_ready.Store(false)
 	conn.state = &cs
 	conn.sync_chan = make(chan bool, 1)
+	conn.read_sync_chan = make(chan bool, 1)
+	conn.buffer_list = list.New()
 
 	return &conn
 }
@@ -576,18 +591,34 @@ func (connection Connection) Read(b []byte) (int, error) {
 	var length int
 	var err error
 	// // Receive packet from onvmpoller
-	rx_data, ok := <-connection.rxchan
+	// rx_data, ok := <-connection.rxchan
+	_, ok := <-connection.read_sync_chan
 
 	if ok {
-		// Get response
-		if len(b) < len(rx_data) {
-			// TODO: Fix this problem
-			logger.Log.Errorf("Read buffer length is not sufficient. Need %v but got %v", len(rx_data), len(b))
-		} else {
-			length = copy(b, rx_data)
+		// 	// Get response
+		// 	if len(b) < len(rx_data) {
+		// 		// TODO: Fix this problem
+		// 		logger.Log.Errorf("Read buffer length is not sufficient. Need %v but got %v", len(rx_data), len(b))
+		// 	} else {
+		// 		length = copy(b, rx_data)
+		// 	}
+		// } else {
+		// 	err = fmt.Errorf("EOF")
+		// }
+
+		elem := connection.buffer_list.Front()
+		buffer := elem.Value.(*Buffer)
+		for buffer.is_done {
+			elem = elem.Next()
+			buffer = elem.Value.(*Buffer)
 		}
-	} else {
-		err = fmt.Errorf("EOF")
+
+		length = copy(b, buffer.buffer[buffer.counter:])
+		buffer.counter += length
+		if buffer.counter == len(buffer.buffer) {
+			buffer.is_done = true
+			// TODO: Clear list
+		}
 	}
 
 	return length, err
