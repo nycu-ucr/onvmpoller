@@ -57,7 +57,7 @@ const (
 	// Logger level
 	LOG_LEVEL = logrus.WarnLevel
 	// Packet manager numbers
-	ONVM_POLLER_NUM = 4
+	ONVM_POLLER_NUM = 8
 )
 
 type Buffer struct {
@@ -443,9 +443,16 @@ func (poll *OnvmPoll) finFrameHandler() {
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
-				buffer := Buffer{buffer: channel_data.Payload, counter: 0, is_done: false}
-				conn.buffer_list.PushBack(&buffer)
-				conn.read_sync_chan <- true
+				// buffer := Buffer{buffer: channel_data.Payload, counter: 0, is_done: false}
+				// conn.buffer_list.PushBack(&buffer)
+				if conn.buffer_list.Front() == nil {
+					buffer := bytes.NewBuffer(channel_data.Payload)
+					conn.buffer_list.PushBack(buffer)
+					conn.read_sync_chan <- true
+				} else {
+					buffer := bytes.NewBuffer(channel_data.Payload)
+					conn.buffer_list.PushBack(buffer)
+				}
 
 				// conn.rxchan <- channel_data.Payload
 			}
@@ -587,10 +594,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 
 	var length int
 	var err error
-	var elem *list.Element
 
-	elem = connection.buffer_list.Front()
-	if elem == nil {
+	if connection.buffer_list.Front() == nil {
 		// List is empty, waiting for packet
 		// logger.Log.Debugln("Waiting Packet...")
 		_, ok := <-connection.read_sync_chan
@@ -600,21 +605,29 @@ func (connection Connection) Read(b []byte) (int, error) {
 			return length, err
 		}
 	}
-	elem = connection.buffer_list.Front()
-	buffer := elem.Value.(*Buffer)
 
-	for buffer.is_done {
-		logger.Log.Warnln("One buffer is done, it could be cleaned.")
-		elem = elem.Next()
-		buffer = elem.Value.(*Buffer)
-	}
-
-	length = copy(b, buffer.buffer[buffer.counter:])
-	buffer.counter += length
-	if buffer.counter == len(buffer.buffer) {
-		buffer.is_done = true
+	elem := connection.buffer_list.Front()
+	// buffer := elem.Value.(*Buffer)
+	buffer := elem.Value.(*bytes.Buffer)
+	length, err = buffer.Read(b)
+	if err == io.EOF {
 		connection.buffer_list.Remove(elem)
+		// logger.Log.Warnf("[Read] remove!!!")
 	}
+	// logger.Log.Warnf("[Read]length: %d, err: %+v", length, err)
+
+	// for buffer.is_done {
+	// 	logger.Log.Warnln("One buffer is done, it could be cleaned.")
+	// 	elem = elem.Next()
+	// 	buffer = elem.Value.(*Buffer)
+	// }
+
+	// length = copy(b, buffer.buffer[buffer.counter:])
+	// buffer.counter += length
+	// if buffer.counter == len(buffer.buffer) {
+	// 	buffer.is_done = true
+	// 	connection.buffer_list.Remove(elem)
+	// }
 	// logger.Log.Debugf("Read %v bytes", length)
 
 	return length, err
