@@ -174,7 +174,7 @@ func init() {
 	logger.SetLogLevel(LOG_LEVEL)
 
 	/* Parse NF Name */
-	NfName := ParseNfName(os.Args[0])
+	NfName := parseNfName(os.Args[0])
 	var char_ptr *C.char
 	char_ptr = C.CString(NfName)
 
@@ -231,7 +231,7 @@ func InitConfig() {
 	}
 }
 
-func ParseNfName(args string) string {
+func parseNfName(args string) string {
 	nfName := strings.Split(args, "/")
 	return nfName[1]
 }
@@ -246,7 +246,7 @@ func IpToID(ip string) (id int32, err error) {
 	return
 }
 
-func ParseAddress(address string) (string, uint16) {
+func parseAddress(address string) (string, uint16) {
 	addr := strings.Split(address, ":")
 	v, _ := strconv.ParseUint(addr[1], 10, 64)
 	ip_addr, port := addr[0], uint16(v)
@@ -254,7 +254,7 @@ func ParseAddress(address string) (string, uint16) {
 	return ip_addr, port
 }
 
-func MakeConnCtrlMsg(msg_type int) []byte {
+func makeConnCtrlMsg(msg_type int) []byte {
 	switch msg_type {
 	case ESTABLISH_CONN:
 		return SYN
@@ -281,7 +281,7 @@ func hashV4Flow(four_tuple Four_tuple_rte) uint32 {
 	return flowHash
 }
 
-func EncodeChannelDataToBytes(tx_data ChannelData) ([]byte, error) {
+func encodeChannelDataToBytes(tx_data ChannelData) ([]byte, error) {
 	// Encode TxChannelData to bytes
 	// logger.Log.Tracef("EncodeChannelDataToBytes, tx_data:%+v", tx_data)
 	var buf bytes.Buffer
@@ -292,7 +292,7 @@ func EncodeChannelDataToBytes(tx_data ChannelData) ([]byte, error) {
 	return buf.Bytes(), err
 }
 
-func DecodeToChannelData(buf []byte) (ChannelData, error) {
+func decodeToChannelData(buf []byte) (ChannelData, error) {
 	// Decode bytes to RxChannelData
 	var rx_data ChannelData
 
@@ -302,7 +302,7 @@ func DecodeToChannelData(buf []byte) (ChannelData, error) {
 	return rx_data, err
 }
 
-func SwapFourTuple(four_tuple Four_tuple_rte) *Four_tuple_rte {
+func swapFourTuple(four_tuple Four_tuple_rte) *Four_tuple_rte {
 	return &Four_tuple_rte{
 		Src_ip:   four_tuple.Dst_ip,
 		Src_port: four_tuple.Dst_port,
@@ -311,7 +311,7 @@ func SwapFourTuple(four_tuple Four_tuple_rte) *Four_tuple_rte {
 	}
 }
 
-func ParseFourTupleByIndex(four_tuple string, index int) string {
+func parseFourTupleByIndex(four_tuple string, index int) string {
 	tuples := strings.Split(four_tuple, ",")
 	return tuples[index]
 }
@@ -443,8 +443,6 @@ func (poll *OnvmPoll) finFrameHandler() {
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
-				// buffer := Buffer{buffer: channel_data.Payload, counter: 0, is_done: false}
-				// conn.buffer_list.PushBack(&buffer)
 				if conn.buffer_list.Front() == nil {
 					buffer := bytes.NewBuffer(channel_data.Payload)
 					conn.buffer_list.PushBack(buffer)
@@ -453,8 +451,6 @@ func (poll *OnvmPoll) finFrameHandler() {
 					buffer := bytes.NewBuffer(channel_data.Payload)
 					conn.buffer_list.PushBack(buffer)
 				}
-
-				// conn.rxchan <- channel_data.Payload
 			}
 		}
 	}
@@ -529,13 +525,13 @@ func createConnection() *Connection {
 
 func (poll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	poll.tables.Insert(hashV4Flow(*SwapFourTuple(conn.four_tuple)), conn)
+	poll.tables.Insert(hashV4Flow(*swapFourTuple(conn.four_tuple)), conn)
 }
 
 func (poll *OnvmPoll) Delete(conn *Connection) error {
 	// Delete the connection from connection and four-tuple tables
 	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
-		var four_tuple *Four_tuple_rte = SwapFourTuple(conn.four_tuple)
+		var four_tuple *Four_tuple_rte = swapFourTuple(conn.four_tuple)
 		ok := poll.tables.Del(hashV4Flow(*four_tuple))
 		if !ok {
 			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
@@ -543,12 +539,6 @@ func (poll *OnvmPoll) Delete(conn *Connection) error {
 			logger.Log.Errorln(msg)
 			return err
 		}
-		// if _, ok := onvmpoll.tables.GetAndDel(four_tuple); !ok {
-		// 	msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
-		// 	err := errors.New(msg)
-		// 	logger.Log.Errorln(msg)
-		// 	return err
-		// }
 
 		port_manager.ReleasePort(conn.four_tuple.Src_port)
 		logger.Log.Info("Close connection sucessfully.\n")
@@ -558,7 +548,7 @@ func (poll *OnvmPoll) Delete(conn *Connection) error {
 }
 
 func (poll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
-	swap_four_tuple := SwapFourTuple(*four_tuple)
+	swap_four_tuple := swapFourTuple(*four_tuple)
 	c, ok := poll.tables.Get(hashV4Flow(*swap_four_tuple))
 
 	if !ok {
@@ -597,38 +587,19 @@ func (connection Connection) Read(b []byte) (int, error) {
 
 	if connection.buffer_list.Front() == nil {
 		// List is empty, waiting for packet
-		// logger.Log.Debugln("Waiting Packet...")
 		_, ok := <-connection.read_sync_chan
 		if !ok {
-			// logger.Log.Debugln("Read EOF")
 			err = io.EOF
 			return length, err
 		}
 	}
 
 	elem := connection.buffer_list.Front()
-	// buffer := elem.Value.(*Buffer)
 	buffer := elem.Value.(*bytes.Buffer)
 	length, err = buffer.Read(b)
 	if err == io.EOF {
 		connection.buffer_list.Remove(elem)
-		// logger.Log.Warnf("[Read] remove!!!")
 	}
-	// logger.Log.Warnf("[Read]length: %d, err: %+v", length, err)
-
-	// for buffer.is_done {
-	// 	logger.Log.Warnln("One buffer is done, it could be cleaned.")
-	// 	elem = elem.Next()
-	// 	buffer = elem.Value.(*Buffer)
-	// }
-
-	// length = copy(b, buffer.buffer[buffer.counter:])
-	// buffer.counter += length
-	// if buffer.counter == len(buffer.buffer) {
-	// 	buffer.is_done = true
-	// 	connection.buffer_list.Remove(elem)
-	// }
-	// logger.Log.Debugf("Read %v bytes", length)
 
 	return length, err
 }
@@ -671,7 +642,7 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 
 	// Translate Go structure to C char *
 	var buffer_ptr *C.char
-	buffer := MakeConnCtrlMsg(msg_type)
+	buffer := makeConnCtrlMsg(msg_type)
 	buffer_ptr = (*C.char)(C.CBytes(buffer))
 
 	// Use CGO to call functions of NFLib
@@ -716,7 +687,7 @@ func (connection Connection) LocalAddr() net.Addr {
 // RemoteAddr implements the net.Conn RemoteAddr method.
 func (connection Connection) RemoteAddr() net.Addr {
 	var oa OnvmAddr
-	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip) //ParseFourTupleByIndex(connection.four_tuple, DST_IP_ADDR_IDX)
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
 	oa.port = connection.four_tuple.Dst_port
 	oa.network = "onvm"
 	id, _ := IpToID(oa.ipv4_addr)
@@ -774,7 +745,7 @@ func ListenONVM(network, address string) (net.Listener, error) {
 		err := errors.New(msg)
 		return nil, err
 	}
-	ip_addr, port := ParseAddress(address)
+	ip_addr, port := parseAddress(address)
 	local_address = ip_addr
 
 	return listen(ip_addr, port)
@@ -783,7 +754,7 @@ func ListenONVM(network, address string) (net.Listener, error) {
 func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Start DialONVM")
 
-	ip_addr, port := ParseAddress(address)
+	ip_addr, port := parseAddress(address)
 
 	// Initialize a connection
 	conn := createConnection()

@@ -27,7 +27,7 @@ func PacketHandler(pkt *C.struct_rte_mbuf, meta *C.struct_onvm_pkt_meta, nf_loca
 
 	// Deliver packet to onvmpoller
 	// t1 := time.Now()
-	_, err := DecodeToChannelData(buf)
+	_, err := decodeToChannelData(buf)
 	// t2 := time.Now()
 	// logger.Log.Debugf("Decode time: %v\n", t2.Sub(t1).Seconds()*1000)
 
