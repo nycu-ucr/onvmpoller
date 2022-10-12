@@ -601,6 +601,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 		connection.buffer_list.Remove(elem)
 	}
 
+	logger.Log.Debugf("Read %d data", length)
 	return length, err
 }
 
@@ -622,6 +623,7 @@ func (connection Connection) ReadACK() error {
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
+	logger.Log.Debugf("Write %d data.", len(b))
 
 	// Translate Go structure to C char *
 	var buffer_ptr *C.char
@@ -639,6 +641,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 // For connection control message
 func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 	logger.Log.Tracef("Start Connection.WriteControlMessage, four-tuple: %v", connection.four_tuple)
+	logger.Log.Debugf("Write Control Message: %s", []string{"HTTP", "SYN", "FIN", "ACK"}[msg_type])
 
 	// Translate Go structure to C char *
 	var buffer_ptr *C.char
@@ -739,6 +742,7 @@ func (ol OnvmListener) Addr() net.Addr {
 
 func ListenONVM(network, address string) (net.Listener, error) {
 	logger.Log.Traceln("Start ListenONVM")
+	logger.Log.Debugf("Listen at %s", address)
 
 	if network != "onvm" {
 		msg := fmt.Sprintf("Unsppourt network type: %v", network)
@@ -753,6 +757,7 @@ func ListenONVM(network, address string) (net.Listener, error) {
 
 func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Traceln("Start DialONVM")
+	logger.Log.Debugf("Dial to %s", address)
 
 	ip_addr, port := parseAddress(address)
 
