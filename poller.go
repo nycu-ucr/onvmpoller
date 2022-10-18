@@ -623,11 +623,13 @@ func (connection Connection) Read(b []byte) (int, error) {
 	elem = connection.buffer_list.Front()
 	connection.buffer_list_lock.RUnlock()
 
-	buffer, ok := elem.Value.(*bytes.Buffer)
-	if !ok {
-		logger.Log.Errorf("Buffer type is %v", buffer)
+	if elem == nil {
+		logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
+		logger.Log.Error("Element is nil")
 		return length, err1
 	}
+
+	buffer := elem.Value.(*bytes.Buffer)
 	length, err2 = buffer.Read(b)
 
 	if err2 == io.EOF {
