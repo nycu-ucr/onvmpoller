@@ -71,7 +71,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     nf_function_table->pkt_handler = &packet_handler;
 
     int argc = 3;
-    char file_path[] = "/home/hstsai/onvm/";
+    char file_path[] = "/home/hstsai/onvm/NF_json/";
     int path_len = strlen(file_path);
 
     char cmd0[] = "./go.sh";

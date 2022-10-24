@@ -71,6 +71,11 @@ type Config struct {
 	IPIDMap map[string]int32 `yaml:"IPIDMap,omitempty"`
 }
 
+type NFip struct {
+	// Map the NF to IP address
+	Map map[string]string `yaml:"NFIPMap,omitempty"`
+}
+
 type ChannelData struct {
 	PacketType int
 	FourTuple  Four_tuple_rte
@@ -144,6 +149,7 @@ type StatusFlag struct {
 /* Global Variables */
 var (
 	config        Config
+	nfIP          NFip
 	onvmpoll      []*OnvmPoll
 	local_address string
 	nf_ctx        *C.struct_onvm_nf_local_ctx
@@ -159,10 +165,10 @@ var (
 
 func init() {
 	/* Initialize Global Variable */
-	InitConfig()
+	initConfig()
+	initNfIP()
 	initOnvmPoll()
 
-	local_address = "127.0.0.1"
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
@@ -177,6 +183,9 @@ func init() {
 	NfName := parseNfName(os.Args[0])
 	var char_ptr *C.char
 	char_ptr = C.CString(NfName)
+
+	/* Set local_address by NF config */
+	local_address, _ = NfToIP(NfName)
 
 	/* Initialize NF context */
 	logger.Log.Traceln("Start onvm init")
@@ -212,7 +221,7 @@ func CloseONVM() {
 	     Hepler functions
 *********************************/
 
-func InitConfig() {
+func initConfig() {
 	// Get absolute file name of ipid.yaml
 	var ipid_fname string
 	if dir, err := os.Getwd(); err != nil {
@@ -231,9 +240,23 @@ func InitConfig() {
 	}
 }
 
-func parseNfName(args string) string {
-	nfName := strings.Split(args, "/")
-	return nfName[1]
+func initNfIP() {
+	// Get absolute file name of ipid.yaml
+	var nfIP_fname string
+	if dir, err := os.Getwd(); err != nil {
+		nfIP_fname = "./NFip.yaml"
+	} else {
+		nfIP_fname = dir + "/NFip.yaml"
+	}
+
+	// Read and decode the yaml content
+	if yaml_content, err := ioutil.ReadFile(nfIP_fname); err != nil {
+		panic(err)
+	} else {
+		if unMarshalErr := yaml.Unmarshal(yaml_content, &nfIP); unMarshalErr != nil {
+			panic(unMarshalErr)
+		}
+	}
 }
 
 func IpToID(ip string) (id int32, err error) {
@@ -244,6 +267,22 @@ func IpToID(ip string) (id int32, err error) {
 	}
 
 	return
+}
+
+func NfToIP(nf string) (ip string, err error) {
+	ip, ok := nfIP.Map[nf]
+	logger.Log.Warnf("NF: %+v, IP: %+v", nf, ip)
+
+	if !ok {
+		err = fmt.Errorf("no match from NF to IP")
+	}
+
+	return
+}
+
+func parseNfName(args string) string {
+	nfName := strings.Split(args, "/")
+	return nfName[1]
 }
 
 func parseAddress(address string) (string, uint16) {
@@ -397,7 +436,7 @@ func (poll *OnvmPoll) connectionHandler() {
 		new_conn.dst_id = uint8(dst_id)
 
 		// Send ACK back to client
-		_, err := new_conn.WriteControlMessage(REPLY_CONN)
+		_, err := new_conn.writeControlMessage(REPLY_CONN)
 		if err != nil {
 			logger.Log.Errorln(err.Error())
 			new_conn.Close()
@@ -605,8 +644,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 }
 
 // Read ACK
-func (connection Connection) ReadACK() error {
-	logger.Log.Tracef("Start ReadACK, four-tuple: %v", connection.four_tuple)
+func (connection Connection) readACK() error {
+	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
 
 	var err error
 	// Receive packet from onvmpoller
@@ -637,8 +676,8 @@ func (connection Connection) Write(b []byte) (int, error) {
 }
 
 // For connection control message
-func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
-	logger.Log.Tracef("Start Connection.WriteControlMessage, four-tuple: %v", connection.four_tuple)
+func (connection Connection) writeControlMessage(msg_type int) (int, error) {
+	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
 	// Translate Go structure to C char *
 	var buffer_ptr *C.char
@@ -661,7 +700,7 @@ func (connection Connection) Close() error {
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
 	// Notify peer connection can be closed
-	connection.WriteControlMessage(CLOSE_CONN)
+	connection.writeControlMessage(CLOSE_CONN)
 
 	// Close local connection
 	connection.state.is_txchan_closed.Store(true)
@@ -771,7 +810,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.dst_id = uint8(dst_id)
 
 	// Send connection request to server
-	_, err := conn.WriteControlMessage(ESTABLISH_CONN)
+	_, err := conn.writeControlMessage(ESTABLISH_CONN)
 	logger.Log.Traceln("Dial write connection create request")
 
 	if err != nil {
@@ -784,7 +823,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
-	err = conn.ReadACK()
+	err = conn.readACK()
 	if err != nil {
 		logger.Log.Errorln(err.Error())
 		conn.Close()
