@@ -190,6 +190,8 @@ func init() {
 	/* Run onvmpoller */
 	logger.Log.Traceln("Start onvmpoll run")
 	runOnvmPoller()
+
+	time.Sleep(2 * time.Second)
 }
 
 func runOnvmPoller() {
@@ -624,8 +626,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 	connection.buffer_list_lock.RUnlock()
 
 	if elem == nil {
-		logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
-		logger.Log.Error("Element is nil")
+		// logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
+		// logger.Log.Error("Element is nil")
 		return length, err1
 	}
 
