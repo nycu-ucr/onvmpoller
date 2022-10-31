@@ -113,6 +113,7 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
 
     // printf("[service_id]: %d\n[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
     //        service_id, pkt_type, src_ip, src_port, dst_ip, dst_port);
+    printf("C char-array ptr: %p\n", buffer);
 
     pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL)
@@ -131,6 +132,10 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // pkt->ol_flags = PKT_TX_IP_CKSUM | PKT_TX_IPV4 | PKT_TX_TCP_CKSUM;
     // pkt->l2_len = ETH_HDR_LEN;
     // pkt->l3_len = IP_HDR_LEN;
+    printf("buffer size(give): %d\n", buffer_length);
+    struct rte_mbuf *m_last;
+    m_last = rte_pktmbuf_lastseg(pkt);
+    printf("pktmbuf tailroom: %d\n", rte_pktmbuf_tailroom(m_last));
 
     if (buffer_length > 0)
     {

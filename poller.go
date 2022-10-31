@@ -271,7 +271,7 @@ func IpToID(ip string) (id int32, err error) {
 
 func NfToIP(nf string) (ip string, err error) {
 	ip, ok := nfIP.Map[nf]
-	logger.Log.Warnf("NF: %+v, IP: %+v", nf, ip)
+	logger.Log.Warnf("[NF: %+v][IP: %+v]", nf, ip)
 
 	if !ok {
 		err = fmt.Errorf("no match from NF to IP")
@@ -389,10 +389,8 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	/* Put the packet into the right queue */
 
 	res_code := 0
-	payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
-	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 	pktType := int(packet_type)
 
 	pollIndex := four_tuple.getPollIndex()
@@ -401,12 +399,18 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
+
 	case HTTP_FRAME, CLOSE_CONN:
 		// Handle by finFrameHandler
+		payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
+		rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
+
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
+
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
+
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
@@ -436,7 +440,7 @@ func (poll *OnvmPoll) connectionHandler() {
 		new_conn.dst_id = uint8(dst_id)
 
 		// Send ACK back to client
-		_, err := new_conn.writeControlMessage(REPLY_CONN)
+		err := new_conn.writeControlMessage(REPLY_CONN)
 		if err != nil {
 			logger.Log.Errorln(err.Error())
 			new_conn.Close()
@@ -662,27 +666,32 @@ func (connection Connection) readACK() error {
 func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 
+	len := len(b)
+	fmt.Printf("Go []byte ptr: %p\n", &b)
+
 	// Translate Go structure to C char *
-	var buffer_ptr *C.char
-	buffer_ptr = (*C.char)(C.CBytes(b))
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(b))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len(b)))
+		buffer_ptr, C.int(len))
 
-	return len(b), nil
+	return len, nil
 }
 
 // For connection control message
-func (connection Connection) writeControlMessage(msg_type int) (int, error) {
+func (connection Connection) writeControlMessage(msg_type int) error {
 	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
-	// Translate Go structure to C char *
-	var buffer_ptr *C.char
 	buffer := makeConnCtrlMsg(msg_type)
-	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	// Translate Go structure to C char *
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(buffer))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
@@ -690,7 +699,7 @@ func (connection Connection) writeControlMessage(msg_type int) (int, error) {
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len(buffer)))
 
-	return len(buffer), nil
+	return nil
 }
 
 // Close implements the net.Conn Close method.
@@ -810,7 +819,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.dst_id = uint8(dst_id)
 
 	// Send connection request to server
-	_, err := conn.writeControlMessage(ESTABLISH_CONN)
+	err := conn.writeControlMessage(ESTABLISH_CONN)
 	logger.Log.Traceln("Dial write connection create request")
 
 	if err != nil {
