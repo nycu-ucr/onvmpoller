@@ -31,7 +31,6 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -79,14 +78,14 @@ type ChannelData struct {
 }
 
 type Connection struct {
-	dst_id           uint8
-	rxchan           chan ([]byte)
-	four_tuple       Four_tuple_rte
-	state            *connState
-	sync_chan        chan (bool) // For waiting ACK
-	read_sync_chan   chan (bool) // For waiting packet
-	buffer_list      *list.List
-	buffer_list_lock *sync.RWMutex
+	dst_id         uint8
+	rxchan         chan ([]byte)
+	four_tuple     Four_tuple_rte
+	state          *connState
+	sync_chan      chan (bool) // For waiting ACK
+	read_sync_chan chan (bool) // For waiting packet
+	buffer_list    *list.List
+	// buffer_list_lock *sync.RWMutex
 }
 
 type connState struct {
@@ -461,7 +460,7 @@ func (poll *OnvmPoll) finFrameHandler() {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
 				logger.Log.Debugf("onvmpoller reiceve %d data", len(channel_data.Payload))
-				conn.buffer_list_lock.Lock()
+				// conn.buffer_list_lock.Lock()
 				if conn.buffer_list.Front() == nil {
 					buffer := bytes.NewBuffer(channel_data.Payload)
 					conn.buffer_list.PushBack(buffer)
@@ -471,7 +470,7 @@ func (poll *OnvmPoll) finFrameHandler() {
 					conn.buffer_list.PushBack(buffer)
 					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
 				}
-				conn.buffer_list_lock.Unlock()
+				// conn.buffer_list_lock.Unlock()
 			}
 		}
 	}
@@ -540,7 +539,7 @@ func createConnection() *Connection {
 	conn.sync_chan = make(chan bool, 1)
 	conn.read_sync_chan = make(chan bool, 1) // TODO: Adjust to the proper size
 	conn.buffer_list = list.New()
-	conn.buffer_list_lock = new(sync.RWMutex)
+	// conn.buffer_list_lock = new(sync.RWMutex)
 
 	return &conn
 }
@@ -608,9 +607,9 @@ func (connection Connection) Read(b []byte) (int, error) {
 	var err1, err2 error
 	var elem *list.Element
 
-	connection.buffer_list_lock.RLock()
+	// connection.buffer_list_lock.RLock()
 	elem = connection.buffer_list.Front()
-	connection.buffer_list_lock.RUnlock()
+	// connection.buffer_list_lock.RUnlock()
 
 	if elem == nil {
 		// List is empty, waiting for packet
@@ -621,9 +620,9 @@ func (connection Connection) Read(b []byte) (int, error) {
 		}
 	}
 
-	connection.buffer_list_lock.RLock()
+	// connection.buffer_list_lock.RLock()
 	elem = connection.buffer_list.Front()
-	connection.buffer_list_lock.RUnlock()
+	// connection.buffer_list_lock.RUnlock()
 
 	if elem == nil {
 		// logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
@@ -635,9 +634,9 @@ func (connection Connection) Read(b []byte) (int, error) {
 	length, err2 = buffer.Read(b)
 
 	if err2 == io.EOF {
-		connection.buffer_list_lock.Lock()
+		// connection.buffer_list_lock.Lock()
 		connection.buffer_list.Remove(elem)
-		connection.buffer_list_lock.Unlock()
+		// connection.buffer_list_lock.Unlock()
 	}
 
 	// logger.Log.Debugf("Read: provide %d size of buffer", len(b))
