@@ -2,8 +2,8 @@
 #include "_cgo_export.h"
 #include "string.h"
 
+// extern int DeliverBigPacket(struct rte_mbuf *, int, uint32, uint16, uint32, uint16)
 // extern int DeliverPacket(int, char *, int, uint32, uint16, uint32, uint16)
-// extern int DeliverBigPacket(struct rte_mbuf, int, uint32, uint16, uint32, uint16)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 
@@ -405,21 +405,6 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     }
     tcp_hdr = pkt_tcp_hdr(pkt);
 
-    // printf("[packet_handler][pkt->udata64: %d]\n", (int)pkt->udata64);
-    // printf("[packet_handler][pkt->pkt_len: %d]\n", pkt->pkt_len);
-    // printf("[packet_handler][pkt->data_len: %d]\n", pkt->data_len);
-    if (pkt->next == NULL)
-    {
-        payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
-        payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-    }
-    else
-    {
-        payload_len = calculate_payload_len(pkt);
-        payload = malloc(payload_len);
-        payload_assemble(payload, payload_len, pkt);
-    }
-
     switch (tcp_hdr->tcp_flags)
     {
     case RTE_TCP_SYN_FLAG:
@@ -436,14 +421,20 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         break;
     }
 
-    // printf("[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
-    //        pkt_type, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
-
     int res_code;
-    res_code = DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
-    // if(res_code != 0) {
-    //     meta->action = ONVM_NF_ACTION_TONF;
-    // }
+
+    if (pkt->next == NULL)
+    {
+        payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+        payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+        res_code = DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+    }
+    else
+    {
+        payload_len = calculate_payload_len(pkt);
+        // extern int DeliverBigPacket(struct rte_mbuf, int, uint32, uint16, uint32, uint16)
+        payload = DeliverBigPacket(pkt, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+    }
 
     return 0;
 }

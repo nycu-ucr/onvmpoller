@@ -386,7 +386,7 @@ func runPktWorker() {
 }
 
 // export DeliverBigPacket
-func DeliverBigPacket(mbuf C.struct_rte_mbuf, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+func DeliverBigPacket(mbuf *C.struct_rte_mbuf, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	res_code := 0
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
@@ -396,7 +396,7 @@ func DeliverBigPacket(mbuf C.struct_rte_mbuf, buf_len C.int, src_ip C.uint, src_
 	// Handle by finFrameHandler
 	// payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 	payload := make([]byte, buf_len)
-	buffer_ptr := (*C.char)(unsafe.Pointer(&payload[0]))
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
 	C.payload_assemble(buffer_ptr, C.int(buf_len), mbuf)
 	rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
 
