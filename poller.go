@@ -12,6 +12,7 @@ package onvmpoller
 #include <onvm_nflib.h>
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
+extern void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
@@ -384,6 +385,26 @@ func runPktWorker() {
 	}
 }
 
+// export DeliverBigPacket
+func DeliverBigPacket(mbuf C.struct_rte_mbuf, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+	res_code := 0
+
+	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
+
+	pollIndex := four_tuple.getPollIndex()
+
+	// Handle by finFrameHandler
+	// payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
+	payload := make([]byte, buf_len)
+	buffer_ptr := (*C.char)(unsafe.Pointer(&payload[0]))
+	C.payload_assemble(buffer_ptr, C.int(buf_len), mbuf)
+	rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
+
+	onvmpoll[pollIndex].fin_frame_chan <- rxdata
+
+	return res_code
+}
+
 //export DeliverPacket
 func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	/* Put the packet into the right queue */
@@ -667,12 +688,12 @@ func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 
 	len := len(b)
-	fmt.Printf("Go []byte ptr: %p\n", &b)
+	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
 
 	// Translate Go structure to C char *
 	// var buffer_ptr *C.char
 	// buffer_ptr = (*C.char)(C.CBytes(b))
-	buffer_ptr := (*C.char)(unsafe.Pointer(&b))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
@@ -691,7 +712,7 @@ func (connection Connection) writeControlMessage(msg_type int) error {
 	// Translate Go structure to C char *
 	// var buffer_ptr *C.char
 	// buffer_ptr = (*C.char)(C.CBytes(buffer))
-	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),

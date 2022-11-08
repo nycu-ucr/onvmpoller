@@ -3,6 +3,7 @@
 #include "string.h"
 
 // extern int DeliverPacket(int, char *, int, uint32, uint16, uint32, uint16)
+// extern int DeliverBigPacket(struct rte_mbuf, int, uint32, uint16, uint32, uint16)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 
@@ -98,6 +99,113 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
 
     return 0;
 }
+// handle_payload(pktmbuf_pool, buffer, buffer_length);
+struct rte_mbuf *handle_payload(struct rte_mempool *pktmbuf_pool, char *buffer, int buffer_length)
+{
+    struct rte_mbuf *pkt;
+    pkt = rte_pktmbuf_alloc(pktmbuf_pool);
+    if (pkt == NULL)
+    {
+        printf("Failed to allocate packets\n");
+        return NULL;
+    }
+    else if (buffer_length == 0)
+    {
+        return pkt;
+    }
+
+    struct rte_mbuf *head = pkt;
+    uint16_t mbuf_size = rte_pktmbuf_tailroom(head);
+    // printf("pktmbuf tailroom: %d\n", mbuf_size);
+
+    /* Set payload data */
+    if (buffer_length <= mbuf_size)
+    {
+        uint8_t *head_mbuf;
+        head_mbuf = (uint8_t *)rte_pktmbuf_append(pkt, buffer_length);
+        if (head_mbuf == NULL)
+        {
+            printf("Failed to append payload. Consider splitting up the packet.\n");
+            rte_pktmbuf_free(pkt);
+            return NULL;
+        }
+        rte_memcpy(head_mbuf, buffer, buffer_length);
+        // printf("[handle_payload][Small pkt][Copy: %d(bytes)]\n", buffer_length);
+    }
+    else
+    {
+        /* Calculate number of segmants */
+        int quotient = (buffer_length / mbuf_size);
+        int remainder = buffer_length % mbuf_size;
+        // printf("Buffer length: %d\n", buffer_length);
+        // printf("Quotient: %d\n", quotient);
+        // printf("Remainder: %d\n", remainder);
+
+        /* Full the first segmant*/
+        uint8_t *head_mbuf = (uint8_t *)rte_pktmbuf_append(pkt, mbuf_size);
+        if (head_mbuf == NULL)
+        {
+            printf("Failed to append payload. Consider splitting up the packet.\n");
+            rte_pktmbuf_free(pkt);
+            return NULL;
+        }
+        rte_memcpy(head_mbuf, buffer, mbuf_size);
+        // printf("[handle_payload][Big pkt][Head][Copy: %d(bytes)]\n", mbuf_size);
+
+        /* Full the complete segmants  */
+        for (int i = 1; i < quotient; i++)
+        {
+            struct rte_mbuf *mb = rte_pktmbuf_alloc(pktmbuf_pool);
+            if (mb == NULL)
+            {
+                printf("Failed to allocate packets\n");
+                rte_pktmbuf_free(pkt);
+                return NULL;
+            }
+            head->next = mb;
+            head = head->next;
+
+            uint8_t *mid_mbuf = (uint8_t *)rte_pktmbuf_append(pkt, mbuf_size);
+            if (mid_mbuf == NULL)
+            {
+                printf("Failed to append payload. Consider splitting up the packet.\n");
+                rte_pktmbuf_free(pkt);
+                return NULL;
+            }
+
+            rte_memcpy(mid_mbuf, buffer + mbuf_size * i, mbuf_size);
+            // printf("[handle_payload][Big pkt][Midd][Copy: %d(bytes)]\n", mbuf_size);
+        }
+
+        /* Full the remaind segmants */
+        if (remainder != 0)
+        {
+            struct rte_mbuf *mb = rte_pktmbuf_alloc(pktmbuf_pool);
+            if (mb == NULL)
+            {
+                printf("Failed to allocate packets\n");
+                rte_pktmbuf_free(pkt);
+                return NULL;
+            }
+            head->next = mb;
+            head = head->next;
+
+            uint8_t *tail_mbuf = (uint8_t *)rte_pktmbuf_append(pkt, remainder);
+            if (tail_mbuf == NULL)
+            {
+                printf("Failed to append payload. Consider splitting up the packet.\n");
+                rte_pktmbuf_free(pkt);
+                return NULL;
+            }
+
+            rte_memcpy(tail_mbuf, buffer + mbuf_size * quotient, remainder);
+            // printf("[handle_payload][Big pkt][Tail][Copy: %d(bytes)]\n", remainder);
+        }
+    }
+    // printf("\033[0;31m[handle_payload][Pkt-size][Total: %d(bytes)]\033[0m\n", pkt->pkt_len);
+
+    return pkt;
+}
 
 void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                    uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
@@ -113,7 +221,7 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
 
     // printf("[service_id]: %d\n[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
     //        service_id, pkt_type, src_ip, src_port, dst_ip, dst_port);
-    printf("C char-array ptr: %p\n", buffer);
+    // printf("C char ptr: %p\n", buffer);
 
     pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL)
@@ -122,32 +230,34 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         rte_exit(EXIT_FAILURE, "Cannot find mbuf pool!\n");
     }
 
-    pkt = rte_pktmbuf_alloc(pktmbuf_pool);
+    pkt = handle_payload(pktmbuf_pool, buffer, buffer_length);
     if (pkt == NULL)
     {
-        printf("Failed to allocate packets\n");
+        printf("Payload handling error\n");
         return;
     }
 
     // pkt->ol_flags = PKT_TX_IP_CKSUM | PKT_TX_IPV4 | PKT_TX_TCP_CKSUM;
     // pkt->l2_len = ETH_HDR_LEN;
     // pkt->l3_len = IP_HDR_LEN;
-    printf("buffer size(give): %d\n", buffer_length);
-    struct rte_mbuf *m_last;
-    m_last = rte_pktmbuf_lastseg(pkt);
-    printf("pktmbuf tailroom: %d\n", rte_pktmbuf_tailroom(m_last));
+    // printf("buffer size(give): %d\n", buffer_length);
+    // struct rte_mbuf *m_last;
+    // m_last = rte_pktmbuf_lastseg(pkt);
+    // printf("pktmbuf tailroom: %d\n", rte_pktmbuf_tailroom(m_last));
 
-    if (buffer_length > 0)
-    {
-        /* Set payload data */
-        pkt_payload = (uint8_t *)rte_pktmbuf_append(pkt, buffer_length);
-        if (pkt_payload == NULL)
-        {
-            printf("Failed to append payload. Consider splitting up the packet.\n");
-            return;
-        }
-        rte_memcpy(pkt_payload, buffer, buffer_length);
-    }
+    // if (buffer_length > 0)
+    // {
+    //     /* Set payload data */
+    //     pkt_payload = (uint8_t *)rte_pktmbuf_append(pkt, buffer_length);
+    //     if (pkt_payload == NULL)
+    //     {
+    //         printf("Failed to append payload. Consider splitting up the packet.\n");
+    //         return;
+    //     }
+    //     rte_memcpy(pkt_payload, buffer, buffer_length);
+    // }
+    // printf("[onvm_send_pkt][pkt->data_off: %d][before]\n", pkt->data_off);
+    // printf("[onvm_send_pkt][pkt->pkt_len: %d][before]\n", pkt->pkt_len);
 
     /* Set TCP header */
     pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
@@ -218,9 +328,50 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // rte_memcpy(rte_pktmbuf_mtod(pkt, char *), buffer, buffer_length);
 
     // Send out the generated packet
+    // printf("[onvm_send_pkt][pkt->data_off: %d][After]\n", pkt->data_off);
+    // printf("[onvm_send_pkt][pkt->pkt_len: %d][After]\n", pkt->pkt_len);
     onvm_nflib_return_pkt(ctx->nf, pkt);
 
     // printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
+}
+
+static inline int calculate_payload_len(struct rte_mbuf *pkt)
+{
+    int payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+    pkt = pkt->next;
+
+    while (pkt != NULL)
+    {
+        payload_len = payload_len + pkt->data_len;
+        pkt = pkt->next;
+    }
+
+    // printf("\033[0;31m[calculate_payload_len][Total: %d(bytes)]\033[0m\n", payload_len);
+    return payload_len;
+}
+
+void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt)
+{
+    int off_set = 0;
+    int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+    int head_data = pkt->data_len;
+
+    // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
+    uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    rte_memcpy(payload + off_set, data, first_segm_payload_len);
+    off_set = off_set + first_segm_payload_len;
+    pkt = pkt->next;
+
+    while (pkt != NULL)
+    {
+        // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
+        uint8_t *d = rte_pktmbuf_mtod(pkt, uint8_t *);
+        rte_memcpy(payload + off_set, d, pkt->data_len);
+        off_set = off_set + pkt->data_len;
+        pkt = pkt->next;
+    }
+
+    return;
 }
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
@@ -254,8 +405,20 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     }
     tcp_hdr = pkt_tcp_hdr(pkt);
 
-    payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-    payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+    // printf("[packet_handler][pkt->udata64: %d]\n", (int)pkt->udata64);
+    // printf("[packet_handler][pkt->pkt_len: %d]\n", pkt->pkt_len);
+    // printf("[packet_handler][pkt->data_len: %d]\n", pkt->data_len);
+    if (pkt->next == NULL)
+    {
+        payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+        payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    }
+    else
+    {
+        payload_len = calculate_payload_len(pkt);
+        payload = malloc(payload_len);
+        payload_assemble(payload, payload_len, pkt);
+    }
 
     switch (tcp_hdr->tcp_flags)
     {
@@ -278,7 +441,6 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
 
     int res_code;
     res_code = DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
-
     // if(res_code != 0) {
     //     meta->action = ONVM_NF_ACTION_TONF;
     // }
