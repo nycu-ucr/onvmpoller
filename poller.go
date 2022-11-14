@@ -53,6 +53,7 @@ const (
 	ESTABLISH_CONN = 1
 	CLOSE_CONN     = 2
 	REPLY_CONN     = 3
+	BIG_FRAME      = 4
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
@@ -385,28 +386,8 @@ func runPktWorker() {
 	}
 }
 
-// export DeliverBigPacket
-func DeliverBigPacket(mbuf *C.struct_rte_mbuf, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
-	res_code := 0
-
-	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
-
-	pollIndex := four_tuple.getPollIndex()
-
-	// Handle by finFrameHandler
-	// payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
-	payload := make([]byte, buf_len)
-	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
-	C.payload_assemble(buffer_ptr, C.int(buf_len), mbuf)
-	rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
-
-	onvmpoll[pollIndex].fin_frame_chan <- rxdata
-
-	return res_code
-}
-
 //export DeliverPacket
-func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	/* Put the packet into the right queue */
 
 	res_code := 0
@@ -420,18 +401,21 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
-
 	case HTTP_FRAME, CLOSE_CONN:
 		// Handle by finFrameHandler
 		payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 		rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
-
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
-
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
-
+	case BIG_FRAME:
+		// Handle by finFrameHandler
+		payload := make([]byte, buf_len)
+		buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+		C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
+		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}

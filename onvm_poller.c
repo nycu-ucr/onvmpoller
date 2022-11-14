@@ -2,8 +2,7 @@
 #include "_cgo_export.h"
 #include "string.h"
 
-// extern int DeliverBigPacket(struct rte_mbuf *, int, uint32, uint16, uint32, uint16)
-// extern int DeliverPacket(int, char *, int, uint32, uint16, uint32, uint16)
+// extern int DeliverPacket(struct rte_mbuf *, int, char *, int, uint32, uint16, uint32, uint16)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 
@@ -11,6 +10,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
 #define ESTABLISH_CONN 1
 #define CLOSE_CONN 2
 #define REPLY_CONN 3
+#define BIG_FRAME 4
 #define TCP_PROTO_NUM 0x06
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
@@ -422,18 +422,16 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     }
 
     int res_code;
-
     if (pkt->next == NULL)
     {
         payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
         payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-        res_code = DeliverPacket(pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+        res_code = DeliverPacket(pkt, pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
     else
     {
         payload_len = calculate_payload_len(pkt);
-        // extern int DeliverBigPacket(struct rte_mbuf, int, uint32, uint16, uint32, uint16)
-        payload = DeliverBigPacket(pkt, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+        res_code = DeliverPacket(pkt, BIG_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
 
     return 0;
