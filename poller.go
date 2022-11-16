@@ -12,6 +12,7 @@ package onvmpoller
 #include <onvm_nflib.h>
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
+extern void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
@@ -52,6 +53,7 @@ const (
 	ESTABLISH_CONN = 1
 	CLOSE_CONN     = 2
 	REPLY_CONN     = 3
+	BIG_FRAME      = 4
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
@@ -69,6 +71,11 @@ type Buffer struct {
 type Config struct {
 	// Map the IP address to Service ID
 	IPIDMap map[string]int32 `yaml:"IPIDMap,omitempty"`
+}
+
+type NFip struct {
+	// Map the NF to IP address
+	Map map[string]string `yaml:"NFIPMap,omitempty"`
 }
 
 type ChannelData struct {
@@ -145,6 +152,7 @@ type StatusFlag struct {
 /* Global Variables */
 var (
 	config        Config
+	nfIP          NFip
 	onvmpoll      []*OnvmPoll
 	local_address string
 	nf_ctx        *C.struct_onvm_nf_local_ctx
@@ -160,10 +168,10 @@ var (
 
 func init() {
 	/* Initialize Global Variable */
-	InitConfig()
+	initConfig()
+	initNfIP()
 	initOnvmPoll()
 
-	local_address = "127.0.0.1"
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
@@ -177,6 +185,9 @@ func init() {
 	/* Parse NF Name */
 	NfName := parseNfName(os.Args[0])
 	var char_ptr *C.char = C.CString(NfName)
+
+	/* Set local_address by NF config */
+	local_address, _ = NfToIP(NfName)
 
 	/* Initialize NF context */
 	logger.Log.Traceln("Start onvm init")
@@ -214,7 +225,7 @@ func CloseONVM() {
 	     Hepler functions
 *********************************/
 
-func InitConfig() {
+func initConfig() {
 	// Get absolute file name of ipid.yaml
 	var ipid_fname string
 	if dir, err := os.Getwd(); err != nil {
@@ -233,9 +244,23 @@ func InitConfig() {
 	}
 }
 
-func parseNfName(args string) string {
-	nfName := strings.Split(args, "/")
-	return nfName[1]
+func initNfIP() {
+	// Get absolute file name of ipid.yaml
+	var nfIP_fname string
+	if dir, err := os.Getwd(); err != nil {
+		nfIP_fname = "./NFip.yaml"
+	} else {
+		nfIP_fname = dir + "/NFip.yaml"
+	}
+
+	// Read and decode the yaml content
+	if yaml_content, err := ioutil.ReadFile(nfIP_fname); err != nil {
+		panic(err)
+	} else {
+		if unMarshalErr := yaml.Unmarshal(yaml_content, &nfIP); unMarshalErr != nil {
+			panic(unMarshalErr)
+		}
+	}
 }
 
 func IpToID(ip string) (id int32, err error) {
@@ -246,6 +271,22 @@ func IpToID(ip string) (id int32, err error) {
 	}
 
 	return
+}
+
+func NfToIP(nf string) (ip string, err error) {
+	ip, ok := nfIP.Map[nf]
+	logger.Log.Warnf("[NF: %+v][IP: %+v]", nf, ip)
+
+	if !ok {
+		err = fmt.Errorf("no match from NF to IP")
+	}
+
+	return
+}
+
+func parseNfName(args string) string {
+	nfName := strings.Split(args, "/")
+	return nfName[1]
 }
 
 func parseAddress(address string) (string, uint16) {
@@ -357,14 +398,12 @@ func runPktWorker() {
 }
 
 //export DeliverPacket
-func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	/* Put the packet into the right queue */
 
 	res_code := 0
-	payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
-	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 	pktType := int(packet_type)
 
 	pollIndex := four_tuple.getPollIndex()
@@ -375,10 +414,19 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
 	case HTTP_FRAME, CLOSE_CONN:
 		// Handle by finFrameHandler
+		payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
+		rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
+	case BIG_FRAME:
+		// Handle by finFrameHandler
+		payload := make([]byte, buf_len)
+		buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+		C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
+		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
@@ -408,7 +456,7 @@ func (poll *OnvmPoll) connectionHandler() {
 		new_conn.dst_id = uint8(dst_id)
 
 		// Send ACK back to client
-		_, err := new_conn.WriteControlMessage(REPLY_CONN)
+		err := new_conn.writeControlMessage(REPLY_CONN)
 		if err != nil {
 			logger.Log.Errorln(err.Error())
 			new_conn.Close()
@@ -645,8 +693,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 }
 
 // Read ACK
-func (connection Connection) ReadACK() error {
-	logger.Log.Tracef("Start ReadACK, four-tuple: %v", connection.four_tuple)
+func (connection Connection) readACK() error {
+	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
 
 	var err error
 	// Receive packet from onvmpoller
@@ -664,27 +712,33 @@ func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 	logger.Log.Debugf("Write %d data.", len(b))
 
+	len := len(b)
+	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
+
 	// Translate Go structure to C char *
-	var buffer_ptr *C.char = (*C.char)(C.CBytes(b))
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(b))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len(b)))
+		buffer_ptr, C.int(len))
 
-	return len(b), nil
+	return len, nil
 }
 
 // For connection control message
-func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
-	logger.Log.Tracef("Start Connection.WriteControlMessage, four-tuple: %v", connection.four_tuple)
-	logger.Log.Debugf("Write Control Message: %s", []string{"HTTP", "SYN", "FIN", "ACK"}[msg_type])
+func (connection Connection) writeControlMessage(msg_type int) error {
+	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
-	// Translate Go structure to C char *
-	var buffer_ptr *C.char
+
 	buffer := makeConnCtrlMsg(msg_type)
-	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	// Translate Go structure to C char *
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(buffer))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
@@ -692,7 +746,7 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len(buffer)))
 
-	return len(buffer), nil
+	return nil
 }
 
 // Close implements the net.Conn Close method.
@@ -701,9 +755,10 @@ func (connection Connection) Close() error {
 
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
+	// Notify peer connection can be closed
 	if !connection.state.is_txchan_closed.Load() {
 		// Notify peer connection can be closed
-		connection.WriteControlMessage(CLOSE_CONN)
+	  connection.writeControlMessage(CLOSE_CONN)
 
 		// Close local connection
 		connection.state.is_txchan_closed.Store(true)
@@ -816,7 +871,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.dst_id = uint8(dst_id)
 
 	// Send connection request to server
-	_, err := conn.WriteControlMessage(ESTABLISH_CONN)
+	err := conn.writeControlMessage(ESTABLISH_CONN)
 	logger.Log.Traceln("Dial write connection create request")
 
 	if err != nil {
@@ -829,7 +884,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
-	err = conn.ReadACK()
+	err = conn.readACK()
 	if err != nil {
 		logger.Log.Errorln(err.Error())
 		conn.Close()
