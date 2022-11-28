@@ -350,28 +350,62 @@ static inline int calculate_payload_len(struct rte_mbuf *pkt)
     return payload_len;
 }
 
-void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt)
+static inline int calculate_offset(int empty_space, int mbuf_data_len, int mbuf_cap)
 {
-    int off_set = 0;
+    if (empty_space >= mbuf_data_len)
+    {
+        return mbuf_data_len;
+    }
+    else
+    {
+        return empty_space;
+    }
+}
+
+int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset)
+{
+    int offset = 0;
+    int End_offset = Start_offset;
     int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
-    int head_data = pkt->data_len;
 
     // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
-    uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-    rte_memcpy(payload + off_set, data, first_segm_payload_len);
-    off_set = off_set + first_segm_payload_len;
-    pkt = pkt->next;
-
-    while (pkt != NULL)
+    if (buff_cap < first_segm_payload_len - Start_offset)
     {
-        // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
-        uint8_t *d = rte_pktmbuf_mtod(pkt, uint8_t *);
-        rte_memcpy(payload + off_set, d, pkt->data_len);
-        off_set = off_set + pkt->data_len;
-        pkt = pkt->next;
+        /* Target buffer cap is smaller than data left in pkt*/
+        offset = buff_cap;
+    }
+    else
+    {
+        /* Target buffer cap is larger than data left in first mbuf */
+        offset = first_segm_payload_len - Start_offset;
     }
 
-    return;
+    uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    rte_memcpy(buffer_ptr, data + Start_offset, offset);
+    End_offset = End_offset + offset;
+
+    // int empty_space = buff_cap - offset;
+    // if (!empty_space)
+    // {
+    //     /* No space left in target buff */
+    //     return End_offset
+    // };
+
+    // uint16_t mbuf_size = rte_pktmbuf_tailroom(head);
+    // pkt = pkt->next;
+
+    // while (pkt != NULL)
+    // {
+    //     // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
+    //     uint8_t *src = rte_pktmbuf_mtod(pkt, uint8_t *);
+    //     int offset = calculate_offset(empty_space, pkt->data_len);
+
+    //     rte_memcpy(buffer_ptr + End_offset, src, offset);
+    //     End_offset = End_offset + offset;
+    //     pkt = pkt->next;
+    // }
+
+    return End_offset;
 }
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
