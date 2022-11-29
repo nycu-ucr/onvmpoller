@@ -32,6 +32,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -146,10 +147,6 @@ type PortManager struct {
 	release_port_ch chan uint16
 }
 
-type Port struct {
-	count uint32
-}
-
 type StatusFlag struct {
 	is_rxchan_closed bool
 	is_txchan_closed bool
@@ -165,9 +162,9 @@ var (
 	nf_ctx        *C.struct_onvm_nf_local_ctx
 	listener      *OnvmListener
 	port_manager  *PortManager
-	a_port        Port
+	conn_pool     sync.Pool
 
-	//Control Message (bytes)
+	// Control Message (bytes)
 	SYN = []byte("SYN")
 	ACK = []byte("ACK")
 	FIN = []byte("FIN")
@@ -184,7 +181,12 @@ func init() {
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
 		release_port_ch: make(chan uint16, PM_CHANNEL_SIZE),
 	}
-	a_port.count = 0
+
+	conn_pool = sync.Pool{
+		New: func() any {
+			return createConnection()
+		},
+	}
 
 	/* Setup Logger */
 	logger.SetLogLevel(LOG_LEVEL)
@@ -449,7 +451,9 @@ func (poll *OnvmPoll) connectionHandler() {
 		logger.Log.Traceln("Receive one connection request")
 
 		// Initialize the new connection
-		new_conn = createConnection()
+		// new_conn = createConnection()
+		new_conn = conn_pool.Get().(*Connection)
+		initConnectionCh(new_conn)
 		new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(listener.laddr.ipv4_addr)[12:16])
 		new_conn.four_tuple.Src_port = listener.laddr.port
 		new_conn.four_tuple.Dst_ip = four_tuple.Src_ip
@@ -578,10 +582,6 @@ func (pm *PortManager) ReleasePort(port uint16) {
 	pm.release_port_ch <- port
 }
 
-func (port *Port) atomicPort() uint16 {
-	return uint16(atomic.AddUint32(&port.count, 1))
-}
-
 /*********************************
 	Methods of OnvmPoll
 *********************************/
@@ -590,14 +590,17 @@ func createConnection() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	var cs connState
-	conn.rxchan = make(chan []byte, 5) // For non-blocking
 	conn.state = &cs
-	conn.sync_chan = make(chan bool, 1)
-	conn.read_sync_chan = make(chan bool, 1) // TODO: Adjust to the proper size
 	conn.buffer_list = list.New()
 	// conn.buffer_list_lock = new(sync.RWMutex)
 
 	return &conn
+}
+
+func initConnectionCh(conn *Connection) {
+	conn.rxchan = make(chan []byte, 5) // For non-blocking
+	conn.sync_chan = make(chan bool, 1)
+	conn.read_sync_chan = make(chan bool, 1)
 }
 
 func (poll *OnvmPoll) Add(conn *Connection) {
@@ -618,6 +621,8 @@ func (poll *OnvmPoll) Delete(conn *Connection) error {
 		}
 
 		port_manager.ReleasePort(conn.four_tuple.Src_port)
+		// Recycle the connection
+		conn_pool.Put(conn)
 		logger.Log.Info("Close connection sucessfully.\n")
 	}
 
@@ -772,7 +777,6 @@ func (connection Connection) Close() error {
 
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
-	// Notify peer connection can be closed
 	if !connection.state.is_txchan_closed.Load() {
 		// Notify peer connection can be closed
 		connection.writeControlMessage(CLOSE_CONN)
@@ -873,9 +877,11 @@ func DialONVM(network, address string) (net.Conn, error) {
 	ip_addr, port := parseAddress(address)
 
 	// Initialize a connection
-	conn := createConnection()
+	// conn := createConnection()
+	conn := conn_pool.Get().(*Connection)
+	initConnectionCh(conn)
 	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
-	conn.four_tuple.Src_port = port_manager.GetPort() //a_port.atomicPort()
+	conn.four_tuple.Src_port = port_manager.GetPort()
 	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	conn.four_tuple.Dst_port = port
 	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
