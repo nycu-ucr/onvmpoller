@@ -12,7 +12,7 @@ package onvmpoller
 #include <onvm_nflib.h>
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
-extern void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt);
+extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
@@ -79,9 +79,16 @@ type NFip struct {
 }
 
 type ChannelData struct {
-	PacketType int
-	FourTuple  Four_tuple_rte
-	Payload    []byte
+	PacketType  int
+	FourTuple   Four_tuple_rte
+	Packet      *C.struct_rte_mbuf
+	Payload_len int
+}
+
+type Pkt struct {
+	Packet       *C.struct_rte_mbuf
+	Payload_len  int
+	Start_offset int // How many bytes has been read
 }
 
 type Connection struct {
@@ -412,20 +419,19 @@ func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_l
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
-	case HTTP_FRAME, CLOSE_CONN:
+	case HTTP_FRAME:
 		// Handle by finFrameHandler
-		payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
-		rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Packet: pkt, Payload_len: int(buf_len)}
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
-	case BIG_FRAME:
+	case CLOSE_CONN:
 		// Handle by finFrameHandler
-		payload := make([]byte, buf_len)
-		buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
-		C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
-		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
+		// payload := make([]byte, buf_len)
+		// buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+		// C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
+		rxdata := ChannelData{PacketType: CLOSE_CONN, FourTuple: four_tuple}
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
@@ -507,14 +513,16 @@ func (poll *OnvmPoll) finFrameHandler() {
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
-				logger.Log.Debugf("onvmpoller reiceve %d data", len(channel_data.Payload))
+				logger.Log.Debugf("onvmpoller reiceve %d data", channel_data.Payload_len)
 				// conn.buffer_list_lock.Lock()
 				if conn.buffer_list.Front() == nil {
-					buffer := bytes.NewBuffer(channel_data.Payload)
+					// buffer := bytes.NewBuffer(channel_data.Payload)
+					buffer := &Pkt{Packet: channel_data.Packet, Payload_len: channel_data.Payload_len}
 					conn.buffer_list.PushBack(buffer)
 					conn.read_sync_chan <- true
 				} else {
-					buffer := bytes.NewBuffer(channel_data.Payload)
+					// buffer := bytes.NewBuffer(channel_data.Payload)
+					buffer := &Pkt{Packet: channel_data.Packet, Payload_len: channel_data.Payload_len}
 					conn.buffer_list.PushBack(buffer)
 					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
 				}
@@ -652,7 +660,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
 
 	var length int
-	var err1, err2 error
+	var err error
 	var elem *list.Element
 
 	// connection.buffer_list_lock.RLock()
@@ -663,8 +671,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 		// List is empty, waiting for packet
 		_, ok := <-connection.read_sync_chan
 		if !ok {
-			err1 = io.EOF
-			return length, err1
+			err = io.EOF
+			return length, err
 		}
 	}
 
@@ -675,21 +683,31 @@ func (connection Connection) Read(b []byte) (int, error) {
 	if elem == nil {
 		// logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
 		// logger.Log.Error("Element is nil")
-		return length, err1
+		return length, err
 	}
 
-	buffer := elem.Value.(*bytes.Buffer)
-	length, err2 = buffer.Read(b)
+	pkt := elem.Value.(*Pkt)
+	buff_cap := cap(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
+	// length, err2 = buffer.Read(b)
+	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.Packet, C.int(pkt.Start_offset))
+	End_offset := int(offset)
+	length = End_offset - pkt.Start_offset
 
-	if err2 == io.EOF {
+	if End_offset == pkt.Payload_len {
 		// connection.buffer_list_lock.Lock()
+		// logger.Log.Warnf("End_offset: %d", End_offset)
+		// logger.Log.Warnf("pkt.Payload_len: %d", pkt.Payload_len)
+		// logger.Log.Warnln("Remove list")
 		connection.buffer_list.Remove(elem)
 		// connection.buffer_list_lock.Unlock()
+	} else {
+		pkt.Start_offset = End_offset
 	}
 
 	// logger.Log.Debugf("Read: provide %d size of buffer", len(b))
 	logger.Log.Debugf("Read %d data", length)
-	return length, err1
+	return length, err
 }
 
 // Read ACK
@@ -733,7 +751,6 @@ func (connection Connection) Write(b []byte) (int, error) {
 func (connection Connection) writeControlMessage(msg_type int) error {
 	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
-
 	buffer := makeConnCtrlMsg(msg_type)
 	// Translate Go structure to C char *
 	// var buffer_ptr *C.char
@@ -758,7 +775,7 @@ func (connection Connection) Close() error {
 	// Notify peer connection can be closed
 	if !connection.state.is_txchan_closed.Load() {
 		// Notify peer connection can be closed
-	  connection.writeControlMessage(CLOSE_CONN)
+		connection.writeControlMessage(CLOSE_CONN)
 
 		// Close local connection
 		connection.state.is_txchan_closed.Store(true)
