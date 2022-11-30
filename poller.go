@@ -714,18 +714,18 @@ func (connection Connection) Read(b []byte) (int, error) {
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 	// length, err2 = buffer.Read(b)
 	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.PacketList[0], C.int(pkt.Start_offset))
-	End_offset := int(offset)
-	length = End_offset - pkt.Start_offset
+	end_offset := int(offset)
+	length = end_offset - pkt.Start_offset
 
-	if End_offset == pkt.Payload_len {
+	if end_offset == pkt.Payload_len {
 		// connection.buffer_list_lock.Lock()
-		// logger.Log.Warnf("End_offset: %d", End_offset)
+		// logger.Log.Warnf("end_offset: %d", end_offset)
 		// logger.Log.Warnf("pkt.Payload_len: %d", pkt.Payload_len)
 		// logger.Log.Warnln("Remove list")
 		connection.buffer_list.Remove(elem)
 		// connection.buffer_list_lock.Unlock()
 	} else {
-		pkt.Start_offset = End_offset
+		pkt.Start_offset = end_offset
 	}
 
 	// logger.Log.Debugf("Read: provide %d size of buffer", len(b))
