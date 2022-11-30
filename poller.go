@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -84,12 +85,14 @@ type ChannelData struct {
 	FourTuple   Four_tuple_rte
 	Packet      *C.struct_rte_mbuf
 	Payload_len int
+	PacketKey   int
 }
 
 type Pkt struct {
 	Packet       *C.struct_rte_mbuf
 	Payload_len  int
 	Start_offset int // How many bytes has been read
+	PacketKey    int
 }
 
 type Connection struct {
@@ -136,6 +139,7 @@ type OnvmPoll struct {
 		value: pointer to the Connection
 	*/
 	tables         *hashmap.Map[uint32, *Connection]
+	pkt_table      *hashmap.Map[int, *C.struct_rte_mbuf]
 	syn_chan       chan (*Four_tuple_rte)
 	ack_chan       chan (*Four_tuple_rte)
 	fin_frame_chan chan (ChannelData)
@@ -391,6 +395,7 @@ func initOnvmPoll() {
 	for i := 0; i < ONVM_POLLER_NUM; i++ {
 		onvmpoll[i] = &OnvmPoll{
 			tables:         hashmap.New[uint32, *Connection](),
+			pkt_table:      hashmap.New[int, *C.struct_rte_mbuf](),
 			syn_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
 			ack_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
 			fin_frame_chan: make(chan ChannelData, 1024/ONVM_POLLER_NUM),
@@ -409,6 +414,7 @@ func runPktWorker() {
 //export DeliverPacket
 func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	/* Put the packet into the right queue */
+	logger.Log.Warnf("DeliverPacket %p next: %p", pkt, pkt.next)
 
 	res_code := 0
 
@@ -423,7 +429,9 @@ func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_l
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
 	case HTTP_FRAME:
 		// Handle by finFrameHandler
-		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Packet: pkt, Payload_len: int(buf_len)}
+		key := rand.Intn(50000)
+		onvmpoll[pollIndex].pkt_table.Insert(key, pkt)
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Packet: pkt, Payload_len: int(buf_len), PacketKey: key}
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
@@ -519,14 +527,16 @@ func (poll *OnvmPoll) finFrameHandler() {
 			} else {
 				logger.Log.Debugf("onvmpoller reiceve %d data", channel_data.Payload_len)
 				// conn.buffer_list_lock.Lock()
+				logger.Log.Warnf("FinFrameHandler: %p next is %p", channel_data.Packet, channel_data.Packet.next)
+
 				if conn.buffer_list.Front() == nil {
 					// buffer := bytes.NewBuffer(channel_data.Payload)
-					buffer := &Pkt{Packet: channel_data.Packet, Payload_len: channel_data.Payload_len}
+					buffer := &Pkt{Packet: channel_data.Packet, Payload_len: channel_data.Payload_len, PacketKey: channel_data.PacketKey}
 					conn.buffer_list.PushBack(buffer)
 					conn.read_sync_chan <- true
 				} else {
 					// buffer := bytes.NewBuffer(channel_data.Payload)
-					buffer := &Pkt{Packet: channel_data.Packet, Payload_len: channel_data.Payload_len}
+					buffer := &Pkt{Packet: channel_data.Packet, Payload_len: channel_data.Payload_len, PacketKey: channel_data.PacketKey}
 					conn.buffer_list.PushBack(buffer)
 					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
 				}
@@ -691,10 +701,15 @@ func (connection Connection) Read(b []byte) (int, error) {
 		return length, err
 	}
 
+	pollIdx := connection.four_tuple.getPollIndex()
 	pkt := elem.Value.(*Pkt)
+	packet, _ := onvmpoll[pollIdx].pkt_table.Get(pkt.PacketKey)
 	buff_cap := cap(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 	// length, err2 = buffer.Read(b)
+	logger.Log.Warnf("Read: %p next is %p", pkt.Packet, pkt.Packet.next)
+	logger.Log.Warnf("Read: %p next is %p", packet, packet.next)
+	// offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.Packet, C.int(pkt.Start_offset))
 	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.Packet, C.int(pkt.Start_offset))
 	End_offset := int(offset)
 	length = End_offset - pkt.Start_offset
