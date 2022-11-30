@@ -12,6 +12,7 @@ package onvmpoller
 #include <onvm_nflib.h>
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
+extern void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
@@ -52,6 +53,7 @@ const (
 	ESTABLISH_CONN = 1
 	CLOSE_CONN     = 2
 	REPLY_CONN     = 3
+	BIG_FRAME      = 4
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
@@ -71,6 +73,11 @@ type Config struct {
 	IPIDMap map[string]int32 `yaml:"IPIDMap,omitempty"`
 }
 
+type NFip struct {
+	// Map the NF to IP address
+	Map map[string]string `yaml:"NFIPMap,omitempty"`
+}
+
 type ChannelData struct {
 	PacketType int
 	FourTuple  Four_tuple_rte
@@ -85,6 +92,7 @@ type Connection struct {
 	sync_chan      chan (bool) // For waiting ACK
 	read_sync_chan chan (bool) // For waiting packet
 	buffer_list    *list.List
+	// buffer_list_lock *sync.RWMutex
 }
 
 type connState struct {
@@ -144,6 +152,7 @@ type StatusFlag struct {
 /* Global Variables */
 var (
 	config        Config
+	nfIP          NFip
 	onvmpoll      []*OnvmPoll
 	local_address string
 	nf_ctx        *C.struct_onvm_nf_local_ctx
@@ -159,10 +168,10 @@ var (
 
 func init() {
 	/* Initialize Global Variable */
-	InitConfig()
+	initConfig()
+	initNfIP()
 	initOnvmPoll()
 
-	local_address = "127.0.0.1"
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
@@ -175,8 +184,10 @@ func init() {
 
 	/* Parse NF Name */
 	NfName := parseNfName(os.Args[0])
-	var char_ptr *C.char
-	char_ptr = C.CString(NfName)
+	var char_ptr *C.char = C.CString(NfName)
+
+	/* Set local_address by NF config */
+	local_address, _ = NfToIP(NfName)
 
 	/* Initialize NF context */
 	logger.Log.Traceln("Start onvm init")
@@ -189,6 +200,8 @@ func init() {
 	/* Run onvmpoller */
 	logger.Log.Traceln("Start onvmpoll run")
 	runOnvmPoller()
+
+	time.Sleep(2 * time.Second)
 }
 
 func runOnvmPoller() {
@@ -212,7 +225,7 @@ func CloseONVM() {
 	     Hepler functions
 *********************************/
 
-func InitConfig() {
+func initConfig() {
 	// Get absolute file name of ipid.yaml
 	var ipid_fname string
 	if dir, err := os.Getwd(); err != nil {
@@ -231,9 +244,23 @@ func InitConfig() {
 	}
 }
 
-func parseNfName(args string) string {
-	nfName := strings.Split(args, "/")
-	return nfName[1]
+func initNfIP() {
+	// Get absolute file name of ipid.yaml
+	var nfIP_fname string
+	if dir, err := os.Getwd(); err != nil {
+		nfIP_fname = "./NFip.yaml"
+	} else {
+		nfIP_fname = dir + "/NFip.yaml"
+	}
+
+	// Read and decode the yaml content
+	if yaml_content, err := ioutil.ReadFile(nfIP_fname); err != nil {
+		panic(err)
+	} else {
+		if unMarshalErr := yaml.Unmarshal(yaml_content, &nfIP); unMarshalErr != nil {
+			panic(unMarshalErr)
+		}
+	}
 }
 
 func IpToID(ip string) (id int32, err error) {
@@ -246,12 +273,37 @@ func IpToID(ip string) (id int32, err error) {
 	return
 }
 
+func NfToIP(nf string) (ip string, err error) {
+	ip, ok := nfIP.Map[nf]
+	logger.Log.Warnf("[NF: %+v][IP: %+v]", nf, ip)
+
+	if !ok {
+		err = fmt.Errorf("no match from NF to IP")
+	}
+
+	return
+}
+
+func parseNfName(args string) string {
+	nfName := strings.Split(args, "/")
+	return nfName[1]
+}
+
 func parseAddress(address string) (string, uint16) {
 	addr := strings.Split(address, ":")
 	v, _ := strconv.ParseUint(addr[1], 10, 64)
 	ip_addr, port := addr[0], uint16(v)
 
 	return ip_addr, port
+}
+
+func intToIP4(ipInt int64) string {
+	b0 := strconv.FormatInt((ipInt>>24)&0xff, 10)
+	b1 := strconv.FormatInt((ipInt>>16)&0xff, 10)
+	b2 := strconv.FormatInt((ipInt>>8)&0xff, 10)
+	b3 := strconv.FormatInt((ipInt & 0xff), 10)
+
+	return b0 + "." + b1 + "." + b2 + "." + b3
 }
 
 func makeConnCtrlMsg(msg_type int) []byte {
@@ -346,14 +398,12 @@ func runPktWorker() {
 }
 
 //export DeliverPacket
-func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	/* Put the packet into the right queue */
 
 	res_code := 0
-	payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
-	rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 	pktType := int(packet_type)
 
 	pollIndex := four_tuple.getPollIndex()
@@ -364,10 +414,19 @@ func DeliverPacket(packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint,
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
 	case HTTP_FRAME, CLOSE_CONN:
 		// Handle by finFrameHandler
+		payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
+		rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
+	case BIG_FRAME:
+		// Handle by finFrameHandler
+		payload := make([]byte, buf_len)
+		buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+		C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
+		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
@@ -397,7 +456,7 @@ func (poll *OnvmPoll) connectionHandler() {
 		new_conn.dst_id = uint8(dst_id)
 
 		// Send ACK back to client
-		_, err := new_conn.WriteControlMessage(REPLY_CONN)
+		err := new_conn.writeControlMessage(REPLY_CONN)
 		if err != nil {
 			logger.Log.Errorln(err.Error())
 			new_conn.Close()
@@ -407,6 +466,9 @@ func (poll *OnvmPoll) connectionHandler() {
 				new_conn.four_tuple.Dst_port)
 		}
 
+		// s := intToIP4(int64(four_tuple.Src_ip))
+		// t, _ := IpToID(s)
+		// logger.Log.Debugf("Accept connection: %v:%v (NF: %v)", s, four_tuple.Src_port, t)
 		listener.complete_chan <- new_conn
 	}
 }
@@ -432,17 +494,21 @@ func (poll *OnvmPoll) finFrameHandler() {
 			if !ok {
 				logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
 			} else {
-				logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
-				close(conn.rxchan)
-				close(conn.read_sync_chan)
-				conn.state.is_rxchan_closed.Store(true)
-				poll.Delete(conn)
+				if !conn.state.is_rxchan_closed.Load() {
+					logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
+					close(conn.rxchan)
+					close(conn.read_sync_chan)
+					conn.state.is_rxchan_closed.Store(true)
+					poll.Delete(conn)
+				}
 			}
 		case HTTP_FRAME:
 			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
+				logger.Log.Debugf("onvmpoller reiceve %d data", len(channel_data.Payload))
+				// conn.buffer_list_lock.Lock()
 				if conn.buffer_list.Front() == nil {
 					buffer := bytes.NewBuffer(channel_data.Payload)
 					conn.buffer_list.PushBack(buffer)
@@ -450,7 +516,9 @@ func (poll *OnvmPoll) finFrameHandler() {
 				} else {
 					buffer := bytes.NewBuffer(channel_data.Payload)
 					conn.buffer_list.PushBack(buffer)
+					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
 				}
+				// conn.buffer_list_lock.Unlock()
 			}
 		}
 	}
@@ -519,6 +587,7 @@ func createConnection() *Connection {
 	conn.sync_chan = make(chan bool, 1)
 	conn.read_sync_chan = make(chan bool, 1) // TODO: Adjust to the proper size
 	conn.buffer_list = list.New()
+	// conn.buffer_list_lock = new(sync.RWMutex)
 
 	return &conn
 }
@@ -583,30 +652,49 @@ func (connection Connection) Read(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
 
 	var length int
-	var err error
+	var err1, err2 error
+	var elem *list.Element
 
-	if connection.buffer_list.Front() == nil {
+	// connection.buffer_list_lock.RLock()
+	elem = connection.buffer_list.Front()
+	// connection.buffer_list_lock.RUnlock()
+
+	if elem == nil {
 		// List is empty, waiting for packet
 		_, ok := <-connection.read_sync_chan
 		if !ok {
-			err = io.EOF
-			return length, err
+			err1 = io.EOF
+			return length, err1
 		}
 	}
 
-	elem := connection.buffer_list.Front()
-	buffer := elem.Value.(*bytes.Buffer)
-	length, err = buffer.Read(b)
-	if err == io.EOF {
-		connection.buffer_list.Remove(elem)
+	// connection.buffer_list_lock.RLock()
+	elem = connection.buffer_list.Front()
+	// connection.buffer_list_lock.RUnlock()
+
+	if elem == nil {
+		// logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
+		// logger.Log.Error("Element is nil")
+		return length, err1
 	}
 
-	return length, err
+	buffer := elem.Value.(*bytes.Buffer)
+	length, err2 = buffer.Read(b)
+
+	if err2 == io.EOF {
+		// connection.buffer_list_lock.Lock()
+		connection.buffer_list.Remove(elem)
+		// connection.buffer_list_lock.Unlock()
+	}
+
+	// logger.Log.Debugf("Read: provide %d size of buffer", len(b))
+	logger.Log.Debugf("Read %d data", length)
+	return length, err1
 }
 
 // Read ACK
-func (connection Connection) ReadACK() error {
-	logger.Log.Tracef("Start ReadACK, four-tuple: %v", connection.four_tuple)
+func (connection Connection) readACK() error {
+	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
 
 	var err error
 	// Receive packet from onvmpoller
@@ -622,28 +710,35 @@ func (connection Connection) ReadACK() error {
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
+	logger.Log.Debugf("Write %d data.", len(b))
+
+	len := len(b)
+	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
 
 	// Translate Go structure to C char *
-	var buffer_ptr *C.char
-	buffer_ptr = (*C.char)(C.CBytes(b))
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(b))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len(b)))
+		buffer_ptr, C.int(len))
 
-	return len(b), nil
+	return len, nil
 }
 
 // For connection control message
-func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
-	logger.Log.Tracef("Start Connection.WriteControlMessage, four-tuple: %v", connection.four_tuple)
+func (connection Connection) writeControlMessage(msg_type int) error {
+	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
-	// Translate Go structure to C char *
-	var buffer_ptr *C.char
+
 	buffer := makeConnCtrlMsg(msg_type)
-	buffer_ptr = (*C.char)(C.CBytes(buffer))
+	// Translate Go structure to C char *
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(buffer))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
@@ -651,7 +746,7 @@ func (connection Connection) WriteControlMessage(msg_type int) (int, error) {
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len(buffer)))
 
-	return len(buffer), nil
+	return nil
 }
 
 // Close implements the net.Conn Close method.
@@ -661,13 +756,16 @@ func (connection Connection) Close() error {
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
 	// Notify peer connection can be closed
-	connection.WriteControlMessage(CLOSE_CONN)
+	if !connection.state.is_txchan_closed.Load() {
+		// Notify peer connection can be closed
+	  connection.writeControlMessage(CLOSE_CONN)
 
-	// Close local connection
-	connection.state.is_txchan_closed.Store(true)
+		// Close local connection
+		connection.state.is_txchan_closed.Store(true)
 
-	pollIndex := connection.four_tuple.getPollIndex()
-	err = onvmpoll[pollIndex].Delete(&connection)
+		pollIndex := connection.four_tuple.getPollIndex()
+		err = onvmpoll[pollIndex].Delete(&connection)
+	}
 
 	return err
 }
@@ -739,6 +837,7 @@ func (ol OnvmListener) Addr() net.Addr {
 
 func ListenONVM(network, address string) (net.Listener, error) {
 	logger.Log.Traceln("Start ListenONVM")
+	logger.Log.Debugf("Listen at %s", address)
 
 	if network != "onvm" {
 		msg := fmt.Sprintf("Unsppourt network type: %v", network)
@@ -762,6 +861,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.four_tuple.Src_port = port_manager.GetPort() //a_port.atomicPort()
 	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	conn.four_tuple.Dst_port = port
+	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
 
 	// Add the connection to table, otherwise it can't receive response
 	pollIndex := conn.four_tuple.getPollIndex()
@@ -771,7 +871,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 	conn.dst_id = uint8(dst_id)
 
 	// Send connection request to server
-	_, err := conn.WriteControlMessage(ESTABLISH_CONN)
+	err := conn.writeControlMessage(ESTABLISH_CONN)
 	logger.Log.Traceln("Dial write connection create request")
 
 	if err != nil {
@@ -784,7 +884,7 @@ func DialONVM(network, address string) (net.Conn, error) {
 
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
-	err = conn.ReadACK()
+	err = conn.readACK()
 	if err != nil {
 		logger.Log.Errorln(err.Error())
 		conn.Close()
