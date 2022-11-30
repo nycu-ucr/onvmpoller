@@ -12,6 +12,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
 #define REPLY_CONN 3
 #define BIG_FRAME 4
 #define TCP_PROTO_NUM 0x06
+#define MBUF_SIZE 2048
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
 uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
@@ -99,7 +100,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
 
     return 0;
 }
-// handle_payload(pktmbuf_pool, buffer, buffer_length);
+
 struct rte_mbuf *handle_payload(struct rte_mempool *pktmbuf_pool, char *buffer, int buffer_length)
 {
     struct rte_mbuf *pkt;
@@ -362,51 +363,188 @@ static inline int calculate_offset(int empty_space, int mbuf_data_len, int mbuf_
     }
 }
 
-int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset)
-{
-    int offset = 0;
-    int End_offset = Start_offset;
-    int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
-
-    // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
-    if (buff_cap < first_segm_payload_len - Start_offset)
-    {
-        /* Target buffer cap is smaller than data left in pkt*/
-        offset = buff_cap;
-    }
-    else
-    {
-        /* Target buffer cap is larger than data left in first mbuf */
-        offset = first_segm_payload_len - Start_offset;
-    }
-
-    uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-    rte_memcpy(buffer_ptr, data + Start_offset, offset);
-    End_offset = End_offset + offset;
-
-    // int empty_space = buff_cap - offset;
-    // if (!empty_space)
-    // {
-    //     /* No space left in target buff */
-    //     return End_offset
-    // };
-
-    // uint16_t mbuf_size = rte_pktmbuf_tailroom(head);
-    // pkt = pkt->next;
-
-    // while (pkt != NULL)
-    // {
-    //     // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
-    //     uint8_t *src = rte_pktmbuf_mtod(pkt, uint8_t *);
-    //     int offset = calculate_offset(empty_space, pkt->data_len);
-
-    //     rte_memcpy(buffer_ptr + End_offset, src, offset);
-    //     End_offset = End_offset + offset;
-    //     pkt = pkt->next;
-    // }
-
-    return End_offset;
+int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len) {
+    rte_memcpy(dst_ptr, src_ptr, copy_len);
+    return copy_len
 }
+
+int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int start_offset)
+{
+    int remaining_pkt_len = calculate_payload_len(pkt) - start_offset;
+    int end_offset = start_offset;
+
+    // Calc already read part, the current position of payload pointer
+    uint16_t c_q = start_offset / MBUF_SIZE;
+    uint16_t c_r = start_offset % MBUF_SIZE;
+    struct rte_mbuf *c_pkt = pkt;
+
+    for (uint16_t x=0; x < c_q; ++x) 
+    {
+        c_pkt = c_pkt->next;
+    }
+
+    // Calc the payload pointer
+    uint8_t *payload_ptr;
+    if (c_q == 0) 
+    {
+        // First segment has header
+        payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    } 
+    else 
+    {
+        payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+    }
+    payload_ptr += c_r;
+
+    if (remaining_pkt_len <= buff_cap) 
+    {
+        // It is able to read all packet into buffer
+
+        // Calc remaining need read part
+        uint16_t need_r1 = MBUF_SIZE - c_r; // The remaining part of the current segment
+        uint16_t need_q  = (remaining_pkt_len - need_r1) / MBUF_SIZE;
+        uint16_t need_r2 = remaining_pkt_len - need_r1 - (need_q * MBUF_SIZE); // The remaining part of the last segment
+
+        int n = 0;
+        // Read the first part
+        n = copy(buffer_ptr, payload_ptr, need_r1);
+        buffer_ptr += n;
+        end_offset += n;
+        c_pkt = c_pkt->next; // Move to next segment
+
+        // Read the second part
+        if (need_q != 0) 
+        {
+            for (int x=0; x < need_q; ++x) 
+            {
+                payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+                n = copy(buffer_ptr, payload_ptr, MBUF_SIZE);
+                buffer_ptr += n;
+                end_offset += n;
+
+                c_pkt = c_pkt->next;
+            }
+        }
+
+        // Read the third part
+        if (need_r2 != 0) 
+        {
+            payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+            n = copy(buffer_ptr, payload_ptr, need_r2);
+            buffer_ptr += n;
+            end_offset += n;
+        }
+
+        return end_offset;
+    } 
+    else 
+    {
+        // It can not read all packet into buffer, only read buff_cap
+
+        int n = 0;
+        int original_buff_cap = buff_cap;
+        
+        // Read the first part
+        uint16_t need_r1 = MBUF_SIZE - c_r; // The remaining part of the current segment
+        if (need_r1 > buff_cap) 
+        {
+            n = copy(buffer_ptr, payload_ptr, buff_cap);
+            end_offset += n;
+
+            return end_offset;
+        }
+        else 
+        {
+            n = copy(buffer_ptr, payload_ptr, need_r1);
+            buffer_ptr += n;
+            end_offset += n;
+            buff_cap -= n;
+        }
+        c_pkt = c_pkt->next; // Move to next segment
+
+        if (buff_cap == 0) 
+        {
+            return end_offset
+        } 
+        else if (buff_cap < 0) 
+        {
+            // This is error
+            printf("Error: the capacity of buffer is %d\n", buff_cap);
+        }
+
+        // Challenge 2: Read the second part
+        uint16_t need_q  = buff_cap / MBUF_SIZE;
+
+        if (need_q != 0) 
+        {
+            for (int x=0; x < need_q; ++x) 
+            {
+                payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+                n = copy(buffer_ptr, payload_ptr, MBUF_SIZE);
+                buffer_ptr += n;
+                end_offset += n;
+                buff_cap -= n;
+
+                c_pkt = c_pkt->next;
+            }
+        }
+
+        // Challenge 3: Read the third part
+        if (buff_cap != 0) 
+        {
+            n = copy(buffer_ptr, payload_ptr, buff_cap);
+            end_offset += n;
+        }
+
+        return end_offset;
+    }
+}
+
+// int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset)
+// {
+//     int offset = 0;
+//     int End_offset = Start_offset;
+//     int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+
+//     // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
+//     if (buff_cap < first_segm_payload_len - Start_offset)
+//     {
+//         /* Target buffer cap is smaller than data left in pkt*/
+//         offset = buff_cap;
+//     }
+//     else
+//     {
+//         /* Target buffer cap is larger than data left in first mbuf */
+//         offset = first_segm_payload_len - Start_offset;
+//     }
+
+//     uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+//     rte_memcpy(buffer_ptr, data + Start_offset, offset);
+//     End_offset = End_offset + offset;
+
+//     // int empty_space = buff_cap - offset;
+//     // if (!empty_space)
+//     // {
+//     //     /* No space left in target buff */
+//     //     return End_offset
+//     // };
+
+//     // uint16_t mbuf_size = rte_pktmbuf_tailroom(head);
+//     // pkt = pkt->next;
+
+//     // while (pkt != NULL)
+//     // {
+//     //     // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
+//     //     uint8_t *src = rte_pktmbuf_mtod(pkt, uint8_t *);
+//     //     int offset = calculate_offset(empty_space, pkt->data_len);
+
+//     //     rte_memcpy(buffer_ptr + End_offset, src, offset);
+//     //     End_offset = End_offset + offset;
+//     //     pkt = pkt->next;
+//     // }
+
+//     return End_offset;
+// }
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
 {
