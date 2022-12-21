@@ -11,8 +11,10 @@ package onvmpoller
 /*
 #include <onvm_nflib.h>
 
+struct mbuf_list;
+
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
-extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset);
+extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
@@ -58,9 +60,9 @@ const (
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
-	LOG_LEVEL = logrus.WarnLevel
+	LOG_LEVEL = logrus.DebugLevel
 	// Packet manager numbers
-	ONVM_POLLER_NUM = 8
+	ONVM_POLLER_NUM = 1
 )
 
 type Buffer struct {
@@ -83,13 +85,15 @@ type ChannelData struct {
 	PacketType  int
 	FourTuple   Four_tuple_rte
 	Payload_len int
-	PacketList  []*C.struct_rte_mbuf
+	// PacketList  []*C.struct_rte_mbuf
+	PacketList *C.struct_mbuf_list
 }
 
 type Pkt struct {
 	Payload_len  int
 	Start_offset int // How many bytes has been read
-	PacketList   []*C.struct_rte_mbuf
+	// PacketList  []*C.struct_rte_mbuf
+	PacketList *C.struct_mbuf_list
 }
 
 type Connection struct {
@@ -408,7 +412,7 @@ func runPktWorker() {
 }
 
 //export DeliverPacket
-func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
 	/* Put the packet into the right queue */
 	res_code := 0
 
@@ -423,13 +427,13 @@ func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_l
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
 	case HTTP_FRAME:
 		// Handle by finFrameHandler
-		pkt_list := make([]*C.struct_rte_mbuf, 1)
-		pkt_list[0] = pkt
-		tmp := pkt.next
-		for tmp != nil {
-			pkt_list = append(pkt_list, tmp)
-			tmp = tmp.next
-		}
+		// pkt_list := make([]*C.struct_rte_mbuf, 1)
+		// pkt_list[0] = pkt
+		// tmp := pkt.next
+		// for tmp != nil {
+		// 	pkt_list = append(pkt_list, tmp)
+		// 	tmp = tmp.next
+		// }
 		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload_len: int(buf_len), PacketList: pkt_list}
 		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
@@ -701,19 +705,19 @@ func (connection Connection) Read(b []byte) (int, error) {
 
 	pkt := elem.Value.(*Pkt)
 
-	tmp := pkt.PacketList[0]
-	for idx, ptr := range pkt.PacketList {
-		if idx == 0 {
-			continue
-		}
-		tmp.next = ptr
-		tmp = tmp.next
-	}
+	// tmp := pkt.PacketList[0]
+	// for idx, ptr := range pkt.PacketList {
+	// 	if idx == 0 {
+	// 		continue
+	// 	}
+	// 	tmp.next = ptr
+	// 	tmp = tmp.next
+	// }
 
 	buff_cap := cap(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 	// length, err2 = buffer.Read(b)
-	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.PacketList[0], C.int(pkt.Start_offset))
+	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.PacketList, C.int(pkt.Start_offset))
 	end_offset := int(offset)
 	length = end_offset - pkt.Start_offset
 

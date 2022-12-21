@@ -2,7 +2,7 @@
 #include "_cgo_export.h"
 #include "string.h"
 
-// extern int DeliverPacket(struct rte_mbuf *, int, char *, int, uint32, uint16, uint32, uint16)
+// extern int DeliverPacket(struct mbuf_list *, int, char *, int, uint32, uint16, uint32, uint16)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 
@@ -27,6 +27,46 @@ struct four_tuple
     rte_be32_t dst_addr; /**< destination address */
     rte_be16_t dst_port; /**< TCP destination port. */
 };
+
+struct mbuf_list 
+{
+    struct rte_mbuf *pkt;
+    struct mbuf_list *next;
+};
+
+struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt) {
+    struct mbuf_list *result = (struct mbuf_list *)malloc(sizeof(struct mbuf_list));
+    struct mbuf_list *list_ptr = result;
+
+    result->pkt = pkt;
+    result->next = NULL;
+
+    while (pkt->next != NULL) {
+        // Move packet
+        pkt = pkt->next;
+        // Create an new list
+        list_ptr->next = (struct mbuf_list *)malloc(sizeof(struct mbuf_list));
+        // Move list
+        list_ptr = list_ptr->next;
+        // Store packet
+        list_ptr->pkt = pkt;
+    }
+
+    return result;
+}
+
+void delete_mbuf_list(struct mbuf_list *list) {
+    struct mbuf_list *ptr = list;
+
+    while(ptr != NULL) {
+        struct mbuf_list *tmp = ptr->next;
+
+        free(ptr);
+        ptr = tmp->next;
+    }
+
+    return;
+}
 
 struct four_tuple_str
 {
@@ -368,8 +408,35 @@ static inline int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len) {
     return copy_len;
 }
 
-int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int start_offset)
+// int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int start_offset)
+int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
 {
+    struct rte_mbuf *pkt = pkt_list->pkt;
+    struct rte_mbuf *head = pkt;  // Restore the pointer
+    struct mbuf_list *tmp_pkt_list = pkt_list; // For move pointer
+
+    pkt->next = NULL;
+    // Rebuild packet
+    while(tmp_pkt_list->next != NULL) {
+        // Move pakcet list
+        tmp_pkt_list = tmp_pkt_list->next;
+        // Store packet
+        pkt->next = tmp_pkt_list->pkt;
+        // Move packet
+        pkt = pkt->next;
+    }
+    pkt = head;
+
+    #if 0
+    tmp_pkt_list = pkt_list;
+    printf("payload_assemble show mbuf list\n");
+    while (tmp_pkt_list != NULL) {
+        printf("%p (%p) -> ", tmp_pkt_list, tmp_pkt_list->pkt);
+        tmp_pkt_list = tmp_pkt_list->next;
+    }
+    printf("\n");
+    #endif
+
     int remaining_pkt_len = calculate_payload_len(pkt) - start_offset;
     int end_offset = start_offset;
 
@@ -606,17 +673,29 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     }
 
     int res_code;
+    struct mbuf_list *mbuf_list = create_mbuf_list(pkt);
+    #if 0
+    struct mbuf_list *tmp = mbuf_list;
+    printf("packet_handler show mbuf list\n");
+    while (tmp != NULL) {
+        printf("%p (%p) -> ", tmp, tmp->pkt);
+        tmp = tmp->next;
+    }
+    printf("\n");
+    #endif
+
     if (pkt->next == NULL)
     {
         payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
         payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-        res_code = DeliverPacket(pkt, pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
     else
     {
         payload_len = calculate_payload_len(pkt);
-        res_code = DeliverPacket(pkt, HTTP_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+        // res_code = DeliverPacket(pkt, HTTP_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
+    
+    res_code = DeliverPacket(mbuf_list, pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 
-    return 0;
+    return res_code;
 }
