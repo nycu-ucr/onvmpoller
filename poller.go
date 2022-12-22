@@ -60,9 +60,9 @@ const (
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
-	LOG_LEVEL = logrus.DebugLevel
+	LOG_LEVEL = logrus.WarnLevel
 	// Packet manager numbers
-	ONVM_POLLER_NUM = 1
+	ONVM_POLLER_NUM = 8
 )
 
 type Buffer struct {
@@ -96,21 +96,28 @@ type Pkt struct {
 	PacketList *C.struct_mbuf_list
 }
 
+type buffer struct {
+	sync.Mutex
+	list *list.List
+	cond *sync.Cond
+}
+
 type Connection struct {
-	dst_id         uint8
-	rxchan         chan ([]byte)
+	dst_id uint8
+	// rxchan         chan ([]byte)
 	four_tuple     Four_tuple_rte
 	state          *connState
-	sync_chan      chan (bool) // For waiting ACK
-	read_sync_chan chan (bool) // For waiting packet
+	sync_chan      chan struct{} // For waiting ACK
+	read_sync_chan chan *Pkt // For waiting packet
 	buffer_list    *list.List
-	// buffer_list_lock *sync.RWMutex
+	buffer_list_lock *sync.RWMutex
 }
 
 type connState struct {
 	is_rxchan_closed atomic.Bool
 	is_txchan_closed atomic.Bool
-	is_ready         atomic.Bool
+	// is_ready         atomic.Bool
+	is_waiting_pkt   atomic.Bool
 }
 
 type Four_tuple_rte struct {
@@ -216,6 +223,7 @@ func init() {
 	runOnvmPoller()
 
 	time.Sleep(2 * time.Second)
+	logger.Log.Warnln("Init onvmpoller!!")
 }
 
 func runOnvmPoller() {
@@ -500,8 +508,8 @@ func (poll *OnvmPoll) replyHandler() {
 		if !ok {
 			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
 		} else {
-			conn.state.is_ready.Store(true)
-			conn.sync_chan <- true
+			// conn.state.is_ready.Store(true)
+			conn.sync_chan <- struct{}{}
 		}
 	}
 }
@@ -517,7 +525,7 @@ func (poll *OnvmPoll) finFrameHandler() {
 			} else {
 				if !conn.state.is_rxchan_closed.Load() {
 					logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
-					close(conn.rxchan)
+					// close(conn.rxchan)
 					close(conn.read_sync_chan)
 					conn.state.is_rxchan_closed.Store(true)
 					poll.Delete(conn)
@@ -526,23 +534,26 @@ func (poll *OnvmPoll) finFrameHandler() {
 		case HTTP_FRAME:
 			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
 			if !ok {
-				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
+				logger.Log.Errorf("DeliverPacket-HTTP Frame, Can not get connection via four-tuple %v", channel_data.FourTuple)
 			} else {
 				logger.Log.Debugf("onvmpoller reiceve %d data", channel_data.Payload_len)
-				// conn.buffer_list_lock.Lock()
+				conn.buffer_list_lock.Lock()
 
 				if conn.buffer_list.Front() == nil {
 					// buffer := bytes.NewBuffer(channel_data.Payload)
 					buffer := &Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList}
 					conn.buffer_list.PushBack(buffer)
-					conn.read_sync_chan <- true
+					if conn.state.is_waiting_pkt.Load() {
+						/* Only when there is a reader waiting, then we need to do signal */
+						conn.read_sync_chan <- buffer
+					}
 				} else {
 					// buffer := bytes.NewBuffer(channel_data.Payload)
 					buffer := &Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList}
 					conn.buffer_list.PushBack(buffer)
 					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
 				}
-				// conn.buffer_list_lock.Unlock()
+				conn.buffer_list_lock.Unlock()
 			}
 		}
 	}
@@ -604,15 +615,20 @@ func createConnection() *Connection {
 	var cs connState
 	conn.state = &cs
 	conn.buffer_list = list.New()
-	// conn.buffer_list_lock = new(sync.RWMutex)
+	conn.buffer_list_lock = new(sync.RWMutex)
 
 	return &conn
 }
 
 func initConnectionCh(conn *Connection) {
-	conn.rxchan = make(chan []byte, 5) // For non-blocking
-	conn.sync_chan = make(chan bool, 1)
-	conn.read_sync_chan = make(chan bool, 1)
+	var new_state connState
+
+	// conn.rxchan = make(chan []byte, 5) // For non-blocking
+	conn.sync_chan = make(chan struct{})
+	conn.read_sync_chan = make(chan *Pkt)
+
+	/* Need to reset the connection state */
+	conn.state = &new_state
 }
 
 func (poll *OnvmPoll) Add(conn *Connection) {
@@ -633,9 +649,11 @@ func (poll *OnvmPoll) Delete(conn *Connection) error {
 		}
 
 		port_manager.ReleasePort(conn.four_tuple.Src_port)
+
 		// Recycle the connection
 		conn_pool.Put(conn)
-		logger.Log.Info("Close connection sucessfully.\n")
+
+		logger.Log.Tracef("Close connection sucessfully.")
 	}
 
 	return nil
@@ -679,31 +697,44 @@ func (connection Connection) Read(b []byte) (int, error) {
 	var length int
 	var err error
 	var elem *list.Element
+	var pkt *Pkt
 
-	// connection.buffer_list_lock.RLock()
+	connection.buffer_list_lock.RLock()
 	elem = connection.buffer_list.Front()
-	// connection.buffer_list_lock.RUnlock()
+	connection.buffer_list_lock.RUnlock()
 
+	// List is empty, waiting for packet
 	if elem == nil {
-		// List is empty, waiting for packet
-		_, ok := <-connection.read_sync_chan
+		/* Let the finframehandler can notice
+		   there is a reader need to be signaled */
+		connection.state.is_waiting_pkt.Store(true)
+		select {
+		case packet, ok := <-connection.read_sync_chan:
+			connection.state.is_waiting_pkt.Store(false)
+			if !ok {
+				err = io.EOF
+				return length, err
+			} else {
+				pkt = packet
+			}
+		case <-time.After(5 * time.Second):
+			connection.state.is_waiting_pkt.Store(false)
+			return length, fmt.Errorf("Read timeout")
+		}
+	} else {
+		var ok bool
+		pkt, ok = elem.Value.(*Pkt)
 		if !ok {
-			err = io.EOF
-			return length, err
+			logger.Log.Errorln("Elem is not Pkt type")
 		}
 	}
 
-	// connection.buffer_list_lock.RLock()
-	elem = connection.buffer_list.Front()
-	// connection.buffer_list_lock.RUnlock()
+	return connection.read(b, pkt)
+}
 
-	if elem == nil {
-		// logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
-		// logger.Log.Error("Element is nil")
-		return length, err
-	}
-
-	pkt := elem.Value.(*Pkt)
+func (connection Connection) read(b []byte, pkt *Pkt) (int, error) {
+	var length int
+	var err error
 
 	// tmp := pkt.PacketList[0]
 	// for idx, ptr := range pkt.PacketList {
@@ -722,18 +753,13 @@ func (connection Connection) Read(b []byte) (int, error) {
 	length = end_offset - pkt.Start_offset
 
 	if end_offset == pkt.Payload_len {
-		// connection.buffer_list_lock.Lock()
-		// logger.Log.Warnf("end_offset: %d", end_offset)
-		// logger.Log.Warnf("pkt.Payload_len: %d", pkt.Payload_len)
-		// logger.Log.Warnln("Remove list")
-		connection.buffer_list.Remove(elem)
-		// connection.buffer_list_lock.Unlock()
+		connection.buffer_list_lock.Lock()
+		connection.buffer_list.Remove(connection.buffer_list.Front())
+		connection.buffer_list_lock.Unlock()
 	} else {
 		pkt.Start_offset = end_offset
 	}
 
-	// logger.Log.Debugf("Read: provide %d size of buffer", len(b))
-	logger.Log.Debugf("Read %d data", length)
 	return length, err
 }
 
@@ -770,6 +796,8 @@ func (connection Connection) Write(b []byte) (int, error) {
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len))
+
+	// runtime.KeepAlive(b)
 
 	return len, nil
 }

@@ -28,20 +28,22 @@ struct four_tuple
     rte_be16_t dst_port; /**< TCP destination port. */
 };
 
-struct mbuf_list 
+struct mbuf_list
 {
     struct rte_mbuf *pkt;
     struct mbuf_list *next;
 };
 
-struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt) {
+static inline struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt)
+{
     struct mbuf_list *result = (struct mbuf_list *)malloc(sizeof(struct mbuf_list));
     struct mbuf_list *list_ptr = result;
 
     result->pkt = pkt;
     result->next = NULL;
 
-    while (pkt->next != NULL) {
+    while (pkt->next != NULL)
+    {
         // Move packet
         pkt = pkt->next;
         // Create an new list
@@ -55,10 +57,12 @@ struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt) {
     return result;
 }
 
-void delete_mbuf_list(struct mbuf_list *list) {
+void delete_mbuf_list(struct mbuf_list *list)
+{
     struct mbuf_list *ptr = list;
 
-    while(ptr != NULL) {
+    while (ptr != NULL)
+    {
         struct mbuf_list *tmp = ptr->next;
 
         free(ptr);
@@ -403,7 +407,8 @@ static inline int calculate_offset(int empty_space, int mbuf_data_len, int mbuf_
     }
 }
 
-static inline int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len) {
+static inline int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len)
+{
     rte_memcpy(dst_ptr, src_ptr, copy_len);
     return copy_len;
 }
@@ -412,12 +417,13 @@ static inline int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len) {
 int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
 {
     struct rte_mbuf *pkt = pkt_list->pkt;
-    struct rte_mbuf *head = pkt;  // Restore the pointer
+    struct rte_mbuf *head = pkt;               // Restore the pointer
     struct mbuf_list *tmp_pkt_list = pkt_list; // For move pointer
 
     pkt->next = NULL;
     // Rebuild packet
-    while(tmp_pkt_list->next != NULL) {
+    while (tmp_pkt_list->next != NULL)
+    {
         // Move pakcet list
         tmp_pkt_list = tmp_pkt_list->next;
         // Store packet
@@ -427,7 +433,7 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     }
     pkt = head;
 
-    #if 0
+#if 0
     tmp_pkt_list = pkt_list;
     printf("payload_assemble show mbuf list\n");
     while (tmp_pkt_list != NULL) {
@@ -435,7 +441,7 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
         tmp_pkt_list = tmp_pkt_list->next;
     }
     printf("\n");
-    #endif
+#endif
 
     int remaining_pkt_len = calculate_payload_len(pkt) - start_offset;
     int end_offset = start_offset;
@@ -443,8 +449,9 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     // Calc already read part, the current position of payload pointer
     uint16_t c_q = start_offset / MBUF_SIZE;
     uint16_t c_r = start_offset % MBUF_SIZE;
-    
-    if (c_q == 0 && c_r == 0 && remaining_pkt_len <= buff_cap && remaining_pkt_len <= MBUF_SIZE) {
+
+    if (c_q == 0 && c_r == 0 && remaining_pkt_len <= buff_cap && remaining_pkt_len <= MBUF_SIZE)
+    {
         // Shortcut
         uint8_t *payload_ptr = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
         rte_memcpy(buffer_ptr, payload_ptr, remaining_pkt_len);
@@ -453,34 +460,35 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     }
 
     struct rte_mbuf *c_pkt = pkt;
-    for (uint16_t x=0; x < c_q; ++x) 
+    for (uint16_t x = 0; x < c_q; ++x)
     {
         c_pkt = c_pkt->next;
     }
 
     // Calc the payload pointer
     uint8_t *payload_ptr;
-    if (c_q == 0) 
+    if (c_q == 0)
     {
         // First segment has header
         payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-    } 
-    else 
+    }
+    else
     {
         payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
     }
     payload_ptr += c_r;
 
-    if (remaining_pkt_len <= buff_cap) 
+    if (remaining_pkt_len <= buff_cap)
     {
         // It is able to read all packet into buffer
 
         // Calc remaining need read part
-        uint16_t need_r1 = (remaining_pkt_len > MBUF_SIZE) ? MBUF_SIZE - c_r: remaining_pkt_len; // The remaining part of the current segment
-        uint16_t need_q  = (remaining_pkt_len - need_r1) / MBUF_SIZE;
+        uint16_t need_r1 = (remaining_pkt_len > MBUF_SIZE) ? MBUF_SIZE - c_r : remaining_pkt_len; // The remaining part of the current segment
+        uint16_t need_q = (remaining_pkt_len - need_r1) / MBUF_SIZE;
         uint16_t need_r2 = remaining_pkt_len - need_r1 - (need_q * MBUF_SIZE); // The remaining part of the last segment
 
-        if ((need_r1 + need_q * MBUF_SIZE + need_r2) != remaining_pkt_len) {
+        if ((need_r1 + need_q * MBUF_SIZE + need_r2) != remaining_pkt_len)
+        {
             printf("Error: size mismatch %d != %d\n", need_r1 + need_q * MBUF_SIZE + need_r2, remaining_pkt_len);
         }
 
@@ -492,9 +500,9 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
         c_pkt = c_pkt->next; // Move to next segment
 
         // Read the second part
-        if (need_q != 0) 
+        if (need_q != 0)
         {
-            for (int x=0; x < need_q; ++x) 
+            for (int x = 0; x < need_q; ++x)
             {
                 payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
                 n = copy(buffer_ptr, payload_ptr, MBUF_SIZE);
@@ -506,7 +514,7 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
         }
 
         // Read the third part
-        if (need_r2 != 0) 
+        if (need_r2 != 0)
         {
             payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
             n = copy(buffer_ptr, payload_ptr, need_r2);
@@ -515,24 +523,24 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
         }
 
         return end_offset;
-    } 
-    else 
+    }
+    else
     {
         // It can not read all packet into buffer, only read buff_cap
 
         int n = 0;
         int original_buff_cap = buff_cap;
-        
+
         // Read the first part
-        uint16_t need_r1 = (remaining_pkt_len > MBUF_SIZE) ? MBUF_SIZE - c_r: remaining_pkt_len; // The remaining part of the current segment
-        if (need_r1 > buff_cap) 
+        uint16_t need_r1 = (remaining_pkt_len > MBUF_SIZE) ? MBUF_SIZE - c_r : remaining_pkt_len; // The remaining part of the current segment
+        if (need_r1 > buff_cap)
         {
             n = copy(buffer_ptr, payload_ptr, buff_cap);
             end_offset += n;
 
             return end_offset;
         }
-        else 
+        else
         {
             n = copy(buffer_ptr, payload_ptr, need_r1);
             buffer_ptr += n;
@@ -541,22 +549,22 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
         }
         c_pkt = c_pkt->next; // Move to next segment
 
-        if (buff_cap == 0) 
+        if (buff_cap == 0)
         {
             return end_offset;
-        } 
-        else if (buff_cap < 0) 
+        }
+        else if (buff_cap < 0)
         {
             // This is error
             printf("Error: the capacity of buffer is %d\n", buff_cap);
         }
 
         // Challenge 2: Read the second part
-        uint16_t need_q  = buff_cap / MBUF_SIZE;
+        uint16_t need_q = buff_cap / MBUF_SIZE;
 
-        if (need_q != 0) 
+        if (need_q != 0)
         {
-            for (int x=0; x < need_q; ++x) 
+            for (int x = 0; x < need_q; ++x)
             {
                 payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
                 n = copy(buffer_ptr, payload_ptr, MBUF_SIZE);
@@ -569,7 +577,7 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
         }
 
         // Challenge 3: Read the third part
-        if (buff_cap != 0) 
+        if (buff_cap != 0)
         {
             n = copy(buffer_ptr, payload_ptr, buff_cap);
             end_offset += n;
@@ -632,6 +640,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     struct rte_ether_hdr *eth_hdr;
     uint8_t *payload;
     int payload_len, pkt_type;
+    struct mbuf_list *mbuf_list;
 
     meta->action = ONVM_NF_ACTION_DROP;
 
@@ -669,12 +678,12 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         break;
     default:
         pkt_type = HTTP_FRAME;
+        mbuf_list = create_mbuf_list(pkt);
         break;
     }
 
     int res_code;
-    struct mbuf_list *mbuf_list = create_mbuf_list(pkt);
-    #if 0
+#if 0
     struct mbuf_list *tmp = mbuf_list;
     printf("packet_handler show mbuf list\n");
     while (tmp != NULL) {
@@ -682,7 +691,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         tmp = tmp->next;
     }
     printf("\n");
-    #endif
+#endif
 
     if (pkt->next == NULL)
     {
@@ -694,7 +703,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         payload_len = calculate_payload_len(pkt);
         // res_code = DeliverPacket(pkt, HTTP_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
-    
+
     res_code = DeliverPacket(mbuf_list, pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 
     return res_code;
