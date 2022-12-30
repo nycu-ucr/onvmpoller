@@ -18,6 +18,7 @@ extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list 
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
+extern void test_cgo(char* ptr);
 */
 import "C"
 
@@ -30,8 +31,11 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"os"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,11 +109,11 @@ type buffer struct {
 type Connection struct {
 	dst_id uint8
 	// rxchan         chan ([]byte)
-	four_tuple     Four_tuple_rte
-	state          *connState
-	sync_chan      chan struct{} // For waiting ACK
-	read_sync_chan chan *Pkt // For waiting packet
-	buffer_list    *list.List
+	four_tuple       Four_tuple_rte
+	state            *connState
+	sync_chan        chan struct{} // For waiting ACK
+	read_sync_chan   chan *Pkt     // For waiting packet
+	buffer_list      *list.List
 	buffer_list_lock *sync.RWMutex
 }
 
@@ -117,7 +121,7 @@ type connState struct {
 	is_rxchan_closed atomic.Bool
 	is_txchan_closed atomic.Bool
 	// is_ready         atomic.Bool
-	is_waiting_pkt   atomic.Bool
+	is_waiting_pkt atomic.Bool
 }
 
 type Four_tuple_rte struct {
@@ -797,7 +801,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len))
 
-	// runtime.KeepAlive(b)
+	runtime.KeepAlive(b)
 
 	return len, nil
 }
@@ -806,17 +810,17 @@ func (connection Connection) Write(b []byte) (int, error) {
 func (connection Connection) writeControlMessage(msg_type int) error {
 	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
-	buffer := makeConnCtrlMsg(msg_type)
+	// buffer := makeConnCtrlMsg(msg_type)
 	// Translate Go structure to C char *
 	// var buffer_ptr *C.char
 	// buffer_ptr = (*C.char)(C.CBytes(buffer))
-	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
+	// buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len(buffer)))
+		nil, C.int(0))
 
 	return nil
 }
@@ -969,4 +973,27 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Debugln("DialONVM done")
 
 	return conn, nil
+}
+
+/* Test related */
+func Test_cgo() {
+	b := []byte("Test-CGO")
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
+	C.test_cgo(buffer_ptr)
+}
+
+func TimeTrack(start time.Time) {
+	elapsed := time.Since(start)
+
+	// Skip this function, and fetch the PC and file for its parent.
+	pc, _, _, _ := runtime.Caller(1)
+
+	// Retrieve a function object this functions parent.
+	funcObj := runtime.FuncForPC(pc)
+
+	// Regex to extract just the function name (and not the module path).
+	runtimeFunc := regexp.MustCompile(`^.*\.(.*)$`)
+	name := runtimeFunc.ReplaceAllString(funcObj.Name(), "$1")
+
+	log.Println(fmt.Sprintf("%s took %s", name, elapsed))
 }
