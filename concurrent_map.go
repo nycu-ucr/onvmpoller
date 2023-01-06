@@ -39,7 +39,9 @@ type innerMap struct {
 ********************************
 
 	Partitionable interface
-*********************************/
+
+********************************
+*/
 func (four_tuple *Four_tuple_rte) Value() Four_tuple_rte {
 	return *four_tuple
 }

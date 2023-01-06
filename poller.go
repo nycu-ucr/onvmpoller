@@ -154,7 +154,7 @@ type OnvmPoll struct {
 	// pkt_table      *hashmap.Map[int, *C.struct_rte_mbuf]
 	syn_chan       chan (*Four_tuple_rte)
 	ack_chan       chan (*Four_tuple_rte)
-	fin_frame_chan chan (ChannelData)
+	fin_frame_chan chan (*ChannelData) //*sharedBuffer
 }
 
 type PortManager struct {
@@ -410,7 +410,7 @@ func initOnvmPoll() {
 			tables:         hashmap.New[uint32, *Connection](),
 			syn_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
 			ack_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
-			fin_frame_chan: make(chan ChannelData, 1024/ONVM_POLLER_NUM),
+			fin_frame_chan: make(chan *ChannelData, 1024/ONVM_POLLER_NUM), //newSharedBuffer(1024 / ONVM_POLLER_NUM),
 		}
 	}
 }
@@ -425,6 +425,7 @@ func runPktWorker() {
 
 //export DeliverPacket
 func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+	// defer TimeTrack(time.Now())
 	/* Put the packet into the right queue */
 	res_code := 0
 
@@ -447,7 +448,9 @@ func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char,
 		// 	tmp = tmp.next
 		// }
 		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload_len: int(buf_len), PacketList: pkt_list}
-		onvmpoll[pollIndex].fin_frame_chan <- rxdata
+		// log.Println(fmt.Sprintf("DeliverPacket (now) %d(ns)", time.Now().Nanosecond()))
+		onvmpoll[pollIndex].fin_frame_chan <- &rxdata
+		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
@@ -457,7 +460,8 @@ func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char,
 		// buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
 		// C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
 		rxdata := ChannelData{PacketType: CLOSE_CONN, FourTuple: four_tuple}
-		onvmpoll[pollIndex].fin_frame_chan <- rxdata
+		onvmpoll[pollIndex].fin_frame_chan <- &rxdata
+		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	default:
 		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
@@ -536,6 +540,8 @@ func (poll *OnvmPoll) finFrameHandler() {
 				}
 			}
 		case HTTP_FRAME:
+			// t := time.Now()
+			// log.Println(fmt.Sprintf("finFrameHandler (now) %d(ns)", time.Now().Nanosecond()))
 			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
 			if !ok {
 				logger.Log.Errorf("DeliverPacket-HTTP Frame, Can not get connection via four-tuple %v", channel_data.FourTuple)
@@ -559,6 +565,7 @@ func (poll *OnvmPoll) finFrameHandler() {
 				}
 				conn.buffer_list_lock.Unlock()
 			}
+			// log.Println(fmt.Sprintf("handle-HTTP-frame took %d(ns)", time.Since(t).Nanoseconds()))
 		}
 	}
 }
@@ -641,6 +648,7 @@ func (poll *OnvmPoll) Add(conn *Connection) {
 }
 
 func (poll *OnvmPoll) Delete(conn *Connection) error {
+	// defer TimeTrack(time.Now())
 	// Delete the connection from connection and four-tuple tables
 	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
 		var four_tuple *Four_tuple_rte = swapFourTuple(conn.four_tuple)
@@ -696,6 +704,7 @@ func (oa OnvmAddr) String() string {
 
 // Read implements the net.Conn Read method.
 func (connection Connection) Read(b []byte) (int, error) {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
 
 	var length int
@@ -703,9 +712,11 @@ func (connection Connection) Read(b []byte) (int, error) {
 	var elem *list.Element
 	var pkt *Pkt
 
+	// t := time.Now()
 	connection.buffer_list_lock.RLock()
 	elem = connection.buffer_list.Front()
 	connection.buffer_list_lock.RUnlock()
+	// log.Println(fmt.Sprintf("buffer_list_lock took %d(ns)", time.Since(t).Nanoseconds()))
 
 	// List is empty, waiting for packet
 	if elem == nil {
@@ -721,6 +732,8 @@ func (connection Connection) Read(b []byte) (int, error) {
 			} else {
 				pkt = packet
 			}
+			// log.Println(fmt.Sprintf("Read-empty took %d(ns)", time.Since(t).Nanoseconds()))
+			// log.Println(fmt.Sprintf("Read (now) %d(ns)", time.Now().Nanosecond()))
 		case <-time.After(5 * time.Second):
 			connection.state.is_waiting_pkt.Store(false)
 			return length, fmt.Errorf("Read timeout")
@@ -731,12 +744,16 @@ func (connection Connection) Read(b []byte) (int, error) {
 		if !ok {
 			logger.Log.Errorln("Elem is not Pkt type")
 		}
+		// log.Println(fmt.Sprintf("Read-not-empty took %d(ns)", time.Since(t).Nanoseconds()))
 	}
 
-	return connection.read(b, pkt)
+	runtime.KeepAlive(b)
+
+	return connection.reading(b, pkt)
 }
 
-func (connection Connection) read(b []byte, pkt *Pkt) (int, error) {
+func (connection Connection) reading(b []byte, pkt *Pkt) (int, error) {
+	// defer TimeTrack(time.Now())
 	var length int
 	var err error
 
@@ -764,11 +781,14 @@ func (connection Connection) read(b []byte, pkt *Pkt) (int, error) {
 		pkt.Start_offset = end_offset
 	}
 
+	runtime.KeepAlive(b)
+
 	return length, err
 }
 
 // Read ACK
 func (connection Connection) readACK() error {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
 
 	var err error
@@ -784,6 +804,7 @@ func (connection Connection) readACK() error {
 
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 	logger.Log.Debugf("Write %d data.", len(b))
 
@@ -808,6 +829,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 
 // For connection control message
 func (connection Connection) writeControlMessage(msg_type int) error {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
 	// buffer := makeConnCtrlMsg(msg_type)
@@ -995,5 +1017,92 @@ func TimeTrack(start time.Time) {
 	runtimeFunc := regexp.MustCompile(`^.*\.(.*)$`)
 	name := runtimeFunc.ReplaceAllString(funcObj.Name(), "$1")
 
-	log.Println(fmt.Sprintf("%s took %s", name, elapsed))
+	log.Println(fmt.Sprintf("%s took %d(ns)", name, elapsed.Nanoseconds()))
+}
+
+/* Share-memory */
+
+type sharedBuffer struct {
+	sync.Mutex
+	rcond  *sync.Cond
+	wcond  *sync.Cond
+	closed bool
+	read   int
+	write  int
+	count  int
+	size   int
+	buffer []*ChannelData
+}
+
+func newSharedBuffer(size int) *sharedBuffer {
+	s := &sharedBuffer{
+		buffer: make([]*ChannelData, size),
+		size:   size,
+	}
+	s.rcond = sync.NewCond(s)
+	s.wcond = sync.NewCond(s)
+	return s
+}
+
+func (s *sharedBuffer) close() {
+	s.Lock()
+	s.closed = true
+	s.rcond.Broadcast()
+	s.Unlock()
+}
+
+func (s *sharedBuffer) put(val *ChannelData) {
+	s.Lock()
+
+	// If the buffer is full we need to wait for space to appear
+	for s.count == s.size {
+		s.wcond.Wait()
+	}
+
+	// s.write tells us the next space that's free to write to. If we reach the
+	// end of the buffer we wrap around to the start
+	s.buffer[s.write] = val
+	s.write++
+	if s.write == s.size {
+		s.write = 0
+	}
+
+	// If the buffer was empty, then signal to anyone that's waiting as there's
+	// now data to read
+	if s.count == 0 {
+		s.rcond.Signal()
+	}
+	s.count++
+	s.Unlock()
+}
+
+func (s *sharedBuffer) get() (*ChannelData, bool) {
+	s.Lock()
+
+	// If the buffer is empty then we need to wait for some data
+	for s.count == 0 {
+		if s.closed {
+			s.Unlock()
+			return nil, true
+		}
+		s.rcond.Wait()
+	}
+
+	// s.read tells us where the next byte to read is. If we reach the end of
+	// the buffer we wrap around to the beginning
+	val := s.buffer[s.read]
+	s.read++
+	if s.read == s.size {
+		s.read = 0
+	}
+
+	// If the buffer was full, then signal to anyone waiting to write as there is
+	// now space
+	if s.count == s.size {
+		s.wcond.Signal()
+	}
+	s.count--
+
+	s.Unlock()
+	return val, false
 }

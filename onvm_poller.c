@@ -17,7 +17,7 @@ long get_elapsed_time_nano(struct timespec* before, struct timespec* after);
 #define REPLY_CONN 3
 #define BIG_FRAME 4
 #define TCP_PROTO_NUM 0x06
-#define MBUF_SIZE 2048
+#define MBUF_SIZE 4096
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
 uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
