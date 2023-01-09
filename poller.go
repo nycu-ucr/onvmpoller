@@ -109,19 +109,16 @@ type buffer struct {
 type Connection struct {
 	dst_id uint8
 	// rxchan         chan ([]byte)
-	four_tuple       Four_tuple_rte
-	state            *connState
-	sync_chan        chan struct{} // For waiting ACK
-	read_sync_chan   chan *Pkt     // For waiting packet
-	buffer_list      *list.List
-	buffer_list_lock *sync.RWMutex
+	four_tuple Four_tuple_rte
+	state      *connState
+	sync_chan  chan struct{} // For waiting ACK
+	buffer     *shareList
+	pkt        *Pkt
 }
 
 type connState struct {
 	is_rxchan_closed atomic.Bool
 	is_txchan_closed atomic.Bool
-	// is_ready         atomic.Bool
-	is_waiting_pkt atomic.Bool
 }
 
 type Four_tuple_rte struct {
@@ -227,7 +224,7 @@ func init() {
 	runOnvmPoller()
 
 	time.Sleep(2 * time.Second)
-	logger.Log.Warnln("Init onvmpoller!!")
+	logger.Log.Warnln("Init onvmpoller(share-list ver)")
 }
 
 func runOnvmPoller() {
@@ -410,7 +407,7 @@ func initOnvmPoll() {
 			tables:         hashmap.New[uint32, *Connection](),
 			syn_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
 			ack_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
-			fin_frame_chan: make(chan *ChannelData, 1024/ONVM_POLLER_NUM), //newSharedBuffer(1024 / ONVM_POLLER_NUM),
+			fin_frame_chan: make(chan *ChannelData, 128/ONVM_POLLER_NUM),
 		}
 	}
 }
@@ -418,7 +415,7 @@ func initOnvmPoll() {
 func runPktWorker() {
 	for i := 0; i < ONVM_POLLER_NUM; i++ {
 		go onvmpoll[i].connectionHandler()
-		go onvmpoll[i].finFrameHandler()
+		go onvmpoll[i].finHandler()
 		go onvmpoll[i].replyHandler()
 	}
 }
@@ -435,22 +432,14 @@ func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char,
 	pollIndex := four_tuple.getPollIndex()
 
 	switch pktType {
+	case HTTP_FRAME:
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload_len: int(buf_len), PacketList: pkt_list}
+		// log.Println(fmt.Sprintf("DeliverPacket (now) %d(ns)", time.Now().Nanosecond()))
+		onvmpoll[pollIndex].frameHandler(&rxdata)
+		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
-	case HTTP_FRAME:
-		// Handle by finFrameHandler
-		// pkt_list := make([]*C.struct_rte_mbuf, 1)
-		// pkt_list[0] = pkt
-		// tmp := pkt.next
-		// for tmp != nil {
-		// 	pkt_list = append(pkt_list, tmp)
-		// 	tmp = tmp.next
-		// }
-		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload_len: int(buf_len), PacketList: pkt_list}
-		// log.Println(fmt.Sprintf("DeliverPacket (now) %d(ns)", time.Now().Nanosecond()))
-		onvmpoll[pollIndex].fin_frame_chan <- &rxdata
-		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
@@ -462,8 +451,6 @@ func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char,
 		rxdata := ChannelData{PacketType: CLOSE_CONN, FourTuple: four_tuple}
 		onvmpoll[pollIndex].fin_frame_chan <- &rxdata
 		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
-	default:
-		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
 	}
 
 	return res_code
@@ -522,51 +509,29 @@ func (poll *OnvmPoll) replyHandler() {
 	}
 }
 
-func (poll *OnvmPoll) finFrameHandler() {
+func (poll *OnvmPoll) finHandler() {
 	for channel_data := range poll.fin_frame_chan {
-		switch channel_data.PacketType {
-		case CLOSE_CONN:
-			// Let onvmpoller delete the connection
-			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
-			if !ok {
-				logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
-			} else {
-				if !conn.state.is_rxchan_closed.Load() {
-					logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
-					// close(conn.rxchan)
-					close(conn.read_sync_chan)
-					conn.state.is_rxchan_closed.Store(true)
-					poll.Delete(conn)
-				}
+		// Let onvmpoller delete the connection
+		conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
+		if !ok {
+			logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
+		} else {
+			if !conn.state.is_rxchan_closed.Load() {
+				logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
+				conn.buffer.close()
+				conn.state.is_rxchan_closed.Store(true)
+				poll.Delete(conn)
 			}
-		case HTTP_FRAME:
-			// t := time.Now()
-			// log.Println(fmt.Sprintf("finFrameHandler (now) %d(ns)", time.Now().Nanosecond()))
-			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
-			if !ok {
-				logger.Log.Errorf("DeliverPacket-HTTP Frame, Can not get connection via four-tuple %v", channel_data.FourTuple)
-			} else {
-				logger.Log.Debugf("onvmpoller reiceve %d data", channel_data.Payload_len)
-				conn.buffer_list_lock.Lock()
-
-				if conn.buffer_list.Front() == nil {
-					// buffer := bytes.NewBuffer(channel_data.Payload)
-					buffer := &Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList}
-					conn.buffer_list.PushBack(buffer)
-					if conn.state.is_waiting_pkt.Load() {
-						/* Only when there is a reader waiting, then we need to do signal */
-						conn.read_sync_chan <- buffer
-					}
-				} else {
-					// buffer := bytes.NewBuffer(channel_data.Payload)
-					buffer := &Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList}
-					conn.buffer_list.PushBack(buffer)
-					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
-				}
-				conn.buffer_list_lock.Unlock()
-			}
-			// log.Println(fmt.Sprintf("handle-HTTP-frame took %d(ns)", time.Since(t).Nanoseconds()))
 		}
+	}
+}
+
+func (poll *OnvmPoll) frameHandler(channel_data *ChannelData) {
+	conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
+	if !ok {
+		logger.Log.Errorf("DeliverPacket-HTTP Frame, Can not get connection via four-tuple %v", channel_data.FourTuple)
+	} else {
+		conn.buffer.send(&Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList})
 	}
 }
 
@@ -625,8 +590,7 @@ func createConnection() *Connection {
 	var conn Connection
 	var cs connState
 	conn.state = &cs
-	conn.buffer_list = list.New()
-	conn.buffer_list_lock = new(sync.RWMutex)
+	conn.buffer = newShareList()
 
 	return &conn
 }
@@ -636,10 +600,10 @@ func initConnectionCh(conn *Connection) {
 
 	// conn.rxchan = make(chan []byte, 5) // For non-blocking
 	conn.sync_chan = make(chan struct{})
-	conn.read_sync_chan = make(chan *Pkt)
 
 	/* Need to reset the connection state */
 	conn.state = &new_state
+	conn.buffer = newShareList()
 }
 
 func (poll *OnvmPoll) Add(conn *Connection) {
@@ -709,76 +673,39 @@ func (connection Connection) Read(b []byte) (int, error) {
 
 	var length int
 	var err error
-	var elem *list.Element
-	var pkt *Pkt
-
-	// t := time.Now()
-	connection.buffer_list_lock.RLock()
-	elem = connection.buffer_list.Front()
-	connection.buffer_list_lock.RUnlock()
-	// log.Println(fmt.Sprintf("buffer_list_lock took %d(ns)", time.Since(t).Nanoseconds()))
 
 	// List is empty, waiting for packet
-	if elem == nil {
-		/* Let the finframehandler can notice
-		   there is a reader need to be signaled */
-		connection.state.is_waiting_pkt.Store(true)
-		select {
-		case packet, ok := <-connection.read_sync_chan:
-			connection.state.is_waiting_pkt.Store(false)
-			if !ok {
-				err = io.EOF
-				return length, err
-			} else {
-				pkt = packet
-			}
-			// log.Println(fmt.Sprintf("Read-empty took %d(ns)", time.Since(t).Nanoseconds()))
-			// log.Println(fmt.Sprintf("Read (now) %d(ns)", time.Now().Nanosecond()))
-		case <-time.After(5 * time.Second):
-			connection.state.is_waiting_pkt.Store(false)
-			return length, fmt.Errorf("Read timeout")
+	if connection.pkt == nil {
+		var close bool
+		connection.pkt, close = connection.buffer.recv()
+
+		if close {
+			err = io.EOF
+			return length, err
 		}
-	} else {
-		var ok bool
-		pkt, ok = elem.Value.(*Pkt)
-		if !ok {
-			logger.Log.Errorln("Elem is not Pkt type")
-		}
-		// log.Println(fmt.Sprintf("Read-not-empty took %d(ns)", time.Since(t).Nanoseconds()))
 	}
 
 	runtime.KeepAlive(b)
 
-	return connection.reading(b, pkt)
+	return connection.reading(b)
 }
 
-func (connection Connection) reading(b []byte, pkt *Pkt) (int, error) {
+func (connection Connection) reading(b []byte) (int, error) {
 	// defer TimeTrack(time.Now())
 	var length int
 	var err error
 
-	// tmp := pkt.PacketList[0]
-	// for idx, ptr := range pkt.PacketList {
-	// 	if idx == 0 {
-	// 		continue
-	// 	}
-	// 	tmp.next = ptr
-	// 	tmp = tmp.next
-	// }
-
 	buff_cap := cap(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 	// length, err2 = buffer.Read(b)
-	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), pkt.PacketList, C.int(pkt.Start_offset))
+	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset))
 	end_offset := int(offset)
-	length = end_offset - pkt.Start_offset
+	length = end_offset - connection.pkt.Start_offset
 
-	if end_offset == pkt.Payload_len {
-		connection.buffer_list_lock.Lock()
-		connection.buffer_list.Remove(connection.buffer_list.Front())
-		connection.buffer_list_lock.Unlock()
+	if end_offset == connection.pkt.Payload_len {
+		connection.pkt = nil
 	} else {
-		pkt.Start_offset = end_offset
+		connection.pkt.Start_offset = end_offset
 	}
 
 	runtime.KeepAlive(b)
@@ -1105,4 +1032,59 @@ func (s *sharedBuffer) get() (*ChannelData, bool) {
 
 	s.Unlock()
 	return val, false
+}
+
+type shareList struct {
+	cond   *sync.Cond
+	closed bool
+	l      *list.List
+}
+
+func newShareList() *shareList {
+	return &shareList{
+		cond:   sync.NewCond(&sync.Mutex{}),
+		closed: false,
+		l:      list.New(),
+	}
+}
+
+func (c *shareList) recv() (pkt *Pkt, close bool) {
+	c.cond.L.Lock()
+
+	for c.l.Len() == 0 {
+		if c.closed {
+			c.cond.L.Unlock()
+			return nil, true
+		}
+		c.cond.Wait()
+	}
+
+	pkt = c.l.Remove(c.l.Front()).(*Pkt)
+	c.cond.Signal()
+	c.cond.L.Unlock()
+	return pkt, false
+}
+
+func (c *shareList) send(pkt *Pkt) {
+	c.cond.L.Lock()
+
+	if c.l.Len() == 0 {
+		c.l.PushBack(pkt)
+		c.cond.Signal()
+	} else {
+		c.l.PushBack(pkt)
+	}
+
+	if c.closed {
+		panic("send on closed shareList")
+	}
+
+	c.cond.L.Unlock()
+}
+
+func (c *shareList) close() {
+	c.cond.L.Lock()
+	c.closed = true
+	c.cond.Signal()
+	c.cond.L.Unlock()
 }
