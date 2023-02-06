@@ -490,11 +490,13 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
     pkt = head;
 
 #if 0
-    tmp_pkt_list = pkt_list;
+    // Debug mbuf list
+    struct mbuf_list *tmp;
+    tmp = pkt_list;
     printf("payload_assemble show mbuf list\n");
-    while (tmp_pkt_list != NULL) {
-        printf("%p (%p) -> ", tmp_pkt_list, tmp_pkt_list->pkt);
-        tmp_pkt_list = tmp_pkt_list->next;
+    while (tmp != NULL) {
+        printf("%p (%p) -> ", tmp, tmp_pkt_list->pkt);
+        tmp = tmp_pkt_list->next;
     }
     printf("\n");
 #endif
@@ -512,6 +514,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
         uint8_t *payload_ptr = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
         rte_memcpy(buffer_ptr, payload_ptr, remaining_pkt_len);
         end_offset += remaining_pkt_len;
+        // printf("[handle_assemble] (shortcut): read %d bytes data\n", end_offset - start_offset);
         return end_offset;
     }
 
@@ -578,6 +581,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
             end_offset += n;
         }
 
+        // printf("[handle_assemble] (Case 1): read %d bytes data\n", end_offset - start_offset);
         return end_offset;
     }
     else
@@ -594,6 +598,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
             n = copy(buffer_ptr, payload_ptr, buff_cap);
             end_offset += n;
 
+            // printf("[handle_assemble] (Case 2-1-1): read %d bytes data\n", end_offset - start_offset);
             return end_offset;
         }
         else
@@ -607,6 +612,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
 
         if (buff_cap == 0)
         {
+            // printf("[handle_assemble] (Case 2-1-2): read %d bytes data\n", end_offset - start_offset);
             return end_offset;
         }
         else if (buff_cap < 0)
@@ -639,6 +645,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
             end_offset += n;
         }
 
+        // printf("[handle_assemble] (Case 2): read %d bytes data\n", end_offset - start_offset);
         return end_offset;
     }
 }
@@ -764,22 +771,25 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         mbuf_list = create_mbuf_list(pkt);
         // get_monotonic_time(&t_end);
         // printf("[ONVM] create_mbuf_list latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+        #if 0
+            // Debug mbuf list
+            struct mbuf_list *tmp = mbuf_list;
+            printf("packet_handler show mbuf list\n");
+            while (tmp != NULL) {
+                // printf("%p\n", tmp);
+                // printf("%p\n", tmp->pkt);
+                printf("%p (%p) -> ", tmp, tmp->pkt);
+                tmp = tmp->next;
+            }
+            printf("\n");
+        #endif
         break;
     default:
-        printf("[packet_handler]Unknown pkt type: %d\n", tcp_hdr->tcp_flags);
+        // printf("[packet_handler]Unknown pkt type: %d\n", tcp_hdr->tcp_flags);
         break;
     }
 
     int res_code;
-#if 0
-    struct mbuf_list *tmp = mbuf_list;
-    printf("packet_handler show mbuf list\n");
-    while (tmp != NULL) {
-        printf("%p (%p) -> ", tmp, tmp->pkt);
-        tmp = tmp->next;
-    }
-    printf("\n");
-#endif
 
     if (pkt->next == NULL)
     {

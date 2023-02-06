@@ -96,8 +96,8 @@ type ChannelData struct {
 type Pkt struct {
 	Payload_len  int
 	Start_offset int // How many bytes has been read
-	// PacketList  []*C.struct_rte_mbuf
-	PacketList *C.struct_mbuf_list
+	PacketList   *C.struct_mbuf_list
+	is_done      bool
 }
 
 type buffer struct {
@@ -377,8 +377,8 @@ func decodeToChannelData(buf []byte) (ChannelData, error) {
 	return rx_data, err
 }
 
-func swapFourTuple(four_tuple Four_tuple_rte) *Four_tuple_rte {
-	return &Four_tuple_rte{
+func swapFourTuple(four_tuple Four_tuple_rte) Four_tuple_rte {
+	return Four_tuple_rte{
 		Src_ip:   four_tuple.Dst_ip,
 		Src_port: four_tuple.Dst_port,
 		Dst_ip:   four_tuple.Src_ip,
@@ -591,6 +591,7 @@ func createConnection() *Connection {
 	var cs connState
 	conn.state = &cs
 	conn.buffer = newShareList()
+	conn.pkt = &Pkt{Payload_len: 0, Start_offset: 0, PacketList: nil, is_done: true}
 
 	return &conn
 }
@@ -608,17 +609,17 @@ func initConnectionCh(conn *Connection) {
 
 func (poll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	poll.tables.Insert(hashV4Flow(*swapFourTuple(conn.four_tuple)), conn)
+	poll.tables.Insert(hashV4Flow(swapFourTuple(conn.four_tuple)), conn)
 }
 
 func (poll *OnvmPoll) Delete(conn *Connection) error {
 	// defer TimeTrack(time.Now())
 	// Delete the connection from connection and four-tuple tables
 	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
-		var four_tuple *Four_tuple_rte = swapFourTuple(conn.four_tuple)
-		ok := poll.tables.Del(hashV4Flow(*four_tuple))
+		var four_tuple Four_tuple_rte = swapFourTuple(conn.four_tuple)
+		ok := poll.tables.Del(hashV4Flow(four_tuple))
 		if !ok {
-			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
+			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
 			err := errors.New(msg)
 			logger.Log.Errorln(msg)
 			return err
@@ -635,12 +636,13 @@ func (poll *OnvmPoll) Delete(conn *Connection) error {
 	return nil
 }
 
-func (poll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
-	swap_four_tuple := swapFourTuple(*four_tuple)
-	c, ok := poll.tables.Get(hashV4Flow(*swap_four_tuple))
+func GetConnByReverseFourTuple(four_tuple Four_tuple_rte) (*Connection, error) {
+	swap_four_tuple := swapFourTuple(four_tuple)
+	poller_index := swap_four_tuple.getPollIndex()
+	c, ok := onvmpoll[poller_index].tables.Get(hashV4Flow(swap_four_tuple))
 
 	if !ok {
-		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", *four_tuple)
+		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", four_tuple)
 
 		return nil, err
 	} else {
@@ -675,15 +677,23 @@ func (connection Connection) Read(b []byte) (int, error) {
 	var err error
 
 	// List is empty, waiting for packet
-	if connection.pkt == nil {
-		var close bool
-		connection.pkt, close = connection.buffer.recv()
+	if connection.pkt.is_done {
+		is_close := connection.buffer.recv(connection.pkt)
 
-		if close {
+		if is_close {
 			err = io.EOF
 			return length, err
 		}
 	}
+
+	// if true {
+	// 	conn, _ := GetConnByReverseFourTuple(connection.four_tuple)
+	// 	conn.pkt = connection.pkt
+	// 	// logger.Log.Errorln("Read", connection.four_tuple)
+	// 	logger.Log.Debugf("1: Conn ptr: %p, Conn pkt ptr: %p", &connection, connection.pkt)
+	// 	logger.Log.Debugf("2: Conn ptr: %p, Conn pkt ptr: %p", conn, conn.pkt)
+	// 	logger.Log.Debugf("Read, Pkt info, start offset: %v, payload length: %v", connection.pkt.Start_offset, connection.pkt.Payload_len)
+	// }
 
 	runtime.KeepAlive(b)
 
@@ -691,6 +701,7 @@ func (connection Connection) Read(b []byte) (int, error) {
 }
 
 func (connection Connection) reading(b []byte) (int, error) {
+	logger.Log.Tracef("Start Connection.reading, four-tuple: %v", connection.four_tuple)
 	// defer TimeTrack(time.Now())
 	var length int
 	var err error
@@ -703,13 +714,14 @@ func (connection Connection) reading(b []byte) (int, error) {
 	length = end_offset - connection.pkt.Start_offset
 
 	if end_offset == connection.pkt.Payload_len {
-		connection.pkt = nil
+		connection.pkt.is_done = true
 	} else {
 		connection.pkt.Start_offset = end_offset
 	}
 
 	runtime.KeepAlive(b)
 
+	logger.Log.Tracef("reading read %v (buffer_cap: %v)", length, buff_cap)
 	return length, err
 }
 
@@ -1048,21 +1060,26 @@ func newShareList() *shareList {
 	}
 }
 
-func (c *shareList) recv() (pkt *Pkt, close bool) {
+func (c *shareList) recv(pkt_buffer *Pkt) (close bool) {
 	c.cond.L.Lock()
 
 	for c.l.Len() == 0 {
 		if c.closed {
 			c.cond.L.Unlock()
-			return nil, true
+			return true
 		}
 		c.cond.Wait()
 	}
 
-	pkt = c.l.Remove(c.l.Front()).(*Pkt)
+	pkt := c.l.Remove(c.l.Front()).(*Pkt)
+	pkt_buffer.is_done = false
+	pkt_buffer.PacketList = pkt.PacketList
+	pkt_buffer.Payload_len = pkt.Payload_len
+	pkt_buffer.Start_offset = pkt.Start_offset
+
 	c.cond.Signal()
 	c.cond.L.Unlock()
-	return pkt, false
+	return false
 }
 
 func (c *shareList) send(pkt *Pkt) {
