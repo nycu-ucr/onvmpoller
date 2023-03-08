@@ -12,6 +12,8 @@ package onvmpoller
 #include <onvm_nflib.h>
 
 struct mbuf_list;
+struct ipv4_4tuple;
+struct xio_socket;
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
 extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset);
@@ -19,6 +21,8 @@ extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
 extern void test_cgo(char* ptr);
+extern void test_CondVarPut(char *condVarPtr);
+extern void* test_CondVarGet();
 */
 import "C"
 
@@ -116,6 +120,20 @@ type Connection struct {
 	pkt        *Pkt
 }
 
+type XIO_Socket struct {
+	xio_socket *C.struct_xio_socket
+	four_tuple C.struct_ipv4_4tuple
+	sync_chan  chan struct{}
+	dst_id     uint8
+}
+
+type XIO_Listener struct {
+	xio_socket    *C.struct_xio_socket
+	four_tuple    C.struct_ipv4_4tuple
+	laddr         OnvmAddr // Local Address
+	complete_chan chan *XIO_Socket
+}
+
 type connState struct {
 	is_rxchan_closed atomic.Bool
 	is_txchan_closed atomic.Bool
@@ -174,6 +192,7 @@ var (
 	local_address string
 	nf_ctx        *C.struct_onvm_nf_local_ctx
 	listener      *OnvmListener
+	xio_listener  *XIO_Listener
 	port_manager  *PortManager
 	conn_pool     sync.Pool
 
@@ -959,93 +978,6 @@ func TimeTrack(start time.Time) {
 	log.Println(fmt.Sprintf("%s took %d(ns)", name, elapsed.Nanoseconds()))
 }
 
-/* Share-memory */
-
-type sharedBuffer struct {
-	sync.Mutex
-	rcond  *sync.Cond
-	wcond  *sync.Cond
-	closed bool
-	read   int
-	write  int
-	count  int
-	size   int
-	buffer []*ChannelData
-}
-
-func newSharedBuffer(size int) *sharedBuffer {
-	s := &sharedBuffer{
-		buffer: make([]*ChannelData, size),
-		size:   size,
-	}
-	s.rcond = sync.NewCond(s)
-	s.wcond = sync.NewCond(s)
-	return s
-}
-
-func (s *sharedBuffer) close() {
-	s.Lock()
-	s.closed = true
-	s.rcond.Broadcast()
-	s.Unlock()
-}
-
-func (s *sharedBuffer) put(val *ChannelData) {
-	s.Lock()
-
-	// If the buffer is full we need to wait for space to appear
-	for s.count == s.size {
-		s.wcond.Wait()
-	}
-
-	// s.write tells us the next space that's free to write to. If we reach the
-	// end of the buffer we wrap around to the start
-	s.buffer[s.write] = val
-	s.write++
-	if s.write == s.size {
-		s.write = 0
-	}
-
-	// If the buffer was empty, then signal to anyone that's waiting as there's
-	// now data to read
-	if s.count == 0 {
-		s.rcond.Signal()
-	}
-	s.count++
-	s.Unlock()
-}
-
-func (s *sharedBuffer) get() (*ChannelData, bool) {
-	s.Lock()
-
-	// If the buffer is empty then we need to wait for some data
-	for s.count == 0 {
-		if s.closed {
-			s.Unlock()
-			return nil, true
-		}
-		s.rcond.Wait()
-	}
-
-	// s.read tells us where the next byte to read is. If we reach the end of
-	// the buffer we wrap around to the beginning
-	val := s.buffer[s.read]
-	s.read++
-	if s.read == s.size {
-		s.read = 0
-	}
-
-	// If the buffer was full, then signal to anyone waiting to write as there is
-	// now space
-	if s.count == s.size {
-		s.wcond.Signal()
-	}
-	s.count--
-
-	s.Unlock()
-	return val, false
-}
-
 type shareList struct {
 	cond   *sync.Cond
 	closed bool
@@ -1104,4 +1036,375 @@ func (c *shareList) close() {
 	c.closed = true
 	c.cond.Signal()
 	c.cond.L.Unlock()
+}
+
+/* Test channel ptr */
+func TestCgoCondWait(id int) {
+	/*
+		condVar := sync.NewCond(&sync.Mutex{})
+		// logger.Log.Warnf("[TestCgoCondWait] condVar: %p", condVar)
+
+		condVarPtr := (*C.char)(unsafe.Pointer(condVar))
+		// logger.Log.Warnf("[TestCgoCondWait] condVarPtr: %p", condVarPtr)
+
+		C.test_CondVarPut(condVarPtr)
+
+		// logger.Log.Warnf("[TestCgoCondWait] Wait on sync.Cond")
+		condVar.L.Lock()
+		condVar.Wait()
+		t := time.Now().Nanosecond()
+
+		logger.Log.Warnf("[TestCgoCondWait] Wake-up time: %d", t)
+
+		// logger.Log.Warnf("[TestCgoCondWait] Wake-up from sync.Cond")
+	*/
+	condVar := make(chan int64, 1)
+	// logger.Log.Warnf("[TestCgoCondWait] condVar: %p", &condVar)
+	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
+	// logger.Log.Warnf("[TestCgoCondWait] condVarPtr: %p", condVarPtr)
+	C.test_CondVarPut(condVarPtr)
+
+	t_start := <-condVar
+
+	t := time.Now().UnixNano()
+	close(condVar)
+	logger.Log.Warnf("[TestCgoCondWait][%d] Wake-up latency: %d", id, t-t_start)
+}
+
+func TestCgoCondSignal(id int) {
+	/*
+		condVarPtr := C.test_CondVarGet()
+		// logger.Log.Warnf("[TestCgoCondSignal] Successful get golang cond_var from clang global var")
+		// logger.Log.Warnf("[TestCgoCondSignal] condVarPtr: %p", condVarPtr)
+
+		condVar := (*sync.Cond)(condVarPtr)
+		// logger.Log.Warnf("[TestCgoCondSignal] condVar: %p", condVar)
+
+		condVar.L.Lock()
+		t := time.Now().Nanosecond()
+		condVar.Signal()
+		condVar.L.Unlock()
+
+		logger.Log.Warnf("[TestCgoCondSignal] Signal time: %d", t)
+		// logger.Log.Warnf("[TestCgoCondSignal] Signal from sync.Cond")
+	*/
+
+	condVarPtr := C.test_CondVarGet()
+	// logger.Log.Warnf("[TestCgoCondSignal] condVarPtr: %p", condVarPtr)
+	condVar := (*chan int64)(condVarPtr)
+	t := time.Now().UnixNano()
+	*condVar <- t
+	// logger.Log.Warnf("[TestCgoCondSignal][%d] Signal time: %d", id, t)
+}
+
+/*
+********************************
+
+	API for XIO listener
+
+********************************
+*/
+
+func ListenXIO(ip_addr string, port uint16) (net.Listener, error) {
+	var l net.Listener
+	var err error
+	l, err = listenXIO(ip_addr, port)
+	if err != nil {
+		return nil, err
+	}
+
+	return l, nil
+}
+
+func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
+	var four_tuple C.struct_ipv4_4tuple
+	four_tuple.ip_src = C.uint(binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16]))
+	four_tuple.port_src = C.ushort(port)
+	four_tuple.ip_dst = C.uint(binary.BigEndian.Uint32(net.ParseIP("0.0.0.0")[12:16]))
+	four_tuple.port_dst = C.ushort(0)
+
+	id, err := IpToID(ip_addr)
+	laddr := OnvmAddr{
+		service_id: uint8(id),
+		network:    "onvm",
+		ipv4_addr:  ip_addr,
+		port:       port,
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	xio_listener = &XIO_Listener{
+		laddr:         laddr,
+		four_tuple:    four_tuple,
+		complete_chan: make(chan *XIO_Socket, 100),
+	}
+
+	complete_chan_ptr := (*C.char)(unsafe.Pointer(&xio_listener.complete_chan))
+	xio_listener.xio_socket = C.xio_listen(four_tuple, complete_chan_ptr)
+	if xio_listener.xio_socket == nil {
+		msg := fmt.Sprintf("Unable to listen on %v", xio_listener.laddr.String())
+		err = errors.New(msg)
+		return nil, err
+	}
+
+	return xio_listener, nil
+}
+
+func (xl XIO_Listener) Accept() (net.Conn, error) {
+	logger.Log.Traceln("Start OnvmListener.Accept")
+	return <-xl.complete_chan, nil
+}
+
+func (xl XIO_Listener) Close() error {
+	/* TODO */
+	return nil
+}
+
+func (xl XIO_Listener) Addr() net.Addr {
+	return xl.laddr
+}
+
+/*
+********************************
+
+	API for XIO Dial
+
+********************************
+*/
+
+func DialXIO(network, address string) (net.Conn, error) {
+	logger.Log.Traceln("Start DialXIO")
+
+	ip_addr, port := parseAddress(address)
+
+	// Initialize a connection
+	// conn := createConnection()
+	conn := conn_pool.Get().(*Connection)
+	initConnectionCh(conn)
+	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
+	conn.four_tuple.Src_port = port_manager.GetPort()
+	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	conn.four_tuple.Dst_port = port
+	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
+
+	// Add the connection to table, otherwise it can't receive response
+	pollIndex := conn.four_tuple.getPollIndex()
+	onvmpoll[pollIndex].Add(conn)
+
+	dst_id, _ := IpToID(ip_addr)
+	conn.dst_id = uint8(dst_id)
+
+	// Send connection request to server
+	err := conn.writeControlMessage(ESTABLISH_CONN)
+	logger.Log.Traceln("Dial write connection create request")
+
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		conn.Close()
+		return conn, err
+	} else {
+		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
+	}
+
+	// Wait for response
+	logger.Log.Traceln("Dial wait connection create response")
+	err = conn.readACK()
+	if err != nil {
+		logger.Log.Errorln(err.Error())
+		conn.Close()
+		return conn, err
+	} else {
+		logger.Log.Traceln("Dial get connection create response")
+	}
+
+	logger.Log.Debugln("DialONVM done")
+
+	return conn, nil
+}
+
+/*
+********************************
+
+	API for XIO connection
+
+********************************
+*/
+
+// Read implements the net.Conn Read method.
+func (connection XIO_Socket) Read(b []byte) (int, error) {
+	// defer TimeTrack(time.Now())
+	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
+
+	var length int
+	var err error
+
+	// List is empty, waiting for packet
+	if connection.pkt.is_done {
+		is_close := connection.buffer.recv(connection.pkt)
+
+		if is_close {
+			err = io.EOF
+			return length, err
+		}
+	}
+
+	// if true {
+	// 	conn, _ := GetConnByReverseFourTuple(connection.four_tuple)
+	// 	conn.pkt = connection.pkt
+	// 	// logger.Log.Errorln("Read", connection.four_tuple)
+	// 	logger.Log.Debugf("1: Conn ptr: %p, Conn pkt ptr: %p", &connection, connection.pkt)
+	// 	logger.Log.Debugf("2: Conn ptr: %p, Conn pkt ptr: %p", conn, conn.pkt)
+	// 	logger.Log.Debugf("Read, Pkt info, start offset: %v, payload length: %v", connection.pkt.Start_offset, connection.pkt.Payload_len)
+	// }
+
+	runtime.KeepAlive(b)
+
+	return connection.reading(b)
+}
+
+func (connection XIO_Socket) reading(b []byte) (int, error) {
+	logger.Log.Tracef("Start Connection.reading, four-tuple: %v", connection.four_tuple)
+	// defer TimeTrack(time.Now())
+	var length int
+	var err error
+
+	buff_cap := cap(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
+	// length, err2 = buffer.Read(b)
+	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset))
+	end_offset := int(offset)
+	length = end_offset - connection.pkt.Start_offset
+
+	if end_offset == connection.pkt.Payload_len {
+		connection.pkt.is_done = true
+	} else {
+		connection.pkt.Start_offset = end_offset
+	}
+
+	runtime.KeepAlive(b)
+
+	logger.Log.Tracef("reading read %v (buffer_cap: %v)", length, buff_cap)
+	return length, err
+}
+
+// Read ACK
+func (connection XIO_Socket) readACK() error {
+	// defer TimeTrack(time.Now())
+	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
+
+	var err error
+	// Receive packet from onvmpoller
+	_, ok := <-connection.sync_chan
+
+	if !ok {
+		err = fmt.Errorf("EOF")
+	}
+
+	return err
+}
+
+// Write implements the net.Conn Write method.
+func (connection XIO_Socket) Write(b []byte) (int, error) {
+	// defer TimeTrack(time.Now())
+	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
+	logger.Log.Debugf("Write %d data.", len(b))
+
+	len := len(b)
+	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
+
+	// Translate Go structure to C char *
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(b))
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
+
+	// Use CGO to call functions of NFLib
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
+		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
+		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
+		buffer_ptr, C.int(len))
+
+	runtime.KeepAlive(b)
+
+	return len, nil
+}
+
+// For connection control message
+func (connection XIO_Socket) writeControlMessage(msg_type int) error {
+	// defer TimeTrack(time.Now())
+	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
+
+	// buffer := makeConnCtrlMsg(msg_type)
+	// Translate Go structure to C char *
+	// var buffer_ptr *C.char
+	// buffer_ptr = (*C.char)(C.CBytes(buffer))
+	// buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
+
+	// Use CGO to call functions of NFLib
+	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
+		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
+		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
+		nil, C.int(0))
+
+	return nil
+}
+
+// Close implements the net.Conn Close method.
+func (connection XIO_Socket) Close() error {
+	var err error
+
+	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
+
+	if !connection.state.is_txchan_closed.Load() {
+		// Notify peer connection can be closed
+		connection.writeControlMessage(CLOSE_CONN)
+
+		// Close local connection
+		connection.state.is_txchan_closed.Store(true)
+
+		pollIndex := connection.four_tuple.getPollIndex()
+		err = onvmpoll[pollIndex].Delete(&connection)
+	}
+
+	return err
+}
+
+// LocalAddr implements the net.Conn LocalAddr method.
+func (connection XIO_Socket) LocalAddr() net.Addr {
+	var oa OnvmAddr
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
+	oa.port = connection.four_tuple.Src_port
+	oa.network = "onvm"
+	id, _ := IpToID(oa.ipv4_addr)
+	oa.service_id = uint8(id)
+
+	return oa
+}
+
+// RemoteAddr implements the net.Conn RemoteAddr method.
+func (connection XIO_Socket) RemoteAddr() net.Addr {
+	var oa OnvmAddr
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
+	oa.port = connection.four_tuple.Dst_port
+	oa.network = "onvm"
+	id, _ := IpToID(oa.ipv4_addr)
+	oa.service_id = uint8(id)
+
+	return oa
+}
+
+// SetDeadline implements the net.Conn SetDeadline method.
+func (connection XIO_Socket) SetDeadline(t time.Time) error {
+	return nil
+}
+
+// SetReadDeadline implements the net.Conn SetReadDeadline method.
+func (connection XIO_Socket) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+// SetWriteDeadline implements the net.Conn SetWriteDeadline method.
+func (connection XIO_Socket) SetWriteDeadline(t time.Time) error {
+	return nil
 }

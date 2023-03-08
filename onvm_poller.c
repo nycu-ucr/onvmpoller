@@ -1,39 +1,88 @@
 #include "onvm_nflib.h"
 #include "_cgo_export.h"
 #include "string.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <arpa/inet.h>
 #include <time.h>
 
 // extern int DeliverPacket(struct mbuf_list *, int, char *, int, uint32, uint16, uint32, uint16)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
-void get_monotonic_time(struct timespec* ts);
-long get_time_nano(struct timespec* ts);
-double get_elapsed_time_sec(struct timespec* before, struct timespec* after);
-long get_elapsed_time_nano(struct timespec* before, struct timespec* after);
+void get_monotonic_time(struct timespec *ts);
+long get_time_nano(struct timespec *ts);
+double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
+long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
+int xio_read(struct xio_socket* xs, uint8_t *buffer, int buffer_length);
+
+/*
+********************************
+
+	        Define
+
+********************************
+*/
+
+/* PKT TYPE */
 #define HTTP_FRAME 0
 #define ESTABLISH_CONN 1
 #define CLOSE_CONN 2
 #define REPLY_CONN 3
 #define BIG_FRAME 4
+
+/* const */
 #define TCP_PROTO_NUM 0x06
+
+/* dpdk config*/
 #define MBUF_SIZE 4096
+
+/* Socket type */
+#define LISTENER_SOCKET 1
+#define XIO_SOCKET 2
+
+/* Socket status */
+#define NEW_SOCKET 0
+#define LISTENING 1
+#define WAITING_EST_ACK 2
+#define EST_COMPLETE 3
+#define RX_CLOSED 4
+#define TX_CLOSED 5
+#define RX_TX_CLOSED 6
+#define READER_WAITING 7
+
+/*
+********************************
+
+	   Global variables
+
+********************************
+*/
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
 uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
 uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
 
-/* Global mempool */
 struct rte_mempool *pktmbuf_pool;
+struct rte_hash *conn_tables;
+struct rte_hash *IpToID;
+struct onvm_nf_local_ctx *globalVar_nf_local_ctx;
 
-int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
+/*
+********************************
 
-struct four_tuple
+	       Structures
+
+********************************
+*/
+
+struct ipv4_4tuple
 {
-    rte_be32_t src_addr; /**< source address */
-    rte_be16_t src_port; /**< TCP source port. */
-    rte_be32_t dst_addr; /**< destination address */
-    rte_be16_t dst_port; /**< TCP destination port. */
+    uint32_t ip_dst;
+    uint32_t ip_src;
+    uint16_t port_dst;
+    uint16_t port_src;
 };
 
 struct mbuf_list
@@ -41,6 +90,80 @@ struct mbuf_list
     struct rte_mbuf *pkt;
     struct mbuf_list *next;
 };
+
+struct socket_buffer
+{
+    int is_done;
+    int payload_len;
+    int start_offset;
+    struct mbuf_list *pkt;
+};
+
+struct buffer
+{
+    uint8_t *buf;
+    int buf_len;
+};
+
+struct conn_request
+{
+    struct ipv4_4tuple fourTuple;
+    struct conn_request *next;
+};
+
+struct xio_socket
+{
+    int status;
+    int socket_type;
+
+    int service_id;
+    struct ipv4_4tuple fourTuple;
+
+    struct socket_buffer socket_buf;
+    struct buffer recieve_buf;
+
+    /* Only used when socket type is LISTENER_SOCKET */
+    struct conn_request *conn_request;
+
+    char *go_channel_ptr;
+    rte_rwlock_t *rwlock;
+};
+
+/*
+********************************
+
+	       Functions
+
+********************************
+*/
+
+static inline void insert_IpToID(uint32_t ip, int id)
+{
+    int ret;
+    uint32_t *ip_p = (uint32_t *)malloc(sizeof(uint32_t));
+    int *id_p = (int *)malloc(sizeof(int));
+    *ip_p = ip;
+    *id_p = id;
+
+    ret = rte_hash_add_key_data(IpToID, (void *)ip_p, (void *)id_p);
+    if (ret < 0) {
+        rte_exit(EXIT_FAILURE, "[insert_IpToID] Unable to add to IpToID\n");
+    }
+}
+
+// Return service_id or -1(failed)
+static inline int convert_IpToID(uint32_t ip){
+    int* service_id_ptr = NULL;
+
+    int ret = rte_hash_lookup_data(IpToID, &ip, (void**) &service_id_ptr);
+    if (ret < 0) {
+        return -1;
+    }
+
+    int service_id = *service_id_ptr;
+
+    return service_id;
+}
 
 static inline struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt)
 {
@@ -80,11 +203,6 @@ void delete_mbuf_list(struct mbuf_list *list)
     return;
 }
 
-struct four_tuple_str
-{
-    char *tuples[4];
-};
-
 static inline int string_len(char *p)
 {
     unsigned int count = 0;
@@ -106,21 +224,25 @@ pkt_tcp_hdr(struct rte_mbuf *pkt)
     return (struct rte_tcp_hdr *)pkt_data;
 }
 
-void get_monotonic_time(struct timespec* ts) {
+void get_monotonic_time(struct timespec *ts)
+{
     clock_gettime(CLOCK_MONOTONIC, ts);
 }
 
-long get_time_nano(struct timespec* ts) {
+long get_time_nano(struct timespec *ts)
+{
     return (long)ts->tv_sec * 1e9 + ts->tv_nsec;
 }
 
-double get_elapsed_time_sec(struct timespec* before, struct timespec* after) {
-    double deltat_s  = after->tv_sec - before->tv_sec;
+double get_elapsed_time_sec(struct timespec *before, struct timespec *after)
+{
+    double deltat_s = after->tv_sec - before->tv_sec;
     double deltat_ns = after->tv_nsec - before->tv_nsec;
-    return deltat_s + deltat_ns*1e-9;
+    return deltat_s + deltat_ns * 1e-9;
 }
 
-long get_elapsed_time_nano(struct timespec* before, struct timespec* after) {
+long get_elapsed_time_nano(struct timespec *before, struct timespec *after)
+{
     return get_time_nano(after) - get_time_nano(before);
 }
 
@@ -174,6 +296,61 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
         onvm_nflib_stop(*nf_local_ctx);
         rte_exit(EXIT_FAILURE, "Cannot find mbuf pool!\n");
     }
+
+    /* Create connection look-up table */
+    struct rte_hash_parameters xio_ipv4_hash_params = {
+        .name = "conn_table",
+        .entries = L3FWD_HASH_ENTRIES,
+        .key_len = sizeof(struct ipv4_4tuple),
+        .hash_func = DEFAULT_HASH_FUNC, // rte_hash_crc may be faster but the key need to be less related
+        .hash_func_init_val = 0,
+        .extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY,
+    };
+    conn_tables = rte_hash_create(&xio_ipv4_hash_params);
+    if (conn_tables == NULL)
+    {
+        rte_exit(EXIT_FAILURE, "Unable to create the connection lookup table\n");
+    }
+
+    /* Create IP address to openNetVM's NFID */
+    struct rte_hash_parameters xio_IpToID_hash_params = {
+        .name = "IpToID",
+        .entries = (uint32_t)256,
+        .key_len = sizeof(uint32_t),
+        .hash_func = DEFAULT_HASH_FUNC,
+        .hash_func_init_val = 0,
+    };
+    IpToID = rte_hash_create(&xio_IpToID_hash_params);
+    if (IpToID == NULL)
+    {
+        rte_exit(EXIT_FAILURE, "Unable to create the IpToID table\n");
+    }
+    // Parse the input lines and insert the key-value pairs into the hash table.
+    FILE* fp = fopen("ipid.yaml", "r");
+    char line[256];
+    while (fgets(line, 256, fp) != NULL) {
+        // Skip comment lines and empty lines.
+        if (line[0] == '#' || line[0] == '\n') {
+            continue;
+        }
+
+        // Parse the IP address and service ID from the input line.
+        char* ip_str = strtok(line, ":");
+        char* service_id_str = strtok(NULL, " ");
+
+        // Convert the IP address string to a uint32_t.
+        uint32_t ip_addr = inet_addr(ip_str);
+
+        // Convert the service ID string to an integer.
+        int service_id = atoi(service_id_str);
+
+        // Insert the IP address and service ID into the hash table.
+        insert_IpToID(ip_addr, service_id);
+    }
+    fclose(fp);
+
+    /* Set the nf_local_ctx to global variable */
+    globalVar_nf_local_ctx = *nf_local_ctx;
 
     return 0;
 }
@@ -670,51 +847,37 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     return end_offset;
 }
 
-// int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset)
-// {
-//     int offset = 0;
-//     int End_offset = Start_offset;
-//     int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+static inline void handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
+{
+    struct mbuf_list *mbuf_list;
+    mbuf_list = create_mbuf_list(pkt);
 
-//     // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
-//     if (buff_cap < first_segm_payload_len - Start_offset)
-//     {
-//         /* Target buffer cap is smaller than data left in pkt*/
-//         offset = buff_cap;
-//     }
-//     else
-//     {
-//         /* Target buffer cap is larger than data left in first mbuf */
-//         offset = first_segm_payload_len - Start_offset;
-//     }
+    int payload_len = 0;
+    uint8_t *payload;
+    if (pkt->next == NULL)
+    {
+        payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+        payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    }
+    else
+    {
+        payload_len = calculate_payload_len(pkt);
+    }
 
-//     uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-//     rte_memcpy(buffer_ptr, data + Start_offset, offset);
-//     End_offset = End_offset + offset;
+    int ret;
+    struct xio_socket *xs;
+    ret = rte_hash_lookup_data(conn_tables, four_tuple, (void **)&xs);
+    rte_rwlock_write_lock(xs->rwlock);
 
-//     // int empty_space = buff_cap - offset;
-//     // if (!empty_space)
-//     // {
-//     //     /* No space left in target buff */
-//     //     return End_offset
-//     // };
+    if(xs->recieve_buf.buf != NULL){
 
-//     // uint16_t mbuf_size = rte_pktmbuf_tailroom(head);
-//     // pkt = pkt->next;
+    }
 
-//     // while (pkt != NULL)
-//     // {
-//     //     // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
-//     //     uint8_t *src = rte_pktmbuf_mtod(pkt, uint8_t *);
-//     //     int offset = calculate_offset(empty_space, pkt->data_len);
+    int res_code;
+    res_code = XIO_wait(mbuf_list, HTTP_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
 
-//     //     rte_memcpy(buffer_ptr + End_offset, src, offset);
-//     //     End_offset = End_offset + offset;
-//     //     pkt = pkt->next;
-//     // }
-
-//     return End_offset;
-// }
+    return;
+}
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
 {
@@ -752,8 +915,16 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         // printf("Error packet is not TCP packet\n");
         return -1;
     }
-    tcp_hdr = pkt_tcp_hdr(pkt);
 
+    struct ipv4_4tuple four_tuple = {
+        .ip_dst = ipv4_hdr->dst_addr,
+        .ip_src = ipv4_hdr->src_addr,
+        .port_dst = tcp_hdr->dst_port,
+        .port_src = tcp_hdr->src_port,
+    };
+
+    /* Check the packet type */
+    tcp_hdr = pkt_tcp_hdr(pkt);
     switch (tcp_hdr->tcp_flags)
     {
     case RTE_TCP_SYN_FLAG:
@@ -769,9 +940,9 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         pkt_type = HTTP_FRAME;
         // get_monotonic_time(&t_start);
         mbuf_list = create_mbuf_list(pkt);
-        // get_monotonic_time(&t_end);
-        // printf("[ONVM] create_mbuf_list latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
-        #if 0
+// get_monotonic_time(&t_end);
+// printf("[ONVM] create_mbuf_list latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+#if 0
             // Debug mbuf list
             struct mbuf_list *tmp = mbuf_list;
             printf("packet_handler show mbuf list\n");
@@ -782,7 +953,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
                 tmp = tmp->next;
             }
             printf("\n");
-        #endif
+#endif
         break;
     default:
         // printf("[packet_handler]Unknown pkt type: %d\n", tcp_hdr->tcp_flags);
@@ -813,10 +984,198 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     return res_code;
 }
 
-void test_cgo(char* ptr)
+void test_cgo(char *ptr)
 {
-    char* tmp = (char*)malloc(sizeof(char)*8);
+    char *tmp = (char *)malloc(sizeof(char) * 8);
     strncpy(tmp, ptr, 8);
     free(tmp);
     return;
+}
+
+char *conditon_var;
+
+/* Test wake-up latency by using golang condition var */
+void test_CondVarPut(char *condVarPtr)
+{
+    conditon_var = condVarPtr;
+    // printf("[test_CondVarPut] Successful assign golang cond_var into clang global var\n");
+
+    return;
+}
+
+void *test_CondVarGet()
+{
+    // printf("[test_CondVarGet] Start to get golang cond_var from clang global var\n");
+    return conditon_var;
+}
+
+struct xio_socket* xio_new_socket(int socket_type, int service_id, struct ipv4_4tuple four_tuple, char *sem)
+{
+    struct xio_socket *xs = (struct xio_socket *)malloc(sizeof(struct xio_socket));
+
+    xs->status = NEW_SOCKET;
+    xs->socket_type = socket_type;
+
+    xs->service_id = service_id;
+    xs->fourTuple = four_tuple;
+
+    xs->socket_buf.pkt = NULL;
+    xs->socket_buf.is_done = 0;
+    xs->socket_buf.payload_len = 0;
+    xs->socket_buf.start_offset = 0;
+    xs->recieve_buf.buf = NULL;
+    xs->recieve_buf.buf_len = 0;
+    xs->conn_request = NULL;
+
+    xs->go_channel_ptr = sem;
+    xs->rwlock = (rte_rwlock_t *)malloc(sizeof(rte_rwlock_t));
+
+    /* Init rwlock */
+    rte_rwlock_init(xs->rwlock);
+
+    /* populate into table*/
+    int ret;
+    ret = rte_hash_add_key_data(conn_tables, (void *)&four_tuple, (void *)&xs);
+    if (ret < 0) {
+        printf("[xio_new_socket] Unable to add to conn_tables\n");
+    }
+
+    return xs;
+}
+
+int xio_write(struct xio_socket* xs, uint8_t *buffer, int buffer_length)
+{
+    onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, HTTP_FRAME,
+                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                  (char*)buffer, buffer_length);
+
+    return buffer_length;
+}
+
+int xio_read(struct xio_socket* xs, uint8_t *buffer, int buffer_length)
+{
+    /* If the ret val < 0, which means there are no pkt yet */
+    int ret = 0;
+
+    struct mbuf_list *pkt;
+    rte_rwlock_read_lock(xs->rwlock);
+    pkt = xs->socket_buf.pkt;
+    rte_rwlock_read_unlock(xs->rwlock);
+
+    if (pkt != NULL){
+        /* Already have pkt in socket's buffer
+           so we can directly call payload_assemble
+        */
+        int end_offset = payload_assemble(buffer, buffer_length, pkt, xs->socket_buf.start_offset);
+
+        rte_rwlock_write_lock(xs->rwlock);
+        ret = end_offset - xs->socket_buf.start_offset;
+        if(end_offset == xs->socket_buf.payload_len){
+            xs->socket_buf.is_done = 1;
+        } else {
+            xs->socket_buf.start_offset = end_offset;
+        }
+        rte_rwlock_write_unlock(xs->rwlock);
+    } else {
+        /* No pkt in socket's buffer
+           so we have to hook up a recieve buffer
+           and change the socket's status
+        */
+        rte_rwlock_write_lock(xs->rwlock);
+        xs->recieve_buf.buf = buffer;
+        xs->recieve_buf.buf_len = buffer_length;
+        xs->status = READER_WAITING;
+        rte_rwlock_write_unlock(xs->rwlock);
+
+        ret = -1;
+    }
+
+    return ret;
+}
+
+struct xio_socket* xio_connect(struct ipv4_4tuple four_tuple, char *sem)
+{
+    /* Check whether the ip-address is valid */
+    int service_id = 0;
+    service_id = convert_IpToID(four_tuple.ip_dst);
+    if(service_id < 0){
+        printf("[xio_connect] Unable to convert IpToID\n");
+        return NULL;
+    }
+
+    /* Create new XIO socket structure */
+    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, four_tuple, sem);
+
+    /* Send ESTABLISH control message */
+    onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, ESTABLISH_CONN,
+                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                  NULL, 0);
+
+    /* Set socket status to waiting ESTABLISH_ACK */
+    rte_rwlock_write_lock(xs->rwlock);
+    if(xs != NULL){
+        xs->status = WAITING_EST_ACK;
+    }
+    rte_rwlock_write_unlock(xs->rwlock);
+
+    return xs;
+}
+
+struct xio_socket* xio_accept(struct xio_socket* listener, int service_id, struct ipv4_4tuple four_tuple, char *sem)
+{
+    /* Check if the listener buffer exist ESTABLISH_CONN request */
+    struct conn_request * req = NULL;
+    rte_rwlock_write_lock(listener->rwlock);
+    if(listener->conn_request == NULL){
+        /* No ESTABLISH_CONN exist */
+        rte_rwlock_write_unlock(listener->rwlock);
+        return NULL;
+    } else {
+        req = listener->conn_request;
+        listener->conn_request = listener->conn_request->next;
+    }
+    rte_rwlock_write_unlock(listener->rwlock);
+
+    /* Check whether the ip-address is valid */
+    int service_id = 0;
+    service_id = convert_IpToID(req->fourTuple.ip_src);
+    if(service_id < 0){
+        printf("[xio_accept] Unable to convert IpToID\n");
+        return NULL;
+    }
+
+    /* Exist ESTABLISH_CONN request need to be handled */
+    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, four_tuple, sem);
+
+    /* Send ESTABLISH_ACK control message */
+    onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, REPLY_CONN,
+                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                  NULL, 0);
+
+    rte_rwlock_write_lock(xs->rwlock);
+    xs->status = EST_COMPLETE;
+    rte_rwlock_write_unlock(xs->rwlock);
+
+    return xs;
+}
+
+struct xio_socket* xio_listen(struct ipv4_4tuple four_tuple, char *complete_chan_ptr)
+{
+    /* Check whether the ip-address is valid */
+    int service_id = 0;
+    service_id = convert_IpToID(four_tuple.ip_src);
+    if(service_id < 0){
+        printf("[xio_listen] Unable to convert IpToID\n");
+        return NULL;
+    }
+
+    struct xio_socket *xs = xio_new_socket(LISTENER_SOCKET, service_id, four_tuple, complete_chan_ptr);
+
+    rte_rwlock_write_lock(xs->rwlock);
+    if(xs != NULL){
+        xs->status = LISTENING;
+    }
+    rte_rwlock_write_unlock(xs->rwlock);
+
+    return xs;
 }
