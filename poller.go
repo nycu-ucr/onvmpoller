@@ -17,12 +17,18 @@ struct xio_socket;
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
 extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset);
-extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
+extern int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
 extern void test_cgo(char* ptr);
 extern void test_CondVarPut(char *condVarPtr);
 extern void* test_CondVarGet();
+extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
+extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
+extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
+extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
+extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
+
 */
 import "C"
 
@@ -68,7 +74,7 @@ const (
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
-	LOG_LEVEL = logrus.WarnLevel
+	LOG_LEVEL = logrus.TraceLevel
 	// Packet manager numbers
 	ONVM_POLLER_NUM = 8
 )
@@ -120,18 +126,18 @@ type Connection struct {
 	pkt        *Pkt
 }
 
-type XIO_Socket struct {
+type XIO_Connection struct {
 	xio_socket *C.struct_xio_socket
-	four_tuple C.struct_ipv4_4tuple
+	four_tuple Four_tuple_rte
 	sync_chan  chan struct{}
 	dst_id     uint8
 }
 
 type XIO_Listener struct {
 	xio_socket    *C.struct_xio_socket
-	four_tuple    C.struct_ipv4_4tuple
+	four_tuple    Four_tuple_rte
 	laddr         OnvmAddr // Local Address
-	complete_chan chan *XIO_Socket
+	complete_chan chan *XIO_Connection
 }
 
 type connState struct {
@@ -439,36 +445,34 @@ func runPktWorker() {
 	}
 }
 
-//export DeliverPacket
-func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+//export XIO_wait
+func XIO_wait(packet_type C.int, go_channel_ptr *C.void) int {
 	// defer TimeTrack(time.Now())
 	/* Put the packet into the right queue */
 	res_code := 0
 
-	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
 	pktType := int(packet_type)
-
-	pollIndex := four_tuple.getPollIndex()
+	logger.Log.Tracef("[XIO_wait] PKT_TYPE:%d go_channel_ptr:%p", pktType, unsafe.Pointer(go_channel_ptr))
 
 	switch pktType {
 	case HTTP_FRAME:
-		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload_len: int(buf_len), PacketList: pkt_list}
-		// log.Println(fmt.Sprintf("DeliverPacket (now) %d(ns)", time.Now().Nanosecond()))
-		onvmpoll[pollIndex].frameHandler(&rxdata)
-		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
+		channel := (*chan struct{})(unsafe.Pointer(go_channel_ptr))
+		*channel <- struct{}{}
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
-		onvmpoll[pollIndex].syn_chan <- &four_tuple
+		channel := (*chan *XIO_Connection)(unsafe.Pointer(go_channel_ptr))
+		*channel <- nil
 	case REPLY_CONN:
 		// Handle by replyHandler
-		onvmpoll[pollIndex].ack_chan <- &four_tuple
+		channel := (*chan struct{})(unsafe.Pointer(go_channel_ptr))
+		*channel <- struct{}{}
 	case CLOSE_CONN:
 		// Handle by finFrameHandler
 		// payload := make([]byte, buf_len)
 		// buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
 		// C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
-		rxdata := ChannelData{PacketType: CLOSE_CONN, FourTuple: four_tuple}
-		onvmpoll[pollIndex].fin_frame_chan <- &rxdata
+		// rxdata := ChannelData{PacketType: CLOSE_CONN, FourTuple: four_tuple}
+		// onvmpoll[pollIndex].fin_frame_chan <- &rxdata
 		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	}
 
@@ -914,9 +918,11 @@ func DialONVM(network, address string) (net.Conn, error) {
 	// conn := createConnection()
 	conn := conn_pool.Get().(*Connection)
 	initConnectionCh(conn)
-	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
+	// conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
+	conn.four_tuple.Src_ip = inet_addr(local_address)
 	conn.four_tuple.Src_port = port_manager.GetPort()
-	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	// conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
 	conn.four_tuple.Dst_port = port
 	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
 
@@ -1105,7 +1111,18 @@ func TestCgoCondSignal(id int) {
 ********************************
 */
 
-func ListenXIO(ip_addr string, port uint16) (net.Listener, error) {
+func ListenXIO(network, address string) (net.Listener, error) {
+	logger.Log.Traceln("Start ListenXIO")
+	logger.Log.Debugf("Listen at %s", address)
+
+	if network != "onvm" {
+		msg := fmt.Sprintf("Unsppourt network type: %v", network)
+		err := errors.New(msg)
+		return nil, err
+	}
+	ip_addr, port := parseAddress(address)
+	local_address = ip_addr
+
 	var l net.Listener
 	var err error
 	l, err = listenXIO(ip_addr, port)
@@ -1117,11 +1134,12 @@ func ListenXIO(ip_addr string, port uint16) (net.Listener, error) {
 }
 
 func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
-	var four_tuple C.struct_ipv4_4tuple
-	four_tuple.ip_src = C.uint(binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16]))
-	four_tuple.port_src = C.ushort(port)
-	four_tuple.ip_dst = C.uint(binary.BigEndian.Uint32(net.ParseIP("0.0.0.0")[12:16]))
-	four_tuple.port_dst = C.ushort(0)
+	var four_tuple Four_tuple_rte
+	// four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	four_tuple.Src_ip = inet_addr(ip_addr)
+	four_tuple.Src_port = port
+	four_tuple.Dst_ip = 0
+	four_tuple.Dst_port = 0
 
 	id, err := IpToID(ip_addr)
 	laddr := OnvmAddr{
@@ -1138,23 +1156,49 @@ func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
 	xio_listener = &XIO_Listener{
 		laddr:         laddr,
 		four_tuple:    four_tuple,
-		complete_chan: make(chan *XIO_Socket, 100),
+		complete_chan: make(chan *XIO_Connection, 100),
 	}
 
 	complete_chan_ptr := (*C.char)(unsafe.Pointer(&xio_listener.complete_chan))
-	xio_listener.xio_socket = C.xio_listen(four_tuple, complete_chan_ptr)
-	if xio_listener.xio_socket == nil {
+
+	xs := C.xio_listen(C.uint32_t(xio_listener.four_tuple.Src_ip), C.uint16_t(xio_listener.four_tuple.Src_port),
+		C.uint32_t(xio_listener.four_tuple.Dst_ip), C.uint16_t(xio_listener.four_tuple.Dst_port), complete_chan_ptr)
+	if xs == nil {
 		msg := fmt.Sprintf("Unable to listen on %v", xio_listener.laddr.String())
 		err = errors.New(msg)
 		return nil, err
 	}
 
+	xio_listener.xio_socket = xs
+
 	return xio_listener, nil
 }
 
 func (xl XIO_Listener) Accept() (net.Conn, error) {
-	logger.Log.Traceln("Start OnvmListener.Accept")
-	return <-xl.complete_chan, nil
+	logger.Log.Traceln("Start XIO_Listener.Accept")
+	// logger.Log.Traceln("xl.complete_chan: %p", xl.complete_chan)
+	_, ok := <-xl.complete_chan
+
+	if !ok {
+		err := fmt.Errorf("Accept EOF")
+		return nil, err
+	}
+
+	condVar := make(chan struct{}, 1)
+	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
+	xs := C.xio_accept(xl.xio_socket, condVarPtr)
+	if xs == nil {
+		msg := fmt.Sprintf("Unable to accept on %v", xio_listener.laddr.String())
+		err := errors.New(msg)
+		return nil, err
+	}
+
+	connection := &XIO_Connection{
+		xio_socket: xs,
+		sync_chan:  condVar,
+	}
+
+	return connection, nil
 }
 
 func (xl XIO_Listener) Close() error {
@@ -1180,28 +1224,26 @@ func DialXIO(network, address string) (net.Conn, error) {
 	ip_addr, port := parseAddress(address)
 
 	// Initialize a connection
-	// conn := createConnection()
-	conn := conn_pool.Get().(*Connection)
-	initConnectionCh(conn)
-	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
+	var conn XIO_Connection
+	conn.four_tuple.Src_ip = inet_addr(local_address)
 	conn.four_tuple.Src_port = port_manager.GetPort()
-	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
+	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
 	conn.four_tuple.Dst_port = port
-	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
 
-	// Add the connection to table, otherwise it can't receive response
-	pollIndex := conn.four_tuple.getPollIndex()
-	onvmpoll[pollIndex].Add(conn)
+	condVar := make(chan struct{}, 1)
+	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
+	conn.sync_chan = condVar
 
 	dst_id, _ := IpToID(ip_addr)
 	conn.dst_id = uint8(dst_id)
 
 	// Send connection request to server
-	err := conn.writeControlMessage(ESTABLISH_CONN)
-	logger.Log.Traceln("Dial write connection create request")
+	xs := C.xio_connect(C.uint32_t(conn.four_tuple.Src_ip), C.uint16_t(conn.four_tuple.Src_port),
+		C.uint32_t(conn.four_tuple.Dst_ip), C.uint16_t(conn.four_tuple.Dst_port), condVarPtr)
+	conn.xio_socket = xs
 
-	if err != nil {
-		logger.Log.Errorln(err.Error())
+	if conn.xio_socket == nil {
+		err := fmt.Errorf("Read ACK failed")
 		conn.Close()
 		return conn, err
 	} else {
@@ -1210,13 +1252,12 @@ func DialXIO(network, address string) (net.Conn, error) {
 
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
-	err = conn.readACK()
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		conn.Close()
-		return conn, err
-	} else {
-		logger.Log.Traceln("Dial get connection create response")
+	_, ok := <-condVar
+
+	if !ok {
+		err := fmt.Errorf("Read ACK failed")
+
+		return nil, err
 	}
 
 	logger.Log.Debugln("DialONVM done")
@@ -1233,178 +1274,137 @@ func DialXIO(network, address string) (net.Conn, error) {
 */
 
 // Read implements the net.Conn Read method.
-func (connection XIO_Socket) Read(b []byte) (int, error) {
+func (connection XIO_Connection) Read(b []byte) (int, error) {
 	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
 
 	var length int
 	var err error
 
-	// List is empty, waiting for packet
-	if connection.pkt.is_done {
-		is_close := connection.buffer.recv(connection.pkt)
+	buffer_len := len(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-		if is_close {
+	/*
+		[Return]
+		>0: read size
+		 0: no pkt in socket buffer
+		-1: EOF
+	*/
+	ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len))
+	read_len := int(ret)
+	logger.Log.Tracef("C.xio_read return=%d, four-tuple: %v", read_len, connection.four_tuple)
+
+	if read_len == -1 {
+		err = io.EOF
+		return length, err
+	} else if read_len == 0 {
+		// Wait for pkt
+		_, ok := <-connection.sync_chan
+
+		if !ok {
 			err = io.EOF
 			return length, err
 		}
 	}
 
-	// if true {
-	// 	conn, _ := GetConnByReverseFourTuple(connection.four_tuple)
-	// 	conn.pkt = connection.pkt
-	// 	// logger.Log.Errorln("Read", connection.four_tuple)
-	// 	logger.Log.Debugf("1: Conn ptr: %p, Conn pkt ptr: %p", &connection, connection.pkt)
-	// 	logger.Log.Debugf("2: Conn ptr: %p, Conn pkt ptr: %p", conn, conn.pkt)
-	// 	logger.Log.Debugf("Read, Pkt info, start offset: %v, payload length: %v", connection.pkt.Start_offset, connection.pkt.Payload_len)
-	// }
-
 	runtime.KeepAlive(b)
 
-	return connection.reading(b)
-}
-
-func (connection XIO_Socket) reading(b []byte) (int, error) {
-	logger.Log.Tracef("Start Connection.reading, four-tuple: %v", connection.four_tuple)
-	// defer TimeTrack(time.Now())
-	var length int
-	var err error
-
-	buff_cap := cap(b)
-	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
-	// length, err2 = buffer.Read(b)
-	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset))
-	end_offset := int(offset)
-	length = end_offset - connection.pkt.Start_offset
-
-	if end_offset == connection.pkt.Payload_len {
-		connection.pkt.is_done = true
-	} else {
-		connection.pkt.Start_offset = end_offset
-	}
-
-	runtime.KeepAlive(b)
-
-	logger.Log.Tracef("reading read %v (buffer_cap: %v)", length, buff_cap)
 	return length, err
 }
 
-// Read ACK
-func (connection XIO_Socket) readACK() error {
-	// defer TimeTrack(time.Now())
-	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
-
-	var err error
-	// Receive packet from onvmpoller
-	_, ok := <-connection.sync_chan
-
-	if !ok {
-		err = fmt.Errorf("EOF")
-	}
-
-	return err
-}
-
 // Write implements the net.Conn Write method.
-func (connection XIO_Socket) Write(b []byte) (int, error) {
+func (connection XIO_Connection) Write(b []byte) (int, error) {
 	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 	logger.Log.Debugf("Write %d data.", len(b))
 
-	len := len(b)
-	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
-
-	// Translate Go structure to C char *
-	// var buffer_ptr *C.char
-	// buffer_ptr = (*C.char)(C.CBytes(b))
-	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
+	buffer_len := len(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
 	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
-		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
-		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len))
+	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len))
+	write_len := int(ret)
+	if write_len < 0 {
+		err := fmt.Errorf("xio_write error")
+		return -1, err
+	}
 
 	runtime.KeepAlive(b)
 
-	return len, nil
-}
-
-// For connection control message
-func (connection XIO_Socket) writeControlMessage(msg_type int) error {
-	// defer TimeTrack(time.Now())
-	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
-
-	// buffer := makeConnCtrlMsg(msg_type)
-	// Translate Go structure to C char *
-	// var buffer_ptr *C.char
-	// buffer_ptr = (*C.char)(C.CBytes(buffer))
-	// buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
-
-	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
-		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
-		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		nil, C.int(0))
-
-	return nil
+	return write_len, nil
 }
 
 // Close implements the net.Conn Close method.
-func (connection XIO_Socket) Close() error {
+func (connection XIO_Connection) Close() error {
 	var err error
 
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
-	if !connection.state.is_txchan_closed.Load() {
-		// Notify peer connection can be closed
-		connection.writeControlMessage(CLOSE_CONN)
+	// if !connection.state.is_txchan_closed.Load() {
+	// 	// Notify peer connection can be closed
+	// 	connection.writeControlMessage(CLOSE_CONN)
 
-		// Close local connection
-		connection.state.is_txchan_closed.Store(true)
+	// 	// Close local connection
+	// 	connection.state.is_txchan_closed.Store(true)
 
-		pollIndex := connection.four_tuple.getPollIndex()
-		err = onvmpoll[pollIndex].Delete(&connection)
-	}
+	// 	pollIndex := connection.four_tuple.getPollIndex()
+	// 	err = onvmpoll[pollIndex].Delete(&connection)
+	// }
+
+	/* TODO */
 
 	return err
 }
 
 // LocalAddr implements the net.Conn LocalAddr method.
-func (connection XIO_Socket) LocalAddr() net.Addr {
+func (connection XIO_Connection) LocalAddr() net.Addr {
 	var oa OnvmAddr
-	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
-	oa.port = connection.four_tuple.Src_port
-	oa.network = "onvm"
-	id, _ := IpToID(oa.ipv4_addr)
-	oa.service_id = uint8(id)
+	// oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
+	// oa.port = connection.four_tuple.Src_port
+	// oa.network = "onvm"
+	// id, _ := IpToID(oa.ipv4_addr)
+	// oa.service_id = uint8(id)
 
 	return oa
 }
 
 // RemoteAddr implements the net.Conn RemoteAddr method.
-func (connection XIO_Socket) RemoteAddr() net.Addr {
+func (connection XIO_Connection) RemoteAddr() net.Addr {
 	var oa OnvmAddr
-	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
-	oa.port = connection.four_tuple.Dst_port
-	oa.network = "onvm"
-	id, _ := IpToID(oa.ipv4_addr)
-	oa.service_id = uint8(id)
+	// oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
+	// oa.port = connection.four_tuple.Dst_port
+	// oa.network = "onvm"
+	// id, _ := IpToID(oa.ipv4_addr)
+	// oa.service_id = uint8(id)
 
 	return oa
 }
 
 // SetDeadline implements the net.Conn SetDeadline method.
-func (connection XIO_Socket) SetDeadline(t time.Time) error {
+func (connection XIO_Connection) SetDeadline(t time.Time) error {
 	return nil
 }
 
 // SetReadDeadline implements the net.Conn SetReadDeadline method.
-func (connection XIO_Socket) SetReadDeadline(t time.Time) error {
+func (connection XIO_Connection) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
 // SetWriteDeadline implements the net.Conn SetWriteDeadline method.
-func (connection XIO_Socket) SetWriteDeadline(t time.Time) error {
+func (connection XIO_Connection) SetWriteDeadline(t time.Time) error {
 	return nil
+}
+
+func inet_addr(ipaddr string) uint32 {
+	var (
+		ip                 = strings.Split(ipaddr, ".")
+		ip1, ip2, ip3, ip4 uint64
+		ret                uint32
+	)
+	ip1, _ = strconv.ParseUint(ip[0], 10, 8)
+	ip2, _ = strconv.ParseUint(ip[1], 10, 8)
+	ip3, _ = strconv.ParseUint(ip[2], 10, 8)
+	ip4, _ = strconv.ParseUint(ip[3], 10, 8)
+	ret = uint32(ip4)<<24 + uint32(ip3)<<16 + uint32(ip2)<<8 + uint32(ip1)
+	return ret
 }
