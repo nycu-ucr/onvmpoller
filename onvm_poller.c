@@ -16,7 +16,7 @@ double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
 long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
 int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint8_t *return_value);
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
@@ -55,6 +55,7 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 #define TX_CLOSED 5
 #define RX_TX_CLOSED 6
 #define READER_WAITING 7
+#define READER_HANDLING 8
 
 /*
 ********************************
@@ -118,6 +119,7 @@ struct recieve_buf
 {
     uint8_t *buf;
     int buf_len;
+    uint8_t *return_value;
 };
 
 struct conn_request
@@ -195,7 +197,7 @@ static inline int isEmpty(Queue *queue)
 
 static inline void enqueue(Queue *queue, void *data)
 {
-    printf("Enqueue\n");
+    // printf("Enqueue\n");
 
     Node *newNode = (Node *)malloc(sizeof(Node));
     newNode->data = data;
@@ -214,7 +216,7 @@ static inline void enqueue(Queue *queue, void *data)
 
 static inline void *dequeue(Queue *queue)
 {
-    printf("Dequeue\n");
+    // printf("Dequeue\n");
     if (isEmpty(queue))
     {
         return NULL;
@@ -946,6 +948,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
 // int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int start_offset)
 int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
 {
+    // printf("[payload_assemble] Start\n");
     int end_offset = 0;
 
     // struct timespec t_start;
@@ -960,13 +963,14 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     // get_monotonic_time(&t_end);
     // printf("[ONVM] rte_pktmbuf_free latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
 
+    // printf("[payload_assemble] End\n");
     return end_offset;
 }
 
 static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
 {
-    printf("[handle_ESTABLISH_CONN] Recieve pkt\n");
-    print_fourTuple(four_tuple);
+    // printf("[handle_ESTABLISH_CONN] Recieve pkt\n");
+    // print_fourTuple(four_tuple);
 
     struct ipv4_4tuple ft = {
         .ip_dst = four_tuple->ip_dst,
@@ -1006,8 +1010,8 @@ static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct r
 
 static inline int handle_REPLY_CONN(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
 {
-    printf("[handle_REPLY_CONN] Recieve pkt\n");
-    print_fourTuple(four_tuple);
+    // printf("[handle_REPLY_CONN] Recieve pkt\n");
+    // print_fourTuple(four_tuple);
 
     int ret;
     struct xio_socket *xs;
@@ -1031,8 +1035,8 @@ static inline int handle_REPLY_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
 
 static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
 {
-    printf("[handle_CLOSE_CONN] Recieve pkt\n");
-    print_fourTuple(four_tuple);
+    // printf("[handle_CLOSE_CONN] Recieve pkt\n");
+    // print_fourTuple(four_tuple);
 
     int ret;
     struct xio_socket *xs;
@@ -1050,8 +1054,8 @@ static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
 
 static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
 {
-    printf("[handle_HTTP_FRAME] Recieve pkt\n");
-    print_fourTuple(four_tuple);
+    // printf("[handle_HTTP_FRAME] Recieve pkt\n");
+    // print_fourTuple(four_tuple);
 
     int res_code;
     struct mbuf_list *mbuf_list;
@@ -1083,29 +1087,27 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
     des->pkt = mbuf_list;
 
     rte_rwlock_write_lock(xs->rwlock);
-    enqueue(xs->socket_buf, NULL);
+    enqueue(xs->socket_buf, des);
     if (xs->status == READER_WAITING)
     {
-        printf("[handle_HTTP_FRAME] READER_WAITING\n");
+        // printf("[handle_HTTP_FRAME] READER_WAITING\n");
         uint8_t *buf = xs->recieve_buf.buf;
         int buf_len = xs->recieve_buf.buf_len;
 
         /* Reset status */
-        xs->status = EST_COMPLETE;
-        xs->recieve_buf.buf = NULL;
-        xs->recieve_buf.buf_len = 0;
-
+        xs->status = READER_HANDLING;
         rte_rwlock_write_unlock(xs->rwlock);
-        int read_res = xio_read(xs, buf, buf_len);
+
+        int read_res = xio_read(xs, buf, buf_len, NULL);
         /* [TODO] handle different read_res */
         res_code = XIO_wait(HTTP_FRAME, xs->go_channel_ptr);
     } else if (xs->status == EST_COMPLETE)
     {
-        printf("[handle_HTTP_FRAME] EST_COMPLETE\n");
+        // printf("[handle_HTTP_FRAME] EST_COMPLETE\n");
         rte_rwlock_write_unlock(xs->rwlock);
     } else
     {
-        printf("[handle_HTTP_FRAME] ELSE_STATUS\n");
+        // printf("[handle_HTTP_FRAME] ELSE_STATUS\n");
         rte_rwlock_write_unlock(xs->rwlock);
         /* [TODO] handle different socket status */
     }
@@ -1121,7 +1123,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
 
     // struct timespec t_start;
     // struct timespec t_end;
-    printf("[packet_handler]\n");
+    // printf("[packet_handler]\n");
 
     meta->action = ONVM_NF_ACTION_DROP;
 
@@ -1208,7 +1210,7 @@ void *test_CondVarGet()
 
 struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4tuple four_tuple, char *sem)
 {
-    printf("[xio_new_socket] Start create type-%d socket\n", socket_type);
+    // printf("[xio_new_socket] Start create type-%d socket\n", socket_type);
     struct xio_socket *xs = (struct xio_socket *)malloc(sizeof(struct xio_socket));
 
     xs->status = NEW_SOCKET;
@@ -1260,14 +1262,16 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 }
 
 /*
+   [Input]
+   return_value: used to get the newest return value in async case
    [Return]
    >0: read size
     0: no pkt in socket buffer
    -1: EOF
 */
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint8_t *return_value)
 {
-    printf("[xio_read] Start read\n");
+    // printf("[xio_read] Start read\n");
     int ret = 0;
 
     struct pkt_descriptor *pkt_desc = NULL;
@@ -1281,24 +1285,44 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 
     if (pkt_desc != NULL)
     {
-        printf("[xio_read] exist pkt\n");
-        /* Already have pkt descriptor in socket's buffer
+        // printf("[xio_read] exist pkt\n");
+        /*
+           Already have pkt descriptor in socket's buffer
            so we can directly call payload_assemble
         */
         int end_offset = payload_assemble(buffer, buffer_length, pkt_desc->pkt, pkt_desc->start_offset);
 
         rte_rwlock_write_lock(xs->rwlock);
         ret = end_offset - pkt_desc->start_offset;
+
+        if (xs->status == READER_HANDLING){
+            /* Exist return_value need to be handle for asyc case */
+            unsigned char bytes[4];
+            bytes[0] = (ret >> 24) & 0xFF;
+            bytes[1] = (ret >> 16) & 0xFF;
+            bytes[2] = (ret >> 8) & 0xFF;
+            bytes[3] = (ret >> 0) & 0xFF;
+            // printf("Before return_value used\n");
+            rte_memcpy(xs->recieve_buf.return_value, bytes, 4);
+            // printf("After return_value used\n");
+
+            /* Async read complete */
+            xs->status = ESTABLISH_CONN;
+            xs->recieve_buf.buf = NULL;
+            xs->recieve_buf.buf_len = 0;
+            xs->recieve_buf.return_value = NULL;
+        }
+
         if (end_offset == pkt_desc->payload_len)
         {
             struct pkt_descriptor *tmp = (struct pkt_descriptor *)dequeue(xs->socket_buf);
             rte_rwlock_write_unlock(xs->rwlock);
             if (tmp != pkt_desc)
             {
-                printf("[Delete pkt] dequeue != queue->front->data");
+                printf("[Delete pkt] dequeue() != queue->front->data");
             }
 
-            delete_mbuf_list(tmp->pkt);
+            //delete_mbuf_list(tmp->pkt);
             free(tmp);
         }
         else
@@ -1309,7 +1333,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
     }
     else
     {
-        printf("[xio_read] non-exist pkt\n");
+        // printf("[xio_read] non-exist pkt\n");
         /* No pkt in socket's buffer
            so we have to hook up a recieve buffer
            and change the socket's status
@@ -1317,6 +1341,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
         rte_rwlock_write_lock(xs->rwlock);
         xs->recieve_buf.buf = buffer;
         xs->recieve_buf.buf_len = buffer_length;
+        xs->recieve_buf.return_value = return_value;
         xs->status = READER_WAITING;
         rte_rwlock_write_unlock(xs->rwlock);
 
@@ -1328,7 +1353,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem)
 {
-    printf("[xio_connect] Start xio_connect\n");
+    // printf("[xio_connect] Start xio_connect\n");
 
     struct ipv4_4tuple four_tuple = {
         .ip_src = ip_src,
@@ -1342,7 +1367,7 @@ struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_d
     service_id = convert_IpToID(four_tuple.ip_dst);
     if (service_id < 0)
     {
-        printf("[xio_connect] Unable to convert IpToID\n");
+        // printf("[xio_connect] Unable to convert IpToID\n");
         return NULL;
     }
 
@@ -1367,7 +1392,7 @@ struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_d
 
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem)
 {
-    printf("[xio_accept] Start xio_accept\n");
+    // printf("[xio_accept] Start xio_accept\n");
 
     /* Check if the listener socket's buffer exist ESTABLISH_CONN request */
     struct conn_request *req;
@@ -1413,7 +1438,7 @@ struct xio_socket *xio_accept(struct xio_socket *listener, char *sem)
 
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr)
 {
-    printf("[xio_listen] Listen on %d:%d\n", ip_src, port_src);
+    // printf("[xio_listen] Listen on %d:%d\n", ip_src, port_src);
 
     struct ipv4_4tuple four_tuple = {
         .ip_src = ip_src,
