@@ -24,7 +24,7 @@ extern void test_cgo(char* ptr);
 extern void test_CondVarPut(char *condVarPtr);
 extern void* test_CondVarGet();
 extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint8_t *return_value);
+extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *return_value);
 extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
 extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
@@ -127,18 +127,17 @@ type Connection struct {
 }
 
 type XIO_Connection struct {
-	xio_socket   *C.struct_xio_socket
-	four_tuple   Four_tuple_rte
-	sync_chan    chan struct{}
-	dst_id       uint8
-	return_value []byte
+	xio_socket *C.struct_xio_socket
+	four_tuple Four_tuple_rte
+	sync_chan  chan struct{}
+	dst_id     uint8
 }
 
 type XIO_Listener struct {
 	xio_socket    *C.struct_xio_socket
 	four_tuple    Four_tuple_rte
 	laddr         OnvmAddr // Local Address
-	complete_chan chan *XIO_Connection
+	complete_chan chan struct{}
 }
 
 type connState struct {
@@ -461,8 +460,8 @@ func XIO_wait(packet_type C.int, go_channel_ptr *C.void) int {
 		*channel <- struct{}{}
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
-		channel := (*chan *XIO_Connection)(unsafe.Pointer(go_channel_ptr))
-		*channel <- nil
+		channel := (*chan struct{})(unsafe.Pointer(go_channel_ptr))
+		*channel <- struct{}{}
 	case REPLY_CONN:
 		// Handle by replyHandler
 		channel := (*chan struct{})(unsafe.Pointer(go_channel_ptr))
@@ -1157,7 +1156,7 @@ func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
 	xio_listener = &XIO_Listener{
 		laddr:         laddr,
 		four_tuple:    four_tuple,
-		complete_chan: make(chan *XIO_Connection, 100),
+		complete_chan: make(chan struct{}, 100),
 	}
 
 	complete_chan_ptr := (*C.char)(unsafe.Pointer(&xio_listener.complete_chan))
@@ -1195,9 +1194,8 @@ func (xl XIO_Listener) Accept() (net.Conn, error) {
 	}
 
 	connection := &XIO_Connection{
-		xio_socket:   xs,
-		sync_chan:    condVar,
-		return_value: make([]byte, 4),
+		xio_socket: xs,
+		sync_chan:  condVar,
 	}
 
 	return connection, nil
@@ -1231,7 +1229,6 @@ func DialXIO(network, address string) (net.Conn, error) {
 	conn.four_tuple.Src_port = port_manager.GetPort()
 	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
 	conn.four_tuple.Dst_port = port
-	conn.return_value = make([]byte, 4)
 
 	condVar := make(chan struct{}, 1)
 	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
@@ -1287,7 +1284,8 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 	buffer_len := len(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-	return_value_ptr := (*C.uint8_t)(unsafe.Pointer(&connection.return_value[0]))
+	length = 0
+	return_value_ptr := (*C.int)(unsafe.Pointer(&length))
 	/*
 		[Return]
 		>0: read size
@@ -1308,11 +1306,9 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 			err = io.EOF
 			return length, err
 		}
-		length = int(parseMsg(connection.return_value))
 	}
 
 	runtime.KeepAlive(b)
-	runtime.KeepAlive(connection.return_value)
 
 	return length, err
 }
@@ -1412,8 +1408,4 @@ func inet_addr(ipaddr string) uint32 {
 	ip4, _ = strconv.ParseUint(ip[3], 10, 8)
 	ret = uint32(ip4)<<24 + uint32(ip3)<<16 + uint32(ip2)<<8 + uint32(ip1)
 	return ret
-}
-
-func parseMsg(b []byte) uint32 {
-	return binary.BigEndian.Uint32(b[0:4])
 }

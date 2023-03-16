@@ -16,7 +16,7 @@ double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
 long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
 int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint8_t *return_value);
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *return_value);
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
@@ -119,7 +119,7 @@ struct recieve_buf
 {
     uint8_t *buf;
     int buf_len;
-    uint8_t *return_value;
+    int *return_value;
 };
 
 struct conn_request
@@ -1269,7 +1269,7 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
     0: no pkt in socket buffer
    -1: EOF
 */
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint8_t *return_value)
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *return_value)
 {
     // printf("[xio_read] Start read\n");
     int ret = 0;
@@ -1297,14 +1297,15 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint8_t 
 
         if (xs->status == READER_HANDLING){
             /* Exist return_value need to be handle for asyc case */
-            unsigned char bytes[4];
-            bytes[0] = (ret >> 24) & 0xFF;
-            bytes[1] = (ret >> 16) & 0xFF;
-            bytes[2] = (ret >> 8) & 0xFF;
-            bytes[3] = (ret >> 0) & 0xFF;
+            // unsigned char bytes[4];
+            // bytes[0] = (ret >> 24) & 0xFF;
+            // bytes[1] = (ret >> 16) & 0xFF;
+            // bytes[2] = (ret >> 8) & 0xFF;
+            // bytes[3] = (ret >> 0) & 0xFF;
             // printf("Before return_value used\n");
-            rte_memcpy(xs->recieve_buf.return_value, bytes, 4);
+            // rte_memcpy(xs->recieve_buf.return_value, bytes, 4);
             // printf("After return_value used\n");
+            *xs->recieve_buf.return_value = ret;
 
             /* Async read complete */
             xs->status = ESTABLISH_CONN;
