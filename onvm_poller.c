@@ -16,7 +16,7 @@ double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
 long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
 int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *return_value);
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
@@ -115,13 +115,6 @@ typedef struct Queue
     Node *rear;
 } Queue;
 
-struct recieve_buf
-{
-    uint8_t *buf;
-    int buf_len;
-    int *return_value;
-};
-
 struct conn_request
 {
     uint32_t ip;
@@ -137,7 +130,6 @@ struct xio_socket
     struct ipv4_4tuple fourTuple;
 
     struct Queue *socket_buf; /* Use for store pkts or connection-requests */
-    struct recieve_buf recieve_buf;
 
     char *go_channel_ptr;
     rte_rwlock_t *rwlock;
@@ -1090,16 +1082,10 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
     enqueue(xs->socket_buf, des);
     if (xs->status == READER_WAITING)
     {
-        // printf("[handle_HTTP_FRAME] READER_WAITING\n");
-        uint8_t *buf = xs->recieve_buf.buf;
-        int buf_len = xs->recieve_buf.buf_len;
-
         /* Reset status */
-        xs->status = READER_HANDLING;
+        xs->status = EST_COMPLETE;
         rte_rwlock_write_unlock(xs->rwlock);
 
-        int read_res = xio_read(xs, buf, buf_len, NULL);
-        /* [TODO] handle different read_res */
         res_code = XIO_wait(HTTP_FRAME, xs->go_channel_ptr);
     } else if (xs->status == EST_COMPLETE)
     {
@@ -1220,8 +1206,6 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4
     xs->fourTuple = four_tuple;
 
     xs->socket_buf = createQueue();
-    xs->recieve_buf.buf = NULL;
-    xs->recieve_buf.buf_len = 0;
 
     xs->go_channel_ptr = sem;
     xs->rwlock = (rte_rwlock_t *)malloc(sizeof(rte_rwlock_t));
@@ -1269,7 +1253,7 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
     0: no pkt in socket buffer
    -1: EOF
 */
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *return_value)
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 {
     // printf("[xio_read] Start read\n");
     int ret = 0;
@@ -1295,25 +1279,6 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *ret
         rte_rwlock_write_lock(xs->rwlock);
         ret = end_offset - pkt_desc->start_offset;
 
-        if (xs->status == READER_HANDLING){
-            /* Exist return_value need to be handle for asyc case */
-            // unsigned char bytes[4];
-            // bytes[0] = (ret >> 24) & 0xFF;
-            // bytes[1] = (ret >> 16) & 0xFF;
-            // bytes[2] = (ret >> 8) & 0xFF;
-            // bytes[3] = (ret >> 0) & 0xFF;
-            // printf("Before return_value used\n");
-            // rte_memcpy(xs->recieve_buf.return_value, bytes, 4);
-            // printf("After return_value used\n");
-            *xs->recieve_buf.return_value = ret;
-
-            /* Async read complete */
-            xs->status = ESTABLISH_CONN;
-            xs->recieve_buf.buf = NULL;
-            xs->recieve_buf.buf_len = 0;
-            xs->recieve_buf.return_value = NULL;
-        }
-
         if (end_offset == pkt_desc->payload_len)
         {
             struct pkt_descriptor *tmp = (struct pkt_descriptor *)dequeue(xs->socket_buf);
@@ -1334,15 +1299,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *ret
     }
     else
     {
-        // printf("[xio_read] non-exist pkt\n");
-        /* No pkt in socket's buffer
-           so we have to hook up a recieve buffer
-           and change the socket's status
-        */
         rte_rwlock_write_lock(xs->rwlock);
-        xs->recieve_buf.buf = buffer;
-        xs->recieve_buf.buf_len = buffer_length;
-        xs->recieve_buf.return_value = return_value;
         xs->status = READER_WAITING;
         rte_rwlock_write_unlock(xs->rwlock);
 

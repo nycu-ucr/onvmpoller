@@ -24,7 +24,7 @@ extern void test_cgo(char* ptr);
 extern void test_CondVarPut(char *condVarPtr);
 extern void* test_CondVarGet();
 extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *return_value);
+extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
 extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
 extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
@@ -212,7 +212,7 @@ func init() {
 	/* Initialize Global Variable */
 	initConfig()
 	initNfIP()
-	initOnvmPoll()
+	// initOnvmPoll()
 
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
@@ -254,7 +254,7 @@ func init() {
 
 func runOnvmPoller() {
 	go C.onvm_nflib_run(nf_ctx)
-	runPktWorker()
+	// runPktWorker()
 }
 
 /*********************************
@@ -1284,15 +1284,13 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 	buffer_len := len(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-	length = 0
-	return_value_ptr := (*C.int)(unsafe.Pointer(&length))
 	/*
 		[Return]
 		>0: read size
 		 0: no pkt in socket buffer
 		-1: EOF
 	*/
-	ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len), return_value_ptr)
+	ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len))
 	read_len := int(ret)
 	logger.Log.Tracef("C.xio_read return=%d, four-tuple: %v", read_len, connection.four_tuple)
 	if read_len == -1 {
@@ -1306,6 +1304,10 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 			err = io.EOF
 			return length, err
 		}
+		l := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len))
+		length = int(l)
+	} else {
+		length = read_len
 	}
 
 	runtime.KeepAlive(b)
