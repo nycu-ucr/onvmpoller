@@ -11,11 +11,14 @@ package onvmpoller
 /*
 #include <onvm_nflib.h>
 
+struct mbuf_list;
+
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
-extern void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt);
+extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset);
 extern void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
+extern void test_cgo(char* ptr);
 */
 import "C"
 
@@ -28,10 +31,14 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"log"
 	"net"
 	"os"
+	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unsafe"
@@ -79,26 +86,39 @@ type NFip struct {
 }
 
 type ChannelData struct {
-	PacketType int
-	FourTuple  Four_tuple_rte
-	Payload    []byte
+	PacketType  int
+	FourTuple   Four_tuple_rte
+	Payload_len int
+	// PacketList  []*C.struct_rte_mbuf
+	PacketList *C.struct_mbuf_list
+}
+
+type Pkt struct {
+	Payload_len  int
+	Start_offset int // How many bytes has been read
+	PacketList   *C.struct_mbuf_list
+	is_done      bool
+}
+
+type buffer struct {
+	sync.Mutex
+	list *list.List
+	cond *sync.Cond
 }
 
 type Connection struct {
-	dst_id         uint8
-	rxchan         chan ([]byte)
-	four_tuple     Four_tuple_rte
-	state          *connState
-	sync_chan      chan (bool) // For waiting ACK
-	read_sync_chan chan (bool) // For waiting packet
-	buffer_list    *list.List
-	// buffer_list_lock *sync.RWMutex
+	dst_id uint8
+	// rxchan         chan ([]byte)
+	four_tuple Four_tuple_rte
+	state      *connState
+	sync_chan  chan struct{} // For waiting ACK
+	buffer     *shareList
+	pkt        *Pkt
 }
 
 type connState struct {
 	is_rxchan_closed atomic.Bool
 	is_txchan_closed atomic.Bool
-	is_ready         atomic.Bool
 }
 
 type Four_tuple_rte struct {
@@ -127,20 +147,17 @@ type OnvmPoll struct {
 		key: Use four-tuple to calculate this hash-key
 		value: pointer to the Connection
 	*/
-	tables         *hashmap.Map[uint32, *Connection]
+	tables *hashmap.Map[uint32, *Connection]
+	// pkt_table      *hashmap.Map[int, *C.struct_rte_mbuf]
 	syn_chan       chan (*Four_tuple_rte)
 	ack_chan       chan (*Four_tuple_rte)
-	fin_frame_chan chan (ChannelData)
+	fin_frame_chan chan (*ChannelData) //*sharedBuffer
 }
 
 type PortManager struct {
 	pool            map[uint16]bool
 	get_port_ch     chan uint16
 	release_port_ch chan uint16
-}
-
-type Port struct {
-	count uint32
 }
 
 type StatusFlag struct {
@@ -151,16 +168,17 @@ type StatusFlag struct {
 
 /* Global Variables */
 var (
-	config        Config
-	nfIP          NFip
-	onvmpoll      []*OnvmPoll
-	local_address string
-	nf_ctx        *C.struct_onvm_nf_local_ctx
-	listener      *OnvmListener
-	port_manager  *PortManager
-	a_port        Port
+	config         Config
+	nfIP           NFip
+	onvmpoll       []*OnvmPoll
+	local_address  string
+	nf_ctx         *C.struct_onvm_nf_local_ctx
+	listener       *OnvmListener
+	port_manager   *PortManager
+	conn_pool      sync.Pool
+	ReadIncomplete error
 
-	//Control Message (bytes)
+	// Control Message (bytes)
 	SYN = []byte("SYN")
 	ACK = []byte("ACK")
 	FIN = []byte("FIN")
@@ -172,12 +190,19 @@ func init() {
 	initNfIP()
 	initOnvmPoll()
 
+	ReadIncomplete = errors.New("Continue")
+
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
 		release_port_ch: make(chan uint16, PM_CHANNEL_SIZE),
 	}
-	a_port.count = 0
+
+	conn_pool = sync.Pool{
+		New: func() any {
+			return createConnection()
+		},
+	}
 
 	/* Setup Logger */
 	logger.SetLogLevel(LOG_LEVEL)
@@ -202,6 +227,7 @@ func init() {
 	runOnvmPoller()
 
 	time.Sleep(2 * time.Second)
+	logger.Log.Warnln("Init onvmpoller(share-list ver)")
 }
 
 func runOnvmPoller() {
@@ -294,6 +320,10 @@ func parseAddress(address string) (string, uint16) {
 	v, _ := strconv.ParseUint(addr[1], 10, 64)
 	ip_addr, port := addr[0], uint16(v)
 
+	if ip_addr == "localhost" {
+		ip_addr = "127.0.0.1"
+	}
+
 	return ip_addr, port
 }
 
@@ -354,8 +384,8 @@ func decodeToChannelData(buf []byte) (ChannelData, error) {
 	return rx_data, err
 }
 
-func swapFourTuple(four_tuple Four_tuple_rte) *Four_tuple_rte {
-	return &Four_tuple_rte{
+func swapFourTuple(four_tuple Four_tuple_rte) Four_tuple_rte {
+	return Four_tuple_rte{
 		Src_ip:   four_tuple.Dst_ip,
 		Src_port: four_tuple.Dst_port,
 		Dst_ip:   four_tuple.Src_ip,
@@ -384,7 +414,7 @@ func initOnvmPoll() {
 			tables:         hashmap.New[uint32, *Connection](),
 			syn_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
 			ack_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
-			fin_frame_chan: make(chan ChannelData, 1024/ONVM_POLLER_NUM),
+			fin_frame_chan: make(chan *ChannelData, 128/ONVM_POLLER_NUM),
 		}
 	}
 }
@@ -392,15 +422,15 @@ func initOnvmPoll() {
 func runPktWorker() {
 	for i := 0; i < ONVM_POLLER_NUM; i++ {
 		go onvmpoll[i].connectionHandler()
-		go onvmpoll[i].finFrameHandler()
+		go onvmpoll[i].finHandler()
 		go onvmpoll[i].replyHandler()
 	}
 }
 
 //export DeliverPacket
-func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+func DeliverPacket(pkt_list *C.struct_mbuf_list, packet_type C.int, buf *C.char, buf_len C.int, src_ip C.uint, src_port C.ushort, dst_ip C.uint, dst_port C.ushort) int {
+	// defer TimeTrack(time.Now())
 	/* Put the packet into the right queue */
-
 	res_code := 0
 
 	four_tuple := Four_tuple_rte{Src_ip: uint32(src_ip), Src_port: uint16(src_port), Dst_ip: uint32(dst_ip), Dst_port: uint16(dst_port)}
@@ -409,26 +439,25 @@ func DeliverPacket(pkt *C.struct_rte_mbuf, packet_type C.int, buf *C.char, buf_l
 	pollIndex := four_tuple.getPollIndex()
 
 	switch pktType {
+	case HTTP_FRAME:
+		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload_len: int(buf_len), PacketList: pkt_list}
+		// log.Println(fmt.Sprintf("DeliverPacket (now) %d(ns)", time.Now().Nanosecond()))
+		onvmpoll[pollIndex].frameHandler(&rxdata)
+		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	case ESTABLISH_CONN:
 		// Handle by connectionHandler
 		onvmpoll[pollIndex].syn_chan <- &four_tuple
-	case HTTP_FRAME, CLOSE_CONN:
-		// Handle by finFrameHandler
-		payload := C.GoBytes(unsafe.Pointer(buf), C.int(buf_len))
-		rxdata := ChannelData{PacketType: int(packet_type), FourTuple: four_tuple, Payload: payload}
-		onvmpoll[pollIndex].fin_frame_chan <- rxdata
 	case REPLY_CONN:
 		// Handle by replyHandler
 		onvmpoll[pollIndex].ack_chan <- &four_tuple
-	case BIG_FRAME:
+	case CLOSE_CONN:
 		// Handle by finFrameHandler
-		payload := make([]byte, buf_len)
-		buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
-		C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
-		rxdata := ChannelData{PacketType: HTTP_FRAME, FourTuple: four_tuple, Payload: payload}
-		onvmpoll[pollIndex].fin_frame_chan <- rxdata
-	default:
-		logger.Log.Errorf("Unknown packet type: %v\n", packet_type)
+		// payload := make([]byte, buf_len)
+		// buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&payload[0]))
+		// C.payload_assemble(buffer_ptr, C.int(buf_len), pkt)
+		rxdata := ChannelData{PacketType: CLOSE_CONN, FourTuple: four_tuple}
+		onvmpoll[pollIndex].fin_frame_chan <- &rxdata
+		// onvmpoll[pollIndex].fin_frame_chan.put(&rxdata)
 	}
 
 	return res_code
@@ -443,7 +472,9 @@ func (poll *OnvmPoll) connectionHandler() {
 		logger.Log.Traceln("Receive one connection request")
 
 		// Initialize the new connection
-		new_conn = createConnection()
+		// new_conn = createConnection()
+		new_conn = conn_pool.Get().(*Connection)
+		initConnectionCh(new_conn)
 		new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(listener.laddr.ipv4_addr)[12:16])
 		new_conn.four_tuple.Src_port = listener.laddr.port
 		new_conn.four_tuple.Dst_ip = four_tuple.Src_ip
@@ -477,50 +508,37 @@ func (poll *OnvmPoll) replyHandler() {
 	for four_tuple := range poll.ack_chan {
 		conn, ok := poll.tables.Get(hashV4Flow(*four_tuple))
 		if !ok {
-			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
+			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %+v", four_tuple)
 		} else {
-			conn.state.is_ready.Store(true)
-			conn.sync_chan <- true
+			// conn.state.is_ready.Store(true)
+			conn.sync_chan <- struct{}{}
 		}
 	}
 }
 
-func (poll *OnvmPoll) finFrameHandler() {
+func (poll *OnvmPoll) finHandler() {
 	for channel_data := range poll.fin_frame_chan {
-		switch channel_data.PacketType {
-		case CLOSE_CONN:
-			// Let onvmpoller delete the connection
-			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
-			if !ok {
-				logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
-			} else {
-				if !conn.state.is_rxchan_closed.Load() {
-					logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
-					close(conn.rxchan)
-					close(conn.read_sync_chan)
-					conn.state.is_rxchan_closed.Store(true)
-					poll.Delete(conn)
-				}
-			}
-		case HTTP_FRAME:
-			conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
-			if !ok {
-				logger.Log.Errorf("DeliverPacket-HTTP Frmae, Can not get connection via four-tuple %v", channel_data.FourTuple)
-			} else {
-				logger.Log.Debugf("onvmpoller reiceve %d data", len(channel_data.Payload))
-				// conn.buffer_list_lock.Lock()
-				if conn.buffer_list.Front() == nil {
-					buffer := bytes.NewBuffer(channel_data.Payload)
-					conn.buffer_list.PushBack(buffer)
-					conn.read_sync_chan <- true
-				} else {
-					buffer := bytes.NewBuffer(channel_data.Payload)
-					conn.buffer_list.PushBack(buffer)
-					logger.Log.Debugf("Buffer List size: %d", conn.buffer_list.Len())
-				}
-				// conn.buffer_list_lock.Unlock()
+		// Let onvmpoller delete the connection
+		conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
+		if !ok {
+			logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
+		} else {
+			if !conn.state.is_rxchan_closed.Load() {
+				logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
+				conn.buffer.close()
+				conn.state.is_rxchan_closed.Store(true)
+				poll.Delete(conn)
 			}
 		}
+	}
+}
+
+func (poll *OnvmPoll) frameHandler(channel_data *ChannelData) {
+	conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
+	if !ok {
+		logger.Log.Errorf("DeliverPacket-HTTP Frame, Can not get connection via four-tuple %v", channel_data.FourTuple)
+	} else {
+		conn.buffer.send(&Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList})
 	}
 }
 
@@ -570,10 +588,6 @@ func (pm *PortManager) ReleasePort(port uint16) {
 	pm.release_port_ch <- port
 }
 
-func (port *Port) atomicPort() uint16 {
-	return uint16(atomic.AddUint32(&port.count, 1))
-}
-
 /*********************************
 	Methods of OnvmPoll
 *********************************/
@@ -582,51 +596,80 @@ func createConnection() *Connection {
 	// Create a new connection with unique connection ID
 	var conn Connection
 	var cs connState
-	conn.rxchan = make(chan []byte, 5) // For non-blocking
 	conn.state = &cs
-	conn.sync_chan = make(chan bool, 1)
-	conn.read_sync_chan = make(chan bool, 1) // TODO: Adjust to the proper size
-	conn.buffer_list = list.New()
-	// conn.buffer_list_lock = new(sync.RWMutex)
+	conn.buffer = newShareList()
+	conn.pkt = &Pkt{Payload_len: 0, Start_offset: 0, PacketList: nil, is_done: true}
 
 	return &conn
 }
 
+func initConnectionCh(conn *Connection) {
+	var new_state connState
+
+	// conn.rxchan = make(chan []byte, 5) // For non-blocking
+	conn.sync_chan = make(chan struct{})
+
+	/* Need to reset the connection state */
+	conn.state = &new_state
+	conn.buffer = newShareList()
+}
+
+func GetConnByReverseFourTuple(four_tuple Four_tuple_rte) (*Connection, error) {
+	swap_four_tuple := swapFourTuple(four_tuple)
+	poller_index := swap_four_tuple.getPollIndex()
+	c, ok := onvmpoll[poller_index].tables.Get(hashV4Flow(swap_four_tuple))
+
+	if !ok {
+		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", four_tuple)
+
+		return nil, err
+	} else {
+		return c, nil
+	}
+}
+
+func showAllConnections() {
+	logger.Log.Tracef("showAllConnections")
+	for i := 0; i < ONVM_POLLER_NUM; i++ {
+		onvmpoll[i].tables.Range(func(key uint32, conn *Connection) bool {
+			fmt.Printf("%v:%v -> %v:%v\n",
+				intToIP4(int64(conn.four_tuple.Src_ip)), conn.four_tuple.Src_port,
+				intToIP4(int64(conn.four_tuple.Dst_ip)), conn.four_tuple.Dst_port,
+			)
+
+			return true
+		})
+	}
+}
+
 func (poll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
-	poll.tables.Insert(hashV4Flow(*swapFourTuple(conn.four_tuple)), conn)
+	poll.tables.Insert(hashV4Flow(swapFourTuple(conn.four_tuple)), conn)
+	// showAllConnections()
 }
 
 func (poll *OnvmPoll) Delete(conn *Connection) error {
+	// defer TimeTrack(time.Now())
 	// Delete the connection from connection and four-tuple tables
 	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
-		var four_tuple *Four_tuple_rte = swapFourTuple(conn.four_tuple)
-		ok := poll.tables.Del(hashV4Flow(*four_tuple))
+		var four_tuple Four_tuple_rte = swapFourTuple(conn.four_tuple)
+		ok := poll.tables.Del(hashV4Flow(four_tuple))
 		if !ok {
-			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", *four_tuple)
+			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
 			err := errors.New(msg)
 			logger.Log.Errorln(msg)
 			return err
 		}
 
 		port_manager.ReleasePort(conn.four_tuple.Src_port)
-		logger.Log.Info("Close connection sucessfully.\n")
+
+		// Recycle the connection
+		conn_pool.Put(conn)
+
+		logger.Log.Tracef("Close connection sucessfully.")
 	}
 
 	return nil
-}
-
-func (poll *OnvmPoll) GetConnByReverseFourTuple(four_tuple *Four_tuple_rte) (*Connection, error) {
-	swap_four_tuple := swapFourTuple(*four_tuple)
-	c, ok := poll.tables.Get(hashV4Flow(*swap_four_tuple))
-
-	if !ok {
-		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", *four_tuple)
-
-		return nil, err
-	} else {
-		return c, nil
-	}
 }
 
 /*********************************
@@ -649,51 +692,60 @@ func (oa OnvmAddr) String() string {
 
 // Read implements the net.Conn Read method.
 func (connection Connection) Read(b []byte) (int, error) {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
 
 	var length int
-	var err1, err2 error
-	var elem *list.Element
+	var err error
 
-	// connection.buffer_list_lock.RLock()
-	elem = connection.buffer_list.Front()
-	// connection.buffer_list_lock.RUnlock()
+	// List is empty, waiting for packet
+	if connection.pkt.is_done {
+		is_close := connection.buffer.recv(connection.pkt)
 
-	if elem == nil {
-		// List is empty, waiting for packet
-		_, ok := <-connection.read_sync_chan
-		if !ok {
-			err1 = io.EOF
-			return length, err1
+		if is_close {
+			err = io.EOF
+			return length, err
 		}
 	}
 
-	// connection.buffer_list_lock.RLock()
-	elem = connection.buffer_list.Front()
-	// connection.buffer_list_lock.RUnlock()
+	runtime.KeepAlive(b)
 
-	if elem == nil {
-		// logger.Log.Warnf("Buffer List: %v", connection.buffer_list.Len())
-		// logger.Log.Error("Element is nil")
-		return length, err1
+	return connection.reading(b)
+}
+
+func (connection Connection) reading(b []byte) (int, error) {
+	logger.Log.Tracef("Start Connection.reading, four-tuple: %v", connection.four_tuple)
+	// defer TimeTrack(time.Now())
+	var length int
+	var err error
+
+	buff_cap := cap(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
+	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset))
+	end_offset := int(offset)
+	length = end_offset - connection.pkt.Start_offset
+
+	if end_offset == connection.pkt.Payload_len {
+		connection.pkt.is_done = true
+		// err = io.EOF // TODO: This will result in hijack operation failed
+	} else {
+		connection.pkt.Start_offset = end_offset
+		err = ReadIncomplete
 	}
 
-	buffer := elem.Value.(*bytes.Buffer)
-	length, err2 = buffer.Read(b)
+	runtime.KeepAlive(b)
 
-	if err2 == io.EOF {
-		// connection.buffer_list_lock.Lock()
-		connection.buffer_list.Remove(elem)
-		// connection.buffer_list_lock.Unlock()
-	}
+	logger.Log.Debugf("(%v:%v -> %v:%v) reading read %v (buffer_cap: %v) (Pkt length: %v) (end offset: %v) (err: %+v)",
+		intToIP4(int64(connection.four_tuple.Dst_ip)), connection.four_tuple.Dst_port,
+		intToIP4(int64(connection.four_tuple.Src_ip)), connection.four_tuple.Src_port,
+		length, buff_cap, connection.pkt.Payload_len, end_offset, err)
 
-	// logger.Log.Debugf("Read: provide %d size of buffer", len(b))
-	logger.Log.Debugf("Read %d data", length)
-	return length, err1
+	return length, err
 }
 
 // Read ACK
 func (connection Connection) readACK() error {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
 
 	var err error
@@ -709,8 +761,12 @@ func (connection Connection) readACK() error {
 
 // Write implements the net.Conn Write method.
 func (connection Connection) Write(b []byte) (int, error) {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
-	logger.Log.Debugf("Write %d data.", len(b))
+	logger.Log.Tracef("(%v:%v -> %v:%v) Write %d data.",
+		intToIP4(int64(connection.four_tuple.Src_ip)), connection.four_tuple.Src_port,
+		intToIP4(int64(connection.four_tuple.Dst_ip)), connection.four_tuple.Dst_port,
+		len(b))
 
 	len := len(b)
 	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
@@ -726,25 +782,27 @@ func (connection Connection) Write(b []byte) (int, error) {
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
 		buffer_ptr, C.int(len))
 
+	runtime.KeepAlive(b)
+
 	return len, nil
 }
 
 // For connection control message
 func (connection Connection) writeControlMessage(msg_type int) error {
+	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
 
-
-	buffer := makeConnCtrlMsg(msg_type)
+	// buffer := makeConnCtrlMsg(msg_type)
 	// Translate Go structure to C char *
 	// var buffer_ptr *C.char
 	// buffer_ptr = (*C.char)(C.CBytes(buffer))
-	buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
+	// buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
 
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
 		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
-		buffer_ptr, C.int(len(buffer)))
+		nil, C.int(0))
 
 	return nil
 }
@@ -755,10 +813,9 @@ func (connection Connection) Close() error {
 
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
-	// Notify peer connection can be closed
 	if !connection.state.is_txchan_closed.Load() {
 		// Notify peer connection can be closed
-	  connection.writeControlMessage(CLOSE_CONN)
+		connection.writeControlMessage(CLOSE_CONN)
 
 		// Close local connection
 		connection.state.is_txchan_closed.Store(true)
@@ -856,9 +913,11 @@ func DialONVM(network, address string) (net.Conn, error) {
 	ip_addr, port := parseAddress(address)
 
 	// Initialize a connection
-	conn := createConnection()
+	// conn := createConnection()
+	conn := conn_pool.Get().(*Connection)
+	initConnectionCh(conn)
 	conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
-	conn.four_tuple.Src_port = port_manager.GetPort() //a_port.atomicPort()
+	conn.four_tuple.Src_port = port_manager.GetPort()
 	conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
 	conn.four_tuple.Dst_port = port
 	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
@@ -896,4 +955,174 @@ func DialONVM(network, address string) (net.Conn, error) {
 	logger.Log.Debugln("DialONVM done")
 
 	return conn, nil
+}
+
+/* Test related */
+func Test_cgo() {
+	b := []byte("Test-CGO")
+	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
+	C.test_cgo(buffer_ptr)
+}
+
+func TimeTrack(start time.Time) {
+	elapsed := time.Since(start)
+
+	// Skip this function, and fetch the PC and file for its parent.
+	pc, _, _, _ := runtime.Caller(1)
+
+	// Retrieve a function object this functions parent.
+	funcObj := runtime.FuncForPC(pc)
+
+	// Regex to extract just the function name (and not the module path).
+	runtimeFunc := regexp.MustCompile(`^.*\.(.*)$`)
+	name := runtimeFunc.ReplaceAllString(funcObj.Name(), "$1")
+
+	log.Println(fmt.Sprintf("%s took %d(ns)", name, elapsed.Nanoseconds()))
+}
+
+/* Share-memory */
+
+type sharedBuffer struct {
+	sync.Mutex
+	rcond  *sync.Cond
+	wcond  *sync.Cond
+	closed bool
+	read   int
+	write  int
+	count  int
+	size   int
+	buffer []*ChannelData
+}
+
+func newSharedBuffer(size int) *sharedBuffer {
+	s := &sharedBuffer{
+		buffer: make([]*ChannelData, size),
+		size:   size,
+	}
+	s.rcond = sync.NewCond(s)
+	s.wcond = sync.NewCond(s)
+	return s
+}
+
+func (s *sharedBuffer) close() {
+	s.Lock()
+	s.closed = true
+	s.rcond.Broadcast()
+	s.Unlock()
+}
+
+func (s *sharedBuffer) put(val *ChannelData) {
+	s.Lock()
+
+	// If the buffer is full we need to wait for space to appear
+	for s.count == s.size {
+		s.wcond.Wait()
+	}
+
+	// s.write tells us the next space that's free to write to. If we reach the
+	// end of the buffer we wrap around to the start
+	s.buffer[s.write] = val
+	s.write++
+	if s.write == s.size {
+		s.write = 0
+	}
+
+	// If the buffer was empty, then signal to anyone that's waiting as there's
+	// now data to read
+	if s.count == 0 {
+		s.rcond.Signal()
+	}
+	s.count++
+	s.Unlock()
+}
+
+func (s *sharedBuffer) get() (*ChannelData, bool) {
+	s.Lock()
+
+	// If the buffer is empty then we need to wait for some data
+	for s.count == 0 {
+		if s.closed {
+			s.Unlock()
+			return nil, true
+		}
+		s.rcond.Wait()
+	}
+
+	// s.read tells us where the next byte to read is. If we reach the end of
+	// the buffer we wrap around to the beginning
+	val := s.buffer[s.read]
+	s.read++
+	if s.read == s.size {
+		s.read = 0
+	}
+
+	// If the buffer was full, then signal to anyone waiting to write as there is
+	// now space
+	if s.count == s.size {
+		s.wcond.Signal()
+	}
+	s.count--
+
+	s.Unlock()
+	return val, false
+}
+
+type shareList struct {
+	cond   *sync.Cond
+	closed bool
+	l      *list.List
+}
+
+func newShareList() *shareList {
+	return &shareList{
+		cond:   sync.NewCond(&sync.Mutex{}),
+		closed: false,
+		l:      list.New(),
+	}
+}
+
+func (c *shareList) recv(pkt_buffer *Pkt) (close bool) {
+	c.cond.L.Lock()
+
+	for c.l.Len() == 0 {
+		if c.closed {
+			c.cond.L.Unlock()
+			return true
+		}
+		c.cond.Wait()
+	}
+
+	pkt := c.l.Remove(c.l.Front()).(*Pkt)
+	pkt_buffer.is_done = false
+	pkt_buffer.PacketList = pkt.PacketList
+	pkt_buffer.Payload_len = pkt.Payload_len
+	pkt_buffer.Start_offset = pkt.Start_offset
+
+	c.cond.Signal()
+	c.cond.L.Unlock()
+	return false
+}
+
+func (c *shareList) send(pkt *Pkt) {
+	c.cond.L.Lock()
+
+	if c.l.Len() == 0 {
+		c.l.PushBack(pkt)
+		c.cond.Signal()
+	} else {
+		c.l.PushBack(pkt)
+	}
+
+	if c.closed {
+		panic("send on closed shareList")
+	}
+
+	c.cond.L.Unlock()
+}
+
+func (c *shareList) close() {
+	c.cond.L.Lock()
+	c.closed = true
+	c.cond.Signal()
+	c.cond.L.Unlock()
 }

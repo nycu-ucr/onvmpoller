@@ -1,10 +1,15 @@
 #include "onvm_nflib.h"
 #include "_cgo_export.h"
 #include "string.h"
+#include <time.h>
 
-// extern int DeliverPacket(struct rte_mbuf *, int, char *, int, uint32, uint16, uint32, uint16)
+// extern int DeliverPacket(struct mbuf_list *, int, char *, int, uint32, uint16, uint32, uint16)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
+void get_monotonic_time(struct timespec* ts);
+long get_time_nano(struct timespec* ts);
+double get_elapsed_time_sec(struct timespec* before, struct timespec* after);
+long get_elapsed_time_nano(struct timespec* before, struct timespec* after);
 
 #define HTTP_FRAME 0
 #define ESTABLISH_CONN 1
@@ -12,10 +17,14 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
 #define REPLY_CONN 3
 #define BIG_FRAME 4
 #define TCP_PROTO_NUM 0x06
+#define MBUF_SIZE 4096
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
 uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
 uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
+
+/* Global mempool */
+struct rte_mempool *pktmbuf_pool;
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 
@@ -26,6 +35,50 @@ struct four_tuple
     rte_be32_t dst_addr; /**< destination address */
     rte_be16_t dst_port; /**< TCP destination port. */
 };
+
+struct mbuf_list
+{
+    struct rte_mbuf *pkt;
+    struct mbuf_list *next;
+};
+
+static inline struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt)
+{
+    struct mbuf_list *result = (struct mbuf_list *)malloc(sizeof(struct mbuf_list));
+    struct mbuf_list *list_ptr = result;
+
+    result->pkt = pkt;
+    result->next = NULL;
+
+    while (pkt->next != NULL)
+    {
+        // Move packet
+        pkt = pkt->next;
+        // Create an new list
+        list_ptr->next = (struct mbuf_list *)malloc(sizeof(struct mbuf_list));
+        // Move list
+        list_ptr = list_ptr->next;
+        // Store packet
+        list_ptr->pkt = pkt;
+    }
+
+    return result;
+}
+
+void delete_mbuf_list(struct mbuf_list *list)
+{
+    struct mbuf_list *ptr = list;
+
+    while (ptr != NULL)
+    {
+        struct mbuf_list *tmp = ptr->next;
+
+        free(ptr);
+        ptr = tmp->next;
+    }
+
+    return;
+}
 
 struct four_tuple_str
 {
@@ -51,6 +104,24 @@ pkt_tcp_hdr(struct rte_mbuf *pkt)
     uint8_t *pkt_data =
         rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr);
     return (struct rte_tcp_hdr *)pkt_data;
+}
+
+void get_monotonic_time(struct timespec* ts) {
+    clock_gettime(CLOCK_MONOTONIC, ts);
+}
+
+long get_time_nano(struct timespec* ts) {
+    return (long)ts->tv_sec * 1e9 + ts->tv_nsec;
+}
+
+double get_elapsed_time_sec(struct timespec* before, struct timespec* after) {
+    double deltat_s  = after->tv_sec - before->tv_sec;
+    double deltat_ns = after->tv_nsec - before->tv_nsec;
+    return deltat_s + deltat_ns*1e-9;
+}
+
+long get_elapsed_time_nano(struct timespec* before, struct timespec* after) {
+    return get_time_nano(after) - get_time_nano(before);
 }
 
 int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
@@ -97,10 +168,17 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
         }
     }
 
+    pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
+    if (pktmbuf_pool == NULL)
+    {
+        onvm_nflib_stop(*nf_local_ctx);
+        rte_exit(EXIT_FAILURE, "Cannot find mbuf pool!\n");
+    }
+
     return 0;
 }
-// handle_payload(pktmbuf_pool, buffer, buffer_length);
-struct rte_mbuf *handle_payload(struct rte_mempool *pktmbuf_pool, char *buffer, int buffer_length)
+
+struct rte_mbuf *handle_payload(char *buffer, int buffer_length)
 {
     struct rte_mbuf *pkt;
     pkt = rte_pktmbuf_alloc(pktmbuf_pool);
@@ -213,24 +291,41 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
 {
     struct rte_mbuf *pkt;
     struct onvm_pkt_meta *pmeta;
-    struct rte_mempool *pktmbuf_pool;
     uint8_t *pkt_payload;
     struct rte_tcp_hdr *pkt_tcp_hdr;
     struct rte_ipv4_hdr *pkt_iph;
     struct rte_ether_hdr *pkt_eth_hdr;
 
-    // printf("[service_id]: %d\n[pkt_type]: %d\n[src_ip]: %d\n[src_port]: %d\n[dst_ip]: %d\n[dst_port]: %d\n",
-    //        service_id, pkt_type, src_ip, src_port, dst_ip, dst_port);
-    // printf("C char ptr: %p\n", buffer);
+    // struct timespec t_start;
+    // struct timespec t_end;
 
-    pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
-    if (pktmbuf_pool == NULL)
+    // get_monotonic_time(&t_start);
+    // pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] rte_mempool_lookup latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+
+    switch (pkt_type)
     {
-        onvm_nflib_stop(ctx);
-        rte_exit(EXIT_FAILURE, "Cannot find mbuf pool!\n");
+    case ESTABLISH_CONN:
+        pkt = rte_pktmbuf_alloc(pktmbuf_pool);
+        break;
+    case REPLY_CONN:
+        pkt = rte_pktmbuf_alloc(pktmbuf_pool);
+        break;
+    case CLOSE_CONN:
+        pkt = rte_pktmbuf_alloc(pktmbuf_pool);
+        break;
+    case HTTP_FRAME:
+        pkt = handle_payload(buffer, buffer_length);
+        break;
+    default:
+        printf("[onvm_send_pkt]Unknown pkt type: %d\n", pkt_type);
+        break;
     }
-
-    pkt = handle_payload(pktmbuf_pool, buffer, buffer_length);
+    // get_monotonic_time(&t_start);
+    // pkt = handle_payload(buffer, buffer_length);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] handle_payload latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
     if (pkt == NULL)
     {
         printf("Payload handling error\n");
@@ -260,7 +355,10 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // printf("[onvm_send_pkt][pkt->pkt_len: %d][before]\n", pkt->pkt_len);
 
     /* Set TCP header */
+    // get_monotonic_time(&t_start);
     pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] rte_pktmbuf_prepend latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
     if (pkt_tcp_hdr == NULL)
     {
         printf("Failed to prepend TCP header. Consider splitting up the packet.\n");
@@ -279,7 +377,11 @@ void onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     case CLOSE_CONN:
         pkt_tcp_hdr->tcp_flags = RTE_TCP_FIN_FLAG;
         break;
+    case HTTP_FRAME:
+        pkt_tcp_hdr->tcp_flags = RTE_TCP_PSH_FLAG;
+        break;
     default:
+        printf("[onvm_send_pkt]Unknown pkt type: %d\n", pkt_type);
         break;
     }
     // rte_memcpy(pkt_tcp_hdr, pkt_tcp_hdr, sizeof(TCP_HDR_LEN)); // + option_len);
@@ -350,29 +452,269 @@ static inline int calculate_payload_len(struct rte_mbuf *pkt)
     return payload_len;
 }
 
-void payload_assemble(uint8_t *payload, int payload_len, struct rte_mbuf *pkt)
+static inline int calculate_offset(int empty_space, int mbuf_data_len, int mbuf_cap)
 {
-    int off_set = 0;
-    int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
-    int head_data = pkt->data_len;
-
-    // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
-    uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-    rte_memcpy(payload + off_set, data, first_segm_payload_len);
-    off_set = off_set + first_segm_payload_len;
-    pkt = pkt->next;
-
-    while (pkt != NULL)
+    if (empty_space >= mbuf_data_len)
     {
-        // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
-        uint8_t *d = rte_pktmbuf_mtod(pkt, uint8_t *);
-        rte_memcpy(payload + off_set, d, pkt->data_len);
-        off_set = off_set + pkt->data_len;
+        return mbuf_data_len;
+    }
+    else
+    {
+        return empty_space;
+    }
+}
+
+static inline int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len)
+{
+    rte_memcpy(dst_ptr, src_ptr, copy_len);
+    return copy_len;
+}
+
+int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
+{
+    struct rte_mbuf *pkt = pkt_list->pkt;
+    struct rte_mbuf *head = pkt;               // Restore the pointer
+    struct mbuf_list *tmp_pkt_list = pkt_list; // For move pointer
+
+    pkt->next = NULL;
+    // Rebuild packet
+    while (tmp_pkt_list->next != NULL)
+    {
+        // Move pakcet list
+        tmp_pkt_list = tmp_pkt_list->next;
+        // Store packet
+        pkt->next = tmp_pkt_list->pkt;
+        // Move packet
         pkt = pkt->next;
     }
+    pkt = head;
 
-    return;
+#if 0
+    // Debug mbuf list
+    struct mbuf_list *tmp;
+    tmp = pkt_list;
+    printf("payload_assemble show mbuf list\n");
+    while (tmp != NULL) {
+        printf("%p (%p) -> ", tmp, tmp_pkt_list->pkt);
+        tmp = tmp_pkt_list->next;
+    }
+    printf("\n");
+#endif
+
+    int remaining_pkt_len = calculate_payload_len(pkt) - start_offset;
+    int end_offset = start_offset;
+
+    // Calc already read part, the current position of payload pointer
+    uint16_t c_q = start_offset / MBUF_SIZE;
+    uint16_t c_r = start_offset % MBUF_SIZE;
+
+    if (c_q == 0 && c_r == 0 && remaining_pkt_len <= buff_cap && remaining_pkt_len <= MBUF_SIZE)
+    {
+        // Shortcut
+        uint8_t *payload_ptr = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+        rte_memcpy(buffer_ptr, payload_ptr, remaining_pkt_len);
+        end_offset += remaining_pkt_len;
+        // printf("[handle_assemble] (shortcut): read %d bytes data\n", end_offset - start_offset);
+        return end_offset;
+    }
+
+    struct rte_mbuf *c_pkt = pkt;
+    for (uint16_t x = 0; x < c_q; ++x)
+    {
+        c_pkt = c_pkt->next;
+    }
+
+    // Calc the payload pointer
+    uint8_t *payload_ptr;
+    if (c_q == 0)
+    {
+        // First segment has header
+        payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+    }
+    else
+    {
+        payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+    }
+    payload_ptr += c_r;
+
+    if (remaining_pkt_len <= buff_cap)
+    {
+        // It is able to read all packet into buffer
+
+        // Calc remaining need read part
+        uint16_t need_r1 = (remaining_pkt_len > MBUF_SIZE) ? MBUF_SIZE - c_r : remaining_pkt_len; // The remaining part of the current segment
+        uint16_t need_q = (remaining_pkt_len - need_r1) / MBUF_SIZE;
+        uint16_t need_r2 = remaining_pkt_len - need_r1 - (need_q * MBUF_SIZE); // The remaining part of the last segment
+
+        if ((need_r1 + need_q * MBUF_SIZE + need_r2) != remaining_pkt_len)
+        {
+            printf("Error: size mismatch %d != %d\n", need_r1 + need_q * MBUF_SIZE + need_r2, remaining_pkt_len);
+        }
+
+        int n = 0;
+        // Read the first part
+        n = copy(buffer_ptr, payload_ptr, need_r1);
+        buffer_ptr += n;
+        end_offset += n;
+        c_pkt = c_pkt->next; // Move to next segment
+
+        // Read the second part
+        if (need_q != 0)
+        {
+            for (int x = 0; x < need_q; ++x)
+            {
+                payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+                n = copy(buffer_ptr, payload_ptr, MBUF_SIZE);
+                buffer_ptr += n;
+                end_offset += n;
+
+                c_pkt = c_pkt->next;
+            }
+        }
+
+        // Read the third part
+        if (need_r2 != 0)
+        {
+            payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+            n = copy(buffer_ptr, payload_ptr, need_r2);
+            buffer_ptr += n;
+            end_offset += n;
+        }
+
+        // printf("[handle_assemble] (Case 1): read %d bytes data\n", end_offset - start_offset);
+        return end_offset;
+    }
+    else
+    {
+        // It can not read all packet into buffer, only read buff_cap
+
+        int n = 0;
+        int original_buff_cap = buff_cap;
+
+        // Read the first part
+        uint16_t need_r1 = (remaining_pkt_len > MBUF_SIZE) ? MBUF_SIZE - c_r : remaining_pkt_len; // The remaining part of the current segment
+        if (need_r1 > buff_cap)
+        {
+            n = copy(buffer_ptr, payload_ptr, buff_cap);
+            end_offset += n;
+
+            // printf("[handle_assemble] (Case 2-1-1): read %d bytes data\n", end_offset - start_offset);
+            return end_offset;
+        }
+        else
+        {
+            n = copy(buffer_ptr, payload_ptr, need_r1);
+            buffer_ptr += n;
+            end_offset += n;
+            buff_cap -= n;
+        }
+        c_pkt = c_pkt->next; // Move to next segment
+
+        if (buff_cap == 0)
+        {
+            // printf("[handle_assemble] (Case 2-1-2): read %d bytes data\n", end_offset - start_offset);
+            return end_offset;
+        }
+        else if (buff_cap < 0)
+        {
+            // This is error
+            printf("Error: the capacity of buffer is %d\n", buff_cap);
+        }
+
+        // Challenge 2: Read the second part
+        uint16_t need_q = buff_cap / MBUF_SIZE;
+
+        if (need_q != 0)
+        {
+            for (int x = 0; x < need_q; ++x)
+            {
+                payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *);
+                n = copy(buffer_ptr, payload_ptr, MBUF_SIZE);
+                buffer_ptr += n;
+                end_offset += n;
+                buff_cap -= n;
+
+                c_pkt = c_pkt->next;
+            }
+        }
+
+        // Challenge 3: Read the third part
+        if (buff_cap != 0)
+        {
+            n = copy(buffer_ptr, payload_ptr, buff_cap);
+            end_offset += n;
+        }
+
+        // printf("[handle_assemble] (Case 2): read %d bytes data\n", end_offset - start_offset);
+        return end_offset;
+    }
 }
+
+// int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int start_offset)
+int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
+{
+    int end_offset = 0;
+
+    // struct timespec t_start;
+    // struct timespec t_end;
+
+    // get_monotonic_time(&t_start);
+    end_offset = handle_assemble(buffer_ptr, buff_cap, pkt_list, start_offset);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] handle_assemble latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+    // get_monotonic_time(&t_start);
+    // rte_pktmbuf_free(pkt_list->pkt);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] rte_pktmbuf_free latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+
+    return end_offset;
+}
+
+// int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int Start_offset)
+// {
+//     int offset = 0;
+//     int End_offset = Start_offset;
+//     int first_segm_payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
+
+//     // printf("[payload_assemble][Get: %d(bytes)]\n", first_segm_payload_len);
+//     if (buff_cap < first_segm_payload_len - Start_offset)
+//     {
+//         /* Target buffer cap is smaller than data left in pkt*/
+//         offset = buff_cap;
+//     }
+//     else
+//     {
+//         /* Target buffer cap is larger than data left in first mbuf */
+//         offset = first_segm_payload_len - Start_offset;
+//     }
+
+//     uint8_t *data = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+//     rte_memcpy(buffer_ptr, data + Start_offset, offset);
+//     End_offset = End_offset + offset;
+
+//     // int empty_space = buff_cap - offset;
+//     // if (!empty_space)
+//     // {
+//     //     /* No space left in target buff */
+//     //     return End_offset
+//     // };
+
+//     // uint16_t mbuf_size = rte_pktmbuf_tailroom(head);
+//     // pkt = pkt->next;
+
+//     // while (pkt != NULL)
+//     // {
+//     //     // printf("[payload_assemble][Get: %d(bytes)]\n", pkt->data_len);
+//     //     uint8_t *src = rte_pktmbuf_mtod(pkt, uint8_t *);
+//     //     int offset = calculate_offset(empty_space, pkt->data_len);
+
+//     //     rte_memcpy(buffer_ptr + End_offset, src, offset);
+//     //     End_offset = End_offset + offset;
+//     //     pkt = pkt->next;
+//     // }
+
+//     return End_offset;
+// }
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
 {
@@ -381,6 +723,10 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     struct rte_ether_hdr *eth_hdr;
     uint8_t *payload;
     int payload_len, pkt_type;
+    struct mbuf_list *mbuf_list;
+
+    // struct timespec t_start;
+    // struct timespec t_end;
 
     meta->action = ONVM_NF_ACTION_DROP;
 
@@ -391,7 +737,10 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     //     return -1;
     // }
 
+    // get_monotonic_time(&t_start);
     ipv4_hdr = onvm_pkt_ipv4_hdr(pkt);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] onvm_pkt_ipv4_hdr latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
     if (ipv4_hdr == NULL)
     {
         // printf("Error packet is not IP packet\n");
@@ -416,23 +765,58 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     case RTE_TCP_FIN_FLAG:
         pkt_type = CLOSE_CONN;
         break;
-    default:
+    case RTE_TCP_PSH_FLAG:
         pkt_type = HTTP_FRAME;
+        // get_monotonic_time(&t_start);
+        mbuf_list = create_mbuf_list(pkt);
+        // get_monotonic_time(&t_end);
+        // printf("[ONVM] create_mbuf_list latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+        #if 0
+            // Debug mbuf list
+            struct mbuf_list *tmp = mbuf_list;
+            printf("packet_handler show mbuf list\n");
+            while (tmp != NULL) {
+                // printf("%p\n", tmp);
+                // printf("%p\n", tmp->pkt);
+                printf("%p (%p) -> ", tmp, tmp->pkt);
+                tmp = tmp->next;
+            }
+            printf("\n");
+        #endif
+        break;
+    default:
+        // printf("[packet_handler]Unknown pkt type: %d\n", tcp_hdr->tcp_flags);
         break;
     }
 
     int res_code;
+
     if (pkt->next == NULL)
     {
         payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
         payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
-        res_code = DeliverPacket(pkt, pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
     else
     {
+        // get_monotonic_time(&t_start);
         payload_len = calculate_payload_len(pkt);
-        res_code = DeliverPacket(pkt, BIG_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+        // get_monotonic_time(&t_end);
+        // printf("[ONVM] calculate_payload_len latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+        // res_code = DeliverPacket(pkt, HTTP_FRAME, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
     }
 
-    return 0;
+    // get_monotonic_time(&t_start);
+    res_code = DeliverPacket(mbuf_list, pkt_type, payload, payload_len, ipv4_hdr->src_addr, tcp_hdr->src_port, ipv4_hdr->dst_addr, tcp_hdr->dst_port);
+    // get_monotonic_time(&t_end);
+    // printf("[ONVM] DeliverPacket latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+
+    return res_code;
+}
+
+void test_cgo(char* ptr)
+{
+    char* tmp = (char*)malloc(sizeof(char)*8);
+    strncpy(tmp, ptr, 8);
+    free(tmp);
+    return;
 }
