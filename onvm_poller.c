@@ -6,8 +6,9 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include </home/hstsai/onvm/onvmpoller/list.h>
 
-// extern int XIO_wait(int, void *)
+// extern int XIO_wait(struct list_node *)
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *nf_local_ctx);
 void get_monotonic_time(struct timespec *ts);
@@ -17,6 +18,7 @@ long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
 int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
 int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
+int xio_close(struct xio_socket *xs);
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
@@ -47,15 +49,15 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 #define XIO_SOCKET 2
 
 /* Socket status */
-#define NEW_SOCKET 0
-#define LISTENING 1
-#define WAITING_EST_ACK 2
-#define EST_COMPLETE 3
-#define RX_CLOSED 4
-#define TX_CLOSED 5
-#define RX_TX_CLOSED 6
-#define READER_WAITING 7
-#define READER_HANDLING 8
+// #define NEW_SOCKET 0
+// #define LISTENING 1
+// #define WAITING_EST_ACK 2
+// #define EST_COMPLETE 3
+// #define RX_CLOSED 4
+// #define TX_CLOSED 5
+// #define RX_TX_CLOSED 6
+// #define READER_WAITING 7
+// #define READER_HANDLING 8
 
 /*
 ********************************
@@ -81,6 +83,17 @@ struct onvm_nf_local_ctx *globalVar_nf_local_ctx;
 
 ********************************
 */
+typedef enum socket_status {
+    NEW_SOCKET,
+    LISTENING,
+    WAITING_EST_ACK,
+    EST_COMPLETE,
+    RX_CLOSED,
+    TX_CLOSED,
+    RX_TX_CLOSED,
+    READER_WAITING,
+    READER_HANDLING
+} socket_status;
 
 struct ipv4_4tuple
 {
@@ -123,7 +136,7 @@ struct conn_request
 
 struct xio_socket
 {
-    int status;
+    socket_status status;
     int socket_type;
 
     int service_id;
@@ -131,8 +144,10 @@ struct xio_socket
 
     struct Queue *socket_buf; /* Use for store pkts or connection-requests */
 
-    char *go_channel_ptr;
+    void *go_channel_ptr;
     rte_rwlock_t *rwlock;
+    rte_atomic16_t *rx_status; /* [0:ACTIVE] [1:CLOSE] */
+    rte_atomic16_t *tx_status; /* [0:ACTIVE] [1:CLOSE] */
 };
 
 /*
@@ -325,6 +340,25 @@ pkt_tcp_hdr(struct rte_mbuf *pkt)
     uint8_t *pkt_data =
         rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr);
     return (struct rte_tcp_hdr *)pkt_data;
+}
+
+/* Only when TX & RX both close then we can delete socket from conn_tables */
+static inline void try_delete_socket(struct xio_socket *xs)
+{
+    if (rte_atomic16_read(xs->rx_status) && rte_atomic16_read(xs->tx_status)) {
+        struct ipv4_4tuple key = swap_four_tuple(xs->fourTuple);
+
+        int ret;
+        ret = rte_hash_del_key(conn_tables, (void *)&key);
+        if (ret < 0)
+        {
+            printf("[try_delete_socket] Unable to delete from conn_tables\n");
+        }
+        // free(xs->rwlock);
+        // free(xs->socket_buf);
+        // free(xs->tx_status);
+        // free(xs->rx_status);
+    }
 }
 
 void get_monotonic_time(struct timespec *ts)
@@ -959,6 +993,63 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     return end_offset;
 }
 
+struct list_node *head;
+struct list_node *tail;
+int list_size = 0;
+
+static inline void reset_list(struct list_node *head)
+{
+    struct list_node *tmp;
+
+    while(head != NULL){
+        tmp = head;
+        head = head->next;
+        free(tmp);
+    }
+
+    list_size = 0;
+}
+
+/*
+    [return]
+    0: not reach
+    1: reach
+*/
+static inline int threshold()
+{
+    int table_size = rte_hash_count(conn_tables);
+
+    return (list_size >= table_size/2);
+}
+
+static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
+{
+    struct list_node *new_node = (struct list_node *)malloc(sizeof(list_node));
+    new_node->go_channel_ptr = go_channel_ptr;
+    new_node->pkt_type = pkt_type;
+    new_node->next = NULL;
+
+    if (list_size == 0){
+        head = new_node;
+        tail = new_node;
+        list_size++;
+    }else{
+        tail->next = new_node;
+        tail = tail->next;
+        list_size++;
+    }
+
+    if (!threshold()){
+        return 0;
+    }
+
+    int res_code;
+    res_code = XIO_wait(head);
+    reset_list(head);
+
+    return 0;
+}
+
 static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
 {
     // printf("[handle_ESTABLISH_CONN] Recieve pkt\n");
@@ -995,7 +1086,7 @@ static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct r
     rte_rwlock_write_unlock(listener->rwlock);
 
     int res_code;
-    res_code = XIO_wait(ESTABLISH_CONN, listener->go_channel_ptr);
+    res_code = batch_wake_up(ESTABLISH_CONN, listener->go_channel_ptr);
 
     return res_code;
 }
@@ -1022,7 +1113,9 @@ static inline int handle_REPLY_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
     rte_rwlock_write_unlock(xs->rwlock);
 
     int res_code;
-    res_code = XIO_wait(REPLY_CONN, xs->go_channel_ptr);
+    res_code = batch_wake_up(REPLY_CONN, xs->go_channel_ptr);
+
+    return res_code;
 }
 
 static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
@@ -1038,10 +1131,15 @@ static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
         return -1;
     }
 
-    /* TODO XIO socket close */
+    if(!rte_atomic16_read(xs->rx_status)){
+        rte_atomic16_set(xs->rx_status, 1);
+        try_delete_socket(xs);
+    }
 
     int res_code;
-    res_code = XIO_wait(CLOSE_CONN, xs->go_channel_ptr);
+    res_code = batch_wake_up(CLOSE_CONN, xs->go_channel_ptr);
+
+    return res_code;
 }
 
 static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt)
@@ -1086,7 +1184,7 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
         xs->status = EST_COMPLETE;
         rte_rwlock_write_unlock(xs->rwlock);
 
-        res_code = XIO_wait(HTTP_FRAME, xs->go_channel_ptr);
+        res_code = batch_wake_up(HTTP_FRAME, xs->go_channel_ptr);
     } else if (xs->status == EST_COMPLETE)
     {
         // printf("[handle_HTTP_FRAME] EST_COMPLETE\n");
@@ -1194,7 +1292,7 @@ void *test_CondVarGet()
     return conditon_var;
 }
 
-struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4tuple four_tuple, char *sem)
+struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4tuple four_tuple, void *sem)
 {
     // printf("[xio_new_socket] Start create type-%d socket\n", socket_type);
     struct xio_socket *xs = (struct xio_socket *)malloc(sizeof(struct xio_socket));
@@ -1209,9 +1307,13 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4
 
     xs->go_channel_ptr = sem;
     xs->rwlock = (rte_rwlock_t *)malloc(sizeof(rte_rwlock_t));
+    xs->rx_status = (rte_atomic16_t *)malloc(sizeof(rte_atomic16_t));
+    xs->tx_status = (rte_atomic16_t *)malloc(sizeof(rte_atomic16_t));
 
     /* Init rwlock */
     rte_rwlock_init(xs->rwlock);
+    rte_atomic16_init(xs->rx_status);
+    rte_atomic16_init(xs->tx_status);
 
     // print_socket(xs);
     /* populate into table*/
@@ -1246,8 +1348,6 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 }
 
 /*
-   [Input]
-   return_value: used to get the newest return value in async case
    [Return]
    >0: read size
     0: no pkt in socket buffer
@@ -1304,6 +1404,37 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
         rte_rwlock_write_unlock(xs->rwlock);
 
         ret = 0;
+    }
+
+    return ret;
+}
+
+/*
+   [Return]
+   >0: SUCCESS
+   -1: FAIL
+*/
+int xio_close(struct xio_socket *xs)
+{
+    int ret = 1;
+    if(!rte_atomic16_read(xs->tx_status))
+    {
+        /* TX status not closed yet*/
+
+        /* Send CLOSE_CONN control message */
+        ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, CLOSE_CONN,
+                            xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                            NULL, 0);
+
+        if(ret < 0){
+            printf("[xio_write] onvm_send_pkt not success\n");
+            return -1;
+        }
+
+        /* Close loacl socket */
+        rte_atomic16_set(xs->tx_status, 1);
+
+        try_delete_socket(xs);
     }
 
     return ret;
