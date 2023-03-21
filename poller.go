@@ -21,15 +21,12 @@ extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list 
 extern int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
                 char *buffer, int buffer_length);
-extern void test_cgo(char* ptr);
-extern void test_CondVarPut(char *condVarPtr);
-extern void* test_CondVarGet();
-extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-extern int xio_close(struct xio_socket *xs);
-extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
-extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
-extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
+extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+extern int xio_close(struct xio_socket *xs, int *error_code);
+extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code);
+extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code);
+extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code);
 
 */
 import "C"
@@ -52,6 +49,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -76,7 +74,7 @@ const (
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
-	LOG_LEVEL = logrus.WarnLevel
+	LOG_LEVEL = logrus.TraceLevel
 	// Packet manager numbers
 	ONVM_POLLER_NUM = 8
 )
@@ -948,13 +946,6 @@ func DialONVM(network, address string) (net.Conn, error) {
 	return conn, nil
 }
 
-/* Test related */
-func Test_cgo() {
-	b := []byte("Test-CGO")
-	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
-	C.test_cgo(buffer_ptr)
-}
-
 func TimeTrack(start time.Time) {
 	elapsed := time.Since(start)
 
@@ -1031,65 +1022,6 @@ func (c *shareList) close() {
 	c.cond.L.Unlock()
 }
 
-/* Test channel ptr */
-func TestCgoCondWait(id int) {
-	/*
-		condVar := sync.NewCond(&sync.Mutex{})
-		// logger.Log.Warnf("[TestCgoCondWait] condVar: %p", condVar)
-
-		condVarPtr := (*C.char)(unsafe.Pointer(condVar))
-		// logger.Log.Warnf("[TestCgoCondWait] condVarPtr: %p", condVarPtr)
-
-		C.test_CondVarPut(condVarPtr)
-
-		// logger.Log.Warnf("[TestCgoCondWait] Wait on sync.Cond")
-		condVar.L.Lock()
-		condVar.Wait()
-		t := time.Now().Nanosecond()
-
-		logger.Log.Warnf("[TestCgoCondWait] Wake-up time: %d", t)
-
-		// logger.Log.Warnf("[TestCgoCondWait] Wake-up from sync.Cond")
-	*/
-	condVar := make(chan int64, 1)
-	// logger.Log.Warnf("[TestCgoCondWait] condVar: %p", &condVar)
-	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
-	// logger.Log.Warnf("[TestCgoCondWait] condVarPtr: %p", condVarPtr)
-	C.test_CondVarPut(condVarPtr)
-
-	t_start := <-condVar
-
-	t := time.Now().UnixNano()
-	close(condVar)
-	logger.Log.Warnf("[TestCgoCondWait][%d] Wake-up latency: %d", id, t-t_start)
-}
-
-func TestCgoCondSignal(id int) {
-	/*
-		condVarPtr := C.test_CondVarGet()
-		// logger.Log.Warnf("[TestCgoCondSignal] Successful get golang cond_var from clang global var")
-		// logger.Log.Warnf("[TestCgoCondSignal] condVarPtr: %p", condVarPtr)
-
-		condVar := (*sync.Cond)(condVarPtr)
-		// logger.Log.Warnf("[TestCgoCondSignal] condVar: %p", condVar)
-
-		condVar.L.Lock()
-		t := time.Now().Nanosecond()
-		condVar.Signal()
-		condVar.L.Unlock()
-
-		logger.Log.Warnf("[TestCgoCondSignal] Signal time: %d", t)
-		// logger.Log.Warnf("[TestCgoCondSignal] Signal from sync.Cond")
-	*/
-
-	condVarPtr := C.test_CondVarGet()
-	// logger.Log.Warnf("[TestCgoCondSignal] condVarPtr: %p", condVarPtr)
-	condVar := (*chan int64)(condVarPtr)
-	t := time.Now().UnixNano()
-	*condVar <- t
-	// logger.Log.Warnf("[TestCgoCondSignal][%d] Signal time: %d", id, t)
-}
-
 /*
 ********************************
 
@@ -1143,13 +1075,13 @@ func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
 	xio_listener = &XIO_Listener{
 		laddr:         laddr,
 		four_tuple:    four_tuple,
-		complete_chan: make(chan struct{}, 100),
+		complete_chan: make(chan struct{}, 1),
 	}
 
 	complete_chan_ptr := (*C.char)(unsafe.Pointer(&xio_listener.complete_chan))
 
 	xs := C.xio_listen(C.uint32_t(xio_listener.four_tuple.Src_ip), C.uint16_t(xio_listener.four_tuple.Src_port),
-		C.uint32_t(xio_listener.four_tuple.Dst_ip), C.uint16_t(xio_listener.four_tuple.Dst_port), complete_chan_ptr)
+		C.uint32_t(xio_listener.four_tuple.Dst_ip), C.uint16_t(xio_listener.four_tuple.Dst_port), complete_chan_ptr, nil)
 	if xs == nil {
 		msg := fmt.Sprintf("Unable to listen on %v", xio_listener.laddr.String())
 		err = errors.New(msg)
@@ -1163,26 +1095,41 @@ func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
 
 func (xl XIO_Listener) Accept() (net.Conn, error) {
 	logger.Log.Traceln("Start XIO_Listener.Accept")
-	// logger.Log.Traceln("xl.complete_chan: %p", xl.complete_chan)
-	_, ok := <-xl.complete_chan
 
-	if !ok {
-		err := fmt.Errorf("Accept EOF")
-		return nil, err
-	}
+	var connection *XIO_Connection
 
 	condVar := make(chan struct{}, 1)
 	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
-	xs := C.xio_accept(xl.xio_socket, condVarPtr)
-	if xs == nil {
-		msg := fmt.Sprintf("Unable to accept on %v", xio_listener.laddr.String())
-		err := errors.New(msg)
-		return nil, err
-	}
+	err_code := 0
+	err_code_ptr := (*C.int)(unsafe.Pointer(&err_code))
+	for {
+		err_code = 0
+		xs := C.xio_accept(xl.xio_socket, condVarPtr, err_code_ptr)
 
-	connection := &XIO_Connection{
-		xio_socket: xs,
-		sync_chan:  condVar,
+		if err_code == int(syscall.EAGAIN) {
+			// Wait for connection request
+			_, ok := <-xl.complete_chan
+			if !ok {
+				err := fmt.Errorf("Accept: listener closed")
+				close(condVar)
+				return nil, err
+			}
+			continue
+		} else if xs == nil {
+			err := fmt.Errorf("Accept: xio_accept return nil socket, errno=%d", err_code)
+			close(condVar)
+			return nil, err
+		} else if err_code != 0 {
+			err := fmt.Errorf("Accept: xio_accept errno=%d", err_code)
+			close(condVar)
+			return nil, err
+		} else {
+			connection = &XIO_Connection{
+				xio_socket: xs,
+				sync_chan:  condVar,
+			}
+			break
+		}
 	}
 
 	return connection, nil
@@ -1226,7 +1173,7 @@ func DialXIO(network, address string) (net.Conn, error) {
 
 	// Send connection request to server
 	xs := C.xio_connect(C.uint32_t(conn.four_tuple.Src_ip), C.uint16_t(conn.four_tuple.Src_port),
-		C.uint32_t(conn.four_tuple.Dst_ip), C.uint16_t(conn.four_tuple.Dst_port), condVarPtr)
+		C.uint32_t(conn.four_tuple.Dst_ip), C.uint16_t(conn.four_tuple.Dst_port), condVarPtr, nil)
 	conn.xio_socket = xs
 
 	if conn.xio_socket == nil {
@@ -1271,30 +1218,29 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 	buffer_len := len(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-	/*
-		[Return]
-		>0: read size
-		 0: no pkt in socket buffer
-		-1: EOF
-	*/
-	ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len))
-	read_len := int(ret)
-	logger.Log.Tracef("C.xio_read return=%d, four-tuple: %v", read_len, connection.four_tuple)
-	if read_len == -1 {
-		err = io.EOF
-		return length, err
-	} else if read_len == 0 {
-		// Wait for pkt
-		_, ok := <-connection.sync_chan
+	err_code := 0
+	err_code_ptr := (*C.int)(unsafe.Pointer(&err_code))
+	for {
+		err_code = 0
+		ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len), err_code_ptr)
+		length = int(ret)
 
-		if !ok {
-			err = io.EOF
-			return length, err
+		if err_code == int(syscall.EAGAIN) {
+			// Wait for pkt
+			_, ok := <-connection.sync_chan
+			if !ok {
+				/* Socket closed */
+				return 0, nil
+			}
+			continue
+		} else if length == 0 && err_code == 0 {
+			return 0, io.EOF
+		} else if err_code != 0 {
+			err := fmt.Errorf("Read: xio_read errno=%d", err_code)
+			return 0, err
+		} else {
+			break
 		}
-		l := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len))
-		length = int(l)
-	} else {
-		length = read_len
 	}
 
 	runtime.KeepAlive(b)
@@ -1308,20 +1254,22 @@ func (connection XIO_Connection) Write(b []byte) (int, error) {
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
 	logger.Log.Debugf("Write %d data.", len(b))
 
+	var length int
+	var err error
+
 	buffer_len := len(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-	// Use CGO to call functions of NFLib
-	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len))
-	write_len := int(ret)
-	if write_len < 0 {
-		err := fmt.Errorf("xio_write error")
-		return -1, err
+	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len), nil)
+	length = int(ret)
+	if length < 0 {
+		err = fmt.Errorf("xio_write error")
+		return 0, err
 	}
 
 	runtime.KeepAlive(b)
 
-	return write_len, nil
+	return length, nil
 }
 
 // Close implements the net.Conn Close method.
@@ -1330,7 +1278,7 @@ func (connection XIO_Connection) Close() error {
 
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
-	ret := C.xio_close(connection.xio_socket)
+	ret := C.xio_close(connection.xio_socket, nil)
 	if int(ret) == -1 {
 		err = fmt.Errorf("xio_close failed")
 	}

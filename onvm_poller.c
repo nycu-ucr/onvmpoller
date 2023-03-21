@@ -16,12 +16,12 @@ long get_time_nano(struct timespec *ts);
 double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
 long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
-int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length);
-int xio_close(struct xio_socket *xs);
-struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
-struct xio_socket *xio_accept(struct xio_socket *listener, char *sem);
-struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr);
+int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+int xio_close(struct xio_socket *xs, int *error_code);
+struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code);
+struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code);
+struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code);
 
 /*
 ********************************
@@ -86,13 +86,10 @@ struct onvm_nf_local_ctx *globalVar_nf_local_ctx;
 typedef enum socket_status {
     NEW_SOCKET,
     LISTENING,
+    LISTENER_WAITING,
     WAITING_EST_ACK,
     EST_COMPLETE,
-    RX_CLOSED,
-    TX_CLOSED,
-    RX_TX_CLOSED,
-    READER_WAITING,
-    READER_HANDLING
+    READER_WAITING
 } socket_status;
 
 struct ipv4_4tuple
@@ -1017,9 +1014,10 @@ static inline void reset_list(struct list_node *head)
 */
 static inline int threshold()
 {
-    int table_size = rte_hash_count(conn_tables);
+    // int table_size = rte_hash_count(conn_tables);
 
-    return (list_size >= table_size/2);
+    // return (list_size >= table_size/2);
+    return 1;
 }
 
 static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
@@ -1055,6 +1053,7 @@ static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct r
     // printf("[handle_ESTABLISH_CONN] Recieve pkt\n");
     // print_fourTuple(four_tuple);
 
+    int res_code;
     struct ipv4_4tuple ft = {
         .ip_dst = four_tuple->ip_dst,
         .ip_src = 0,
@@ -1083,10 +1082,13 @@ static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct r
 
     rte_rwlock_write_lock(listener->rwlock);
     enqueue(listener->socket_buf, req);
-    rte_rwlock_write_unlock(listener->rwlock);
-
-    int res_code;
-    res_code = batch_wake_up(ESTABLISH_CONN, listener->go_channel_ptr);
+    if (listener->status == LISTENER_WAITING) {
+        listener->status = LISTENING;
+        rte_rwlock_write_unlock(listener->rwlock);
+        res_code = batch_wake_up(ESTABLISH_CONN, listener->go_channel_ptr);
+    } else {
+        rte_rwlock_write_unlock(listener->rwlock);
+    }
 
     return res_code;
 }
@@ -1267,31 +1269,6 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
     return res_code;
 }
 
-void test_cgo(char *ptr)
-{
-    char *tmp = (char *)malloc(sizeof(char) * 8);
-    strncpy(tmp, ptr, 8);
-    free(tmp);
-    return;
-}
-
-char *conditon_var;
-
-/* Test wake-up latency by using golang condition var */
-void test_CondVarPut(char *condVarPtr)
-{
-    conditon_var = condVarPtr;
-    // printf("[test_CondVarPut] Successful assign golang cond_var into clang global var\n");
-
-    return;
-}
-
-void *test_CondVarGet()
-{
-    // printf("[test_CondVarGet] Start to get golang cond_var from clang global var\n");
-    return conditon_var;
-}
-
 struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4tuple four_tuple, void *sem)
 {
     // printf("[xio_new_socket] Start create type-%d socket\n", socket_type);
@@ -1332,7 +1309,12 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4
     return xs;
 }
 
-int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
+/*
+   [Return]
+   FAIL: return -1
+   SUCCESS: return number of bytes that were successfully written
+*/
+int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code)
 {
     int ret;
     ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, HTTP_FRAME,
@@ -1349,11 +1331,10 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 
 /*
    [Return]
-   >0: read size
-    0: no pkt in socket buffer
-   -1: EOF
+   FAIL: return -1
+   SUCCESS: return number of bytes that were successfully read
 */
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code)
 {
     // printf("[xio_read] Start read\n");
     int ret = 0;
@@ -1404,6 +1385,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
         rte_rwlock_write_unlock(xs->rwlock);
 
         ret = 0;
+        *error_code = EAGAIN;
     }
 
     return ret;
@@ -1411,12 +1393,12 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length)
 
 /*
    [Return]
-   >0: SUCCESS
-   -1: FAIL
+   FAIL: return -1
+   SUCCESS: return 0
 */
-int xio_close(struct xio_socket *xs)
+int xio_close(struct xio_socket *xs, int *error_code)
 {
-    int ret = 1;
+    int ret = 0;
     if(!rte_atomic16_read(xs->tx_status))
     {
         /* TX status not closed yet*/
@@ -1440,7 +1422,12 @@ int xio_close(struct xio_socket *xs)
     return ret;
 }
 
-struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem)
+/*
+   [Return]
+   FAIL: return NULL
+   SUCCESS: return socket ptr
+*/
+struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code)
 {
     // printf("[xio_connect] Start xio_connect\n");
 
@@ -1479,20 +1466,27 @@ struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_d
     return xs;
 }
 
-struct xio_socket *xio_accept(struct xio_socket *listener, char *sem)
+/*
+   [Return]
+   FAIL: return NULL
+   SUCCESS: return socket ptr
+*/
+struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code)
 {
     // printf("[xio_accept] Start xio_accept\n");
 
     /* Check if the listener socket's buffer exist ESTABLISH_CONN request */
     struct conn_request *req;
     rte_rwlock_write_lock(listener->rwlock);
-    req = (struct conn_request *)dequeue(listener->socket_buf);
-    rte_rwlock_write_unlock(listener->rwlock);
-
-    if (req == NULL)
+    if(isEmpty(listener->socket_buf))
     {
-        /* Do not ESTABLISH_CONN exist */
+        listener->status = LISTENER_WAITING;
+        rte_rwlock_write_unlock(listener->rwlock);
+        *error_code = EAGAIN;
         return NULL;
+    } else {
+        req = (struct conn_request *)dequeue(listener->socket_buf);
+        rte_rwlock_write_unlock(listener->rwlock);
     }
 
     /* Exist ESTABLISH_CONN request socket's buffer in need to be handled */
@@ -1525,7 +1519,12 @@ struct xio_socket *xio_accept(struct xio_socket *listener, char *sem)
     return xs;
 }
 
-struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr)
+/*
+   [Return]
+   FAIL: return NULL
+   SUCCESS: return socket ptr
+*/
+struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code)
 {
     // printf("[xio_listen] Listen on %d:%d\n", ip_src, port_src);
 
@@ -1545,14 +1544,14 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
         return NULL;
     }
 
-    struct xio_socket *xs = xio_new_socket(LISTENER_SOCKET, service_id, four_tuple, complete_chan_ptr);
+    struct xio_socket *listener = xio_new_socket(LISTENER_SOCKET, service_id, four_tuple, complete_chan_ptr);
 
-    rte_rwlock_write_lock(xs->rwlock);
-    if (xs != NULL)
+    rte_rwlock_write_lock(listener->rwlock);
+    if (listener != NULL)
     {
-        xs->status = LISTENING;
+        listener->status = LISTENING;
     }
-    rte_rwlock_write_unlock(xs->rwlock);
+    rte_rwlock_write_unlock(listener->rwlock);
 
-    return xs;
+    return listener;
 }
