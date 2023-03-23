@@ -48,6 +48,9 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 #define LISTENER_SOCKET 1
 #define XIO_SOCKET 2
 
+/* Error code */
+#define END_OF_PKT 87
+
 /* Socket status */
 // #define NEW_SOCKET 0
 // #define LISTENING 1
@@ -1038,6 +1041,7 @@ static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
     }
 
     if (!threshold()){
+        // printf("Ready-list size: %d", list_size);
         return 0;
     }
 
@@ -1189,11 +1193,11 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
         res_code = batch_wake_up(HTTP_FRAME, xs->go_channel_ptr);
     } else if (xs->status == EST_COMPLETE)
     {
-        // printf("[handle_HTTP_FRAME] EST_COMPLETE\n");
+        // printf("[handle_HTTP_FRAME] EST_COMPLETE status\n");
         rte_rwlock_write_unlock(xs->rwlock);
     } else
     {
-        // printf("[handle_HTTP_FRAME] ELSE_STATUS\n");
+        // printf("[handle_HTTP_FRAME] ELSE_STATUS status\n");
         rte_rwlock_write_unlock(xs->rwlock);
         /* [TODO] handle different socket status */
     }
@@ -1369,6 +1373,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
                 printf("[Delete pkt] dequeue() != queue->front->data");
             }
 
+            *error_code = END_OF_PKT;
             //delete_mbuf_list(tmp->pkt);
             free(tmp);
         }

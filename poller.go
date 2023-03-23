@@ -74,9 +74,11 @@ const (
 	// Port manager setting
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
-	LOG_LEVEL = logrus.TraceLevel
+	LOG_LEVEL = logrus.WarnLevel
 	// Packet manager numbers
 	ONVM_POLLER_NUM = 8
+	// Error code
+	END_OF_PKT = 87
 )
 
 type Buffer struct {
@@ -129,7 +131,7 @@ type Connection struct {
 type XIO_Connection struct {
 	xio_socket *C.struct_xio_socket
 	four_tuple Four_tuple_rte
-	sync_chan  chan struct{}
+	sync_chan  *sema
 	dst_id     uint8
 }
 
@@ -137,7 +139,7 @@ type XIO_Listener struct {
 	xio_socket    *C.struct_xio_socket
 	four_tuple    Four_tuple_rte
 	laddr         OnvmAddr // Local Address
-	complete_chan chan struct{}
+	complete_chan *sema
 }
 
 type connState struct {
@@ -449,17 +451,23 @@ func runPktWorker() {
 func XIO_wait(list *C.struct_list_node) int {
 	// defer TimeTrack(time.Now())
 	/* Put the packet into the right queue */
+	// logger.Log.Errorf("XIO_wait start")
 	res_code := 0
+	// i := 0
 
 	for list != nil {
-		channel := (*chan struct{})(unsafe.Pointer(list.go_channel_ptr))
+		c := (*sema)(unsafe.Pointer(list.go_channel_ptr))
+		// logger.Log.Warnf("XIO_wait sema ptr: %p", c)
 		if int(list.pkt_type) == CLOSE_CONN {
-			close(*channel)
+			// logger.Log.Warnf("ClOSE_CONN")
+			c.close()
 		} else {
-			*channel <- struct{}{}
+			c.signal()
 		}
 		list = list.next
+		// i++
 	}
+	// logger.Log.Errorf("XIO_wait end, %d", i)
 
 	return res_code
 }
@@ -1075,10 +1083,10 @@ func listenXIO(ip_addr string, port uint16) (*XIO_Listener, error) {
 	xio_listener = &XIO_Listener{
 		laddr:         laddr,
 		four_tuple:    four_tuple,
-		complete_chan: make(chan struct{}, 1),
+		complete_chan: newSema(),
 	}
 
-	complete_chan_ptr := (*C.char)(unsafe.Pointer(&xio_listener.complete_chan))
+	complete_chan_ptr := (*C.char)(unsafe.Pointer(xio_listener.complete_chan))
 
 	xs := C.xio_listen(C.uint32_t(xio_listener.four_tuple.Src_ip), C.uint16_t(xio_listener.four_tuple.Src_port),
 		C.uint32_t(xio_listener.four_tuple.Dst_ip), C.uint16_t(xio_listener.four_tuple.Dst_port), complete_chan_ptr, nil)
@@ -1098,8 +1106,9 @@ func (xl XIO_Listener) Accept() (net.Conn, error) {
 
 	var connection *XIO_Connection
 
-	condVar := make(chan struct{}, 1)
-	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
+	condVar := newSema()
+	// logger.Log.Warnf("xs.complete_chan ptr: %p", condVar)
+	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
 	err_code := 0
 	err_code_ptr := (*C.int)(unsafe.Pointer(&err_code))
 	for {
@@ -1108,20 +1117,21 @@ func (xl XIO_Listener) Accept() (net.Conn, error) {
 
 		if err_code == int(syscall.EAGAIN) {
 			// Wait for connection request
-			_, ok := <-xl.complete_chan
-			if !ok {
+			ok := xl.complete_chan.wait()
+			runtime.KeepAlive(xl.complete_chan)
+			if ok {
 				err := fmt.Errorf("Accept: listener closed")
-				close(condVar)
+				condVar.close()
 				return nil, err
 			}
 			continue
 		} else if xs == nil {
 			err := fmt.Errorf("Accept: xio_accept return nil socket, errno=%d", err_code)
-			close(condVar)
+			condVar.close()
 			return nil, err
 		} else if err_code != 0 {
 			err := fmt.Errorf("Accept: xio_accept errno=%d", err_code)
-			close(condVar)
+			condVar.close()
 			return nil, err
 		} else {
 			connection = &XIO_Connection{
@@ -1164,8 +1174,8 @@ func DialXIO(network, address string) (net.Conn, error) {
 	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
 	conn.four_tuple.Dst_port = port
 
-	condVar := make(chan struct{}, 1)
-	condVarPtr := (*C.char)(unsafe.Pointer(&condVar))
+	condVar := newSema()
+	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
 	conn.sync_chan = condVar
 
 	dst_id, _ := IpToID(ip_addr)
@@ -1186,9 +1196,10 @@ func DialXIO(network, address string) (net.Conn, error) {
 
 	// Wait for response
 	logger.Log.Traceln("Dial wait connection create response")
-	_, ok := <-condVar
+	ok := condVar.wait()
+	runtime.KeepAlive(condVar)
 
-	if !ok {
+	if ok {
 		err := fmt.Errorf("Read ACK failed")
 
 		return nil, err
@@ -1227,14 +1238,17 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 
 		if err_code == int(syscall.EAGAIN) {
 			// Wait for pkt
-			_, ok := <-connection.sync_chan
-			if !ok {
+			ok := connection.sync_chan.wait()
+			runtime.KeepAlive(connection.sync_chan)
+			// logger.Log.Warnf("Reader wake-up")
+			if ok {
 				/* Socket closed */
-				return 0, nil
+				return 0, io.EOF
 			}
 			continue
-		} else if length == 0 && err_code == 0 {
-			return 0, io.EOF
+		} else if err_code == END_OF_PKT {
+			err := errors.New("EOP")
+			return length, err
 		} else if err_code != 0 {
 			err := fmt.Errorf("Read: xio_read errno=%d", err_code)
 			return 0, err
@@ -1337,4 +1351,59 @@ func inet_addr(ipaddr string) uint32 {
 	ip4, _ = strconv.ParseUint(ip[3], 10, 8)
 	ret = uint32(ip4)<<24 + uint32(ip3)<<16 + uint32(ip2)<<8 + uint32(ip1)
 	return ret
+}
+
+type sema struct {
+	cond   *sync.Cond
+	flag   bool
+	closed bool
+}
+
+func newSema() *sema {
+	return &sema{
+		cond:   sync.NewCond(&sync.Mutex{}),
+		flag:   false,
+		closed: false,
+	}
+}
+
+func (c *sema) wait() (close bool) {
+	c.cond.L.Lock()
+
+	for !c.flag {
+		if c.closed {
+			c.cond.L.Unlock()
+			return true
+		}
+		c.cond.Wait()
+	}
+	c.flag = false
+
+	c.cond.L.Unlock()
+	return false
+}
+
+func (c *sema) signal() {
+	c.cond.L.Lock()
+
+	if c.closed {
+		logger.Log.Warnf("sem.signal(): signal on closed sema")
+	}
+
+	if !c.flag {
+		c.flag = true
+		c.cond.Signal()
+	}
+
+	c.cond.L.Unlock()
+}
+
+func (c *sema) close() {
+	c.cond.L.Lock()
+	if c.flag {
+		logger.Log.Warnf("sem.close(): close on a true flag semaphore")
+	}
+	c.closed = true
+	c.cond.Signal()
+	c.cond.L.Unlock()
 }
