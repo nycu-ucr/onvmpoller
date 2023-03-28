@@ -6,7 +6,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <time.h>
-#include </home/hstsai/onvm/onvmpoller/list.h>
+#include "xio.h"
 
 // extern int XIO_wait(struct list_node *)
 
@@ -51,17 +51,6 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 /* Error code */
 #define END_OF_PKT 87
 
-/* Socket status */
-// #define NEW_SOCKET 0
-// #define LISTENING 1
-// #define WAITING_EST_ACK 2
-// #define EST_COMPLETE 3
-// #define RX_CLOSED 4
-// #define TX_CLOSED 5
-// #define RX_TX_CLOSED 6
-// #define READER_WAITING 7
-// #define READER_HANDLING 8
-
 /*
 ********************************
 
@@ -86,22 +75,6 @@ struct onvm_nf_local_ctx *globalVar_nf_local_ctx;
 
 ********************************
 */
-typedef enum socket_status {
-    NEW_SOCKET,
-    LISTENING,
-    LISTENER_WAITING,
-    WAITING_EST_ACK,
-    EST_COMPLETE,
-    READER_WAITING
-} socket_status;
-
-struct ipv4_4tuple
-{
-    uint32_t ip_dst;
-    uint32_t ip_src;
-    uint16_t port_dst;
-    uint16_t port_src;
-};
 
 struct mbuf_list
 {
@@ -116,39 +89,13 @@ struct pkt_descriptor
     struct mbuf_list *pkt;
 };
 
-typedef struct Node
-{
-    void *data;
-    struct Node *next;
-} Node;
-
-typedef struct Queue
-{
-    Node *front;
-    Node *rear;
-} Queue;
-
 struct conn_request
 {
     uint32_t ip;
     uint16_t port;
 };
 
-struct xio_socket
-{
-    socket_status status;
-    int socket_type;
 
-    int service_id;
-    struct ipv4_4tuple fourTuple;
-
-    struct Queue *socket_buf; /* Use for store pkts or connection-requests */
-
-    void *go_channel_ptr;
-    rte_rwlock_t *rwlock;
-    rte_atomic16_t *rx_status; /* [0:ACTIVE] [1:CLOSE] */
-    rte_atomic16_t *tx_status; /* [0:ACTIVE] [1:CLOSE] */
-};
 
 /*
 ********************************

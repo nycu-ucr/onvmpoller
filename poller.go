@@ -10,7 +10,7 @@ package onvmpoller
 // #cgo LDFLAGS: -lrte_flow_classify -Wl,--whole-archive -lrte_pipeline -Wl,--no-whole-archive -Wl,--whole-archive -lrte_table -Wl,--no-whole-archive -Wl,--whole-archive -lrte_port -Wl,--no-whole-archive -lrte_pdump -lrte_distributor -lrte_ip_frag -lrte_meter -lrte_fib -lrte_rib -lrte_lpm -lrte_acl -lrte_jobstats -Wl,--whole-archive -lrte_metrics -Wl,--no-whole-archive -lrte_bitratestats -lrte_latencystats -lrte_power -lrte_efd -lrte_bpf -lrte_ipsec -Wl,--whole-archive -lrte_cfgfile -lrte_gro -lrte_gso -lrte_hash -lrte_member -lrte_vhost -lrte_kvargs -lrte_telemetry -lrte_mbuf -lrte_net -lrte_ethdev -lrte_bbdev -lrte_cryptodev -lrte_security -lrte_compressdev -lrte_eventdev -lrte_rawdev -lrte_timer -lrte_mempool -lrte_stack -lrte_mempool_ring -lrte_mempool_octeontx2 -lrte_ring -lrte_pci -lrte_eal -lrte_cmdline -lrte_reorder -lrte_sched -lrte_rcu -lrte_graph -lrte_node -lrte_kni -lrte_common_cpt -lrte_common_octeontx -lrte_common_octeontx2 -lrte_common_dpaax -lrte_bus_pci -lrte_bus_vdev -lrte_bus_dpaa -lrte_bus_fslmc -lrte_mempool_bucket -lrte_mempool_stack -lrte_mempool_dpaa -lrte_mempool_dpaa2 -lrte_pmd_af_packet -lrte_pmd_ark -lrte_pmd_atlantic -lrte_pmd_avp -lrte_pmd_axgbe -lrte_pmd_bnxt -lrte_pmd_bond -lrte_pmd_cxgbe -lrte_pmd_dpaa -lrte_pmd_dpaa2 -lrte_pmd_e1000 -lrte_pmd_ena -lrte_pmd_enetc -lrte_pmd_enic -lrte_pmd_fm10k -lrte_pmd_failsafe -lrte_pmd_hinic -lrte_pmd_hns3 -lrte_pmd_i40e -lrte_pmd_iavf -lrte_pmd_ice -lrte_common_iavf -lrte_pmd_igc -lrte_pmd_ionic -lrte_pmd_ixgbe -lrte_pmd_kni -lrte_pmd_lio -lrte_pmd_memif -lrte_pmd_nfp -lrte_pmd_null -lrte_pmd_octeontx2 -lrte_pmd_qede -lrte_pmd_ring -lrte_pmd_softnic -lrte_pmd_sfc_efx -lrte_pmd_tap -lrte_pmd_thunderx_nicvf -lrte_pmd_vdev_netvsc -lrte_pmd_virtio -lrte_pmd_vhost -lrte_pmd_ifc -lrte_pmd_vmxnet3_uio -lrte_bus_vmbus -lrte_pmd_netvsc -lrte_pmd_bbdev_null -lrte_pmd_bbdev_fpga_lte_fec -lrte_pmd_bbdev_fpga_5gnr_fec -lrte_pmd_bbdev_turbo_sw -lrte_pmd_null_crypto -lrte_pmd_nitrox -lrte_pmd_octeontx_crypto -lrte_pmd_octeontx2_crypto -lrte_pmd_crypto_scheduler -lrte_pmd_dpaa2_sec -lrte_pmd_dpaa_sec -lrte_pmd_caam_jr -lrte_pmd_virtio_crypto -lrte_pmd_octeontx_zip -lrte_pmd_qat -lrte_pmd_skeleton_event -lrte_pmd_sw_event -lrte_pmd_dsw_event -lrte_pmd_octeontx_ssovf -lrte_pmd_dpaa_event -lrte_pmd_dpaa2_event -lrte_mempool_octeontx -lrte_pmd_octeontx -lrte_pmd_octeontx2_event -lrte_pmd_opdl_event -lrte_rawdev_skeleton -lrte_rawdev_dpaa2_cmdif -lrte_rawdev_dpaa2_qdma -lrte_bus_ifpga -lrte_rawdev_ioat -lrte_rawdev_ntb -lrte_rawdev_octeontx2_dma -lrte_rawdev_octeontx2_ep -Wl,--no-whole-archive -lrt -lm -lnuma -ldl
 /*
 #include <onvm_nflib.h>
-#include "list.h"
+#include "xio.h"
 
 struct mbuf_list;
 struct ipv4_4tuple;
@@ -374,7 +374,7 @@ func unMarshalIP(ip uint32) string {
 	b1 := strconv.FormatInt((ipInt>>16)&0xff, 10)
 	b2 := strconv.FormatInt((ipInt>>8)&0xff, 10)
 	b3 := strconv.FormatInt((ipInt & 0xff), 10)
-	return b0 + "." + b1 + "." + b2 + "." + b3
+	return b3 + "." + b2 + "." + b1 + "." + b0
 }
 
 func hashV4Flow(four_tuple Four_tuple_rte) uint32 {
@@ -1138,6 +1138,13 @@ func (xl XIO_Listener) Accept() (net.Conn, error) {
 				xio_socket: xs,
 				sync_chan:  condVar,
 			}
+			connection.four_tuple.Src_ip = uint32(xs.fourTuple.ip_src)
+			connection.four_tuple.Src_port = uint16(xs.fourTuple.port_src)
+			connection.four_tuple.Dst_ip = uint32(xs.fourTuple.ip_dst)
+			connection.four_tuple.Dst_port = uint16(xs.fourTuple.port_dst)
+			// logger.Log.Warnf("[Accept] srcIP:%s, srcPort:%d, dstIP:%s, dstPort:%d",
+			// 	unMarshalIP(connection.four_tuple.Src_ip), connection.four_tuple.Src_port,
+			// 	unMarshalIP(connection.four_tuple.Dst_ip), connection.four_tuple.Dst_port)
 			break
 		}
 	}
@@ -1206,6 +1213,9 @@ func DialXIO(network, address string) (net.Conn, error) {
 	}
 
 	logger.Log.Debugln("DialONVM done")
+	// logger.Log.Warnf("[Dial] srcIP:%s, srcPort:%d, dstIP:%s, dstPort:%d",
+	// 	unMarshalIP(conn.four_tuple.Src_ip), conn.four_tuple.Src_port,
+	// 	unMarshalIP(conn.four_tuple.Dst_ip), conn.four_tuple.Dst_port)
 
 	return conn, nil
 }
@@ -1303,11 +1313,11 @@ func (connection XIO_Connection) Close() error {
 // LocalAddr implements the net.Conn LocalAddr method.
 func (connection XIO_Connection) LocalAddr() net.Addr {
 	var oa OnvmAddr
-	// oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
-	// oa.port = connection.four_tuple.Src_port
-	// oa.network = "onvm"
-	// id, _ := IpToID(oa.ipv4_addr)
-	// oa.service_id = uint8(id)
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
+	oa.port = connection.four_tuple.Src_port
+	oa.network = "onvm"
+	id, _ := IpToID(oa.ipv4_addr)
+	oa.service_id = uint8(id)
 
 	return oa
 }
@@ -1315,11 +1325,11 @@ func (connection XIO_Connection) LocalAddr() net.Addr {
 // RemoteAddr implements the net.Conn RemoteAddr method.
 func (connection XIO_Connection) RemoteAddr() net.Addr {
 	var oa OnvmAddr
-	// oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
-	// oa.port = connection.four_tuple.Dst_port
-	// oa.network = "onvm"
-	// id, _ := IpToID(oa.ipv4_addr)
-	// oa.service_id = uint8(id)
+	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
+	oa.port = connection.four_tuple.Dst_port
+	oa.network = "onvm"
+	id, _ := IpToID(oa.ipv4_addr)
+	oa.service_id = uint8(id)
 
 	return oa
 }
