@@ -1332,6 +1332,7 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4
 */
 int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code)
 {
+    // printf("[xio_write] Start write\n");
     int ret;
     ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, HTTP_FRAME,
                   xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
@@ -1371,6 +1372,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
            Already have pkt descriptor in socket's buffer
            so we can directly call payload_assemble
         */
+        // printf("[xio_read] payload length: %d\n", pkt_desc->payload_len);
         int end_offset = payload_assemble(buffer, buffer_length, pkt_desc->pkt, pkt_desc->start_offset);
 
         rte_rwlock_write_lock(xs->rwlock);
@@ -1415,6 +1417,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
 */
 int xio_close(struct xio_socket *xs, int *error_code)
 {
+    // printf("[xio_close] Start close\n");
     int ret = 0;
     if(!rte_atomic16_read(xs->tx_status))
     {
@@ -1426,7 +1429,7 @@ int xio_close(struct xio_socket *xs, int *error_code)
                             NULL, 0);
 
         if(ret < 0){
-            printf("[xio_write] onvm_send_pkt not success\n");
+            printf("[xio_close] onvm_send_pkt not success\n");
             return -1;
         }
 
