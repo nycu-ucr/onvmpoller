@@ -251,7 +251,7 @@ func init() {
 	runOnvmPoller()
 
 	time.Sleep(2 * time.Second)
-	logger.Log.Warnln("Init onvmpoller(share-list ver)")
+	logger.Log.Warnln("Init onvmpoller (XIO-refactor ver)")
 }
 
 func runOnvmPoller() {

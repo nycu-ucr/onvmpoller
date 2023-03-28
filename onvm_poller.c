@@ -308,14 +308,21 @@ static inline struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt)
 
 void delete_mbuf_list(struct mbuf_list *list)
 {
+    if (list == NULL) {
+        printf("[delete_mbuf_list] mbuf_list == NULL\n");
+
+        return;
+    }
+
     struct mbuf_list *ptr = list;
+    struct mbuf_list *tmp = ptr->next;
 
-    while (ptr != NULL)
+    while (tmp != NULL)
     {
-        struct mbuf_list *tmp = ptr->next;
-
+        ptr = tmp;
+        tmp = tmp->next;
+        rte_pktmbuf_free(ptr->pkt);
         free(ptr);
-        ptr = tmp->next;
     }
 
     return;
@@ -354,10 +361,15 @@ static inline void try_delete_socket(struct xio_socket *xs)
         {
             printf("[try_delete_socket] Unable to delete from conn_tables\n");
         }
-        // free(xs->rwlock);
-        // free(xs->socket_buf);
-        // free(xs->tx_status);
-        // free(xs->rx_status);
+        if (!isEmpty(xs->socket_buf))
+        {
+            printf("[try_delete_socket] Delete socket before empty socket buffer\n");
+        }
+        free(xs->rwlock);
+        free(xs->socket_buf);
+        free(xs->tx_status);
+        free(xs->rx_status);
+        free(xs);
     }
 }
 
@@ -1374,7 +1386,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
             }
 
             *error_code = END_OF_PKT;
-            //delete_mbuf_list(tmp->pkt);
+            delete_mbuf_list(tmp->pkt);
             free(tmp);
         }
         else
