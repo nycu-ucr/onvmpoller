@@ -95,8 +95,6 @@ struct conn_request
     uint16_t port;
 };
 
-
-
 /*
 ********************************
 
@@ -107,7 +105,8 @@ struct conn_request
 
 static inline void print_socket(struct xio_socket *xs)
 {
-    if(xs == NULL){
+    if (xs == NULL)
+    {
         printf("[print_socket] Empty socket\n");
         return;
     }
@@ -131,7 +130,7 @@ static inline uint32_t ipv4_4tuple_hash(const void *key, __rte_unused uint32_t k
 {
     const struct ipv4_4tuple *tuple = (const struct ipv4_4tuple *)key;
     uint32_t hash = rte_jhash_3words(tuple->ip_dst, tuple->ip_src,
-                                      ((uint32_t)tuple->port_dst << 16) | tuple->port_src, 0);
+                                     ((uint32_t)tuple->port_dst << 16) | tuple->port_src, 0);
     return hash;
 }
 
@@ -255,7 +254,8 @@ static inline struct mbuf_list *create_mbuf_list(struct rte_mbuf *pkt)
 
 void delete_mbuf_list(struct mbuf_list *list)
 {
-    if (list == NULL) {
+    if (list == NULL)
+    {
         printf("[delete_mbuf_list] mbuf_list == NULL\n");
 
         return;
@@ -299,7 +299,8 @@ pkt_tcp_hdr(struct rte_mbuf *pkt)
 /* Only when TX & RX both close then we can delete socket from conn_tables */
 static inline void try_delete_socket(struct xio_socket *xs)
 {
-    if (rte_atomic16_read(xs->rx_status) && rte_atomic16_read(xs->tx_status)) {
+    if (rte_atomic16_read(xs->rx_status) && rte_atomic16_read(xs->tx_status))
+    {
         struct ipv4_4tuple key = swap_four_tuple(xs->fourTuple);
 
         int ret;
@@ -398,7 +399,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     sprintf(conn_table_name, "conn_table_%s", nf_name);
     struct rte_hash_parameters xio_ipv4_hash_params = {
         .name = conn_table_name,
-        .entries = 1024*1024*1,
+        .entries = 1024 * 1024 * 1,
         .key_len = sizeof(struct ipv4_4tuple),
         .hash_func = ipv4_4tuple_hash, // rte_hash_crc may be faster but the key need to be less related
         .hash_func_init_val = 0,
@@ -566,8 +567,8 @@ struct rte_mbuf *handle_payload(char *buffer, int buffer_length)
 }
 
 int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
-                   uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
-                   char *buffer, int buffer_length)
+                  uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
+                  char *buffer, int buffer_length)
 {
     struct rte_mbuf *pkt;
     struct onvm_pkt_meta *pmeta;
@@ -955,12 +956,20 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
 struct list_node *head;
 struct list_node *tail;
 int list_size = 0;
+uint64_t last_wake_up_time;
+uint64_t time_out = 20000;
+
+int time_trigger_count = 0;
+int size_trigger_count = 0;
+int total_list_size_when_timeout_trigger = 0;
+int total_list_size_when_size_trigger = 0;
 
 static inline void reset_list(struct list_node *head)
 {
     struct list_node *tmp;
 
-    while(head != NULL){
+    while (head != NULL)
+    {
         tmp = head;
         head = head->next;
         free(tmp);
@@ -976,10 +985,38 @@ static inline void reset_list(struct list_node *head)
 */
 static inline int threshold()
 {
-    // int table_size = rte_hash_count(conn_tables);
+    int table_size = rte_hash_count(conn_tables);
 
-    // return (list_size >= table_size/2);
-    return 1;
+    /* Ready-list size trigger */
+    if (table_size <= 16)
+    {
+        /* Num of connections is small */
+        if (abs(table_size - list_size) <= 2)
+        {
+            size_trigger_count++;
+            total_list_size_when_size_trigger += list_size;
+            return 1;
+        }
+    }
+    else
+    {
+        /* Num of connections is large */
+        if (list_size >= 8)
+        {
+            size_trigger_count++;
+            total_list_size_when_size_trigger += list_size;
+            return 1;
+        }
+    }
+
+    if (unlikely((rte_get_tsc_cycles() - last_wake_up_time) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= time_out))
+    {
+        time_trigger_count++;
+        total_list_size_when_timeout_trigger += list_size;
+        return 1;
+    }
+
+    return 0;
 }
 
 static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
@@ -989,17 +1026,21 @@ static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
     new_node->pkt_type = pkt_type;
     new_node->next = NULL;
 
-    if (list_size == 0){
+    if (list_size == 0)
+    {
         head = new_node;
         tail = new_node;
         list_size++;
-    }else{
+    }
+    else
+    {
         tail->next = new_node;
         tail = tail->next;
         list_size++;
     }
 
-    if (!threshold()){
+    if (!threshold())
+    {
         // printf("Ready-list size: %d", list_size);
         return 0;
     }
@@ -1007,6 +1048,9 @@ static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
     int res_code;
     res_code = XIO_wait(head);
     reset_list(head);
+
+    /* Update time stamp to last time threshold trigger */
+    last_wake_up_time = rte_get_tsc_cycles();
 
     return 0;
 }
@@ -1030,10 +1074,13 @@ static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct r
     struct xio_socket *listener;
     int ret;
     ret = rte_hash_lookup_data(conn_tables, (void *)&ft, (void **)&listener);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         printf("[handle_ESTABLISH_CONN] Failed to retrieve value from conn_tables\n");
         return -1;
-    }else{
+    }
+    else
+    {
         // print_socket(listener);
     }
 
@@ -1045,11 +1092,14 @@ static inline int handle_ESTABLISH_CONN(struct ipv4_4tuple *four_tuple, struct r
 
     rte_rwlock_write_lock(listener->rwlock);
     enqueue(listener->socket_buf, req);
-    if (listener->status == LISTENER_WAITING) {
+    if (listener->status == LISTENER_WAITING)
+    {
         listener->status = LISTENING;
         rte_rwlock_write_unlock(listener->rwlock);
         res_code = batch_wake_up(ESTABLISH_CONN, listener->go_channel_ptr);
-    } else {
+    }
+    else
+    {
         rte_rwlock_write_unlock(listener->rwlock);
     }
 
@@ -1064,15 +1114,19 @@ static inline int handle_REPLY_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
     int ret;
     struct xio_socket *xs;
     ret = rte_hash_lookup_data(conn_tables, four_tuple, (void **)&xs);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         printf("[handle_REPLY_CONN] Failed to retrieve value from conn_tables\n");
         return -1;
     }
 
     rte_rwlock_write_lock(xs->rwlock);
-    if(xs->status != WAITING_EST_ACK){
+    if (xs->status != WAITING_EST_ACK)
+    {
         printf("[handle_REPLY_CONN] Socket status != WAITING_EST_ACK, but recieve REPLY_CONN pkt");
-    }else{
+    }
+    else
+    {
         xs->status == EST_COMPLETE;
     }
     rte_rwlock_write_unlock(xs->rwlock);
@@ -1091,14 +1145,25 @@ static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
     int ret;
     struct xio_socket *xs;
     ret = rte_hash_lookup_data(conn_tables, four_tuple, (void **)&xs);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         printf("[handle_CLOSE_CONN] Failed to retrieve value from conn_tables\n");
         return -1;
     }
 
-    if(!rte_atomic16_read(xs->rx_status)){
+    if (!rte_atomic16_read(xs->rx_status))
+    {
         rte_atomic16_set(xs->rx_status, 1);
         try_delete_socket(xs);
+
+        int table_size = rte_hash_count(conn_tables);
+        if (table_size <= 5)
+        {
+            printf("Timeout triggers(percent): %.4f\n", time_trigger_count / (float)(time_trigger_count + size_trigger_count));
+            printf("Size triggers(percent): %.4f\n", size_trigger_count / (float)(time_trigger_count + size_trigger_count));
+            printf("Average ready-list size when timeout triggers: %.4f\n", (float)total_list_size_when_timeout_trigger / (float)time_trigger_count);
+            printf("Average ready-list size when sizeout triggers: %.4f\n", (float)total_list_size_when_size_trigger / (float)size_trigger_count);
+        }
     }
 
     int res_code;
@@ -1131,7 +1196,8 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
     int ret;
     struct xio_socket *xs;
     ret = rte_hash_lookup_data(conn_tables, four_tuple, (void **)&xs);
-    if (ret < 0) {
+    if (ret < 0)
+    {
         printf("[handle_HTTP_FRAME] Failed to retrieve value from conn_tables\n");
         return -1;
     }
@@ -1150,11 +1216,13 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
         rte_rwlock_write_unlock(xs->rwlock);
 
         res_code = batch_wake_up(HTTP_FRAME, xs->go_channel_ptr);
-    } else if (xs->status == EST_COMPLETE)
+    }
+    else if (xs->status == EST_COMPLETE)
     {
         // printf("[handle_HTTP_FRAME] EST_COMPLETE status\n");
         rte_rwlock_write_unlock(xs->rwlock);
-    } else
+    }
+    else
     {
         // printf("[handle_HTTP_FRAME] ELSE_STATUS status\n");
         rte_rwlock_write_unlock(xs->rwlock);
@@ -1282,10 +1350,11 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *er
     // printf("[xio_write] Start write\n");
     int ret;
     ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, HTTP_FRAME,
-                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
-                  (char *)buffer, buffer_length);
+                        xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                        (char *)buffer, buffer_length);
 
-    if(ret < 0){
+    if (ret < 0)
+    {
         printf("[xio_write] onvm_send_pkt not success\n");
         return -1;
     }
@@ -1306,7 +1375,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
     struct pkt_descriptor *pkt_desc = NULL;
 
     rte_rwlock_read_lock(xs->rwlock);
-    if(!isEmpty(xs->socket_buf))
+    if (!isEmpty(xs->socket_buf))
     {
         pkt_desc = (struct pkt_descriptor *)xs->socket_buf->front->data;
     }
@@ -1366,7 +1435,7 @@ int xio_close(struct xio_socket *xs, int *error_code)
 {
     // printf("[xio_close] Start close\n");
     int ret = 0;
-    if(!rte_atomic16_read(xs->tx_status))
+    if (!rte_atomic16_read(xs->tx_status))
     {
         /* TX status not closed yet*/
 
@@ -1375,7 +1444,8 @@ int xio_close(struct xio_socket *xs, int *error_code)
                             xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
                             NULL, 0);
 
-        if(ret < 0){
+        if (ret < 0)
+        {
             printf("[xio_close] onvm_send_pkt not success\n");
             return -1;
         }
@@ -1445,13 +1515,15 @@ struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error
     /* Check if the listener socket's buffer exist ESTABLISH_CONN request */
     struct conn_request *req;
     rte_rwlock_write_lock(listener->rwlock);
-    if(isEmpty(listener->socket_buf))
+    if (isEmpty(listener->socket_buf))
     {
         listener->status = LISTENER_WAITING;
         rte_rwlock_write_unlock(listener->rwlock);
         *error_code = EAGAIN;
         return NULL;
-    } else {
+    }
+    else
+    {
         req = (struct conn_request *)dequeue(listener->socket_buf);
         rte_rwlock_write_unlock(listener->rwlock);
     }
