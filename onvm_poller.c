@@ -991,32 +991,42 @@ static inline int threshold()
     if (table_size <= 16)
     {
         /* Num of connections is small */
-        if (abs(table_size - list_size) <= 2)
+        if (list_size >= table_size/2)
         {
-            size_trigger_count++;
-            total_list_size_when_size_trigger += list_size;
+            // size_trigger_count++;
+            // total_list_size_when_size_trigger += list_size;
             return 1;
         }
     }
     else
     {
         /* Num of connections is large */
-        if (list_size >= 8)
+        if (list_size >= 16)
         {
-            size_trigger_count++;
-            total_list_size_when_size_trigger += list_size;
+            // size_trigger_count++;
+            // total_list_size_when_size_trigger += list_size;
             return 1;
         }
     }
 
-    if (unlikely((rte_get_tsc_cycles() - last_wake_up_time) * TIME_TTL_MULTIPLIER * 1000000000 / rte_get_timer_hz() >= time_out))
+    return 0;
+}
+
+static inline void force_wake_up()
+{
+    if (list_size == 0)
     {
-        time_trigger_count++;
-        total_list_size_when_timeout_trigger += list_size;
-        return 1;
+        return;
     }
 
-    return 0;
+    // time_trigger_count++;
+    // total_list_size_when_timeout_trigger += list_size;
+
+    int res_code;
+    res_code = XIO_wait(head);
+    reset_list(head);
+
+    return;
 }
 
 static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
@@ -1048,9 +1058,6 @@ static inline int batch_wake_up(int pkt_type, void *go_channel_ptr)
     int res_code;
     res_code = XIO_wait(head);
     reset_list(head);
-
-    /* Update time stamp to last time threshold trigger */
-    last_wake_up_time = rte_get_tsc_cycles();
 
     return 0;
 }
@@ -1156,14 +1163,14 @@ static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
         rte_atomic16_set(xs->rx_status, 1);
         try_delete_socket(xs);
 
-        int table_size = rte_hash_count(conn_tables);
-        if (table_size <= 5)
-        {
-            printf("Timeout triggers(percent): %.4f\n", time_trigger_count / (float)(time_trigger_count + size_trigger_count));
-            printf("Size triggers(percent): %.4f\n", size_trigger_count / (float)(time_trigger_count + size_trigger_count));
-            printf("Average ready-list size when timeout triggers: %.4f\n", (float)total_list_size_when_timeout_trigger / (float)time_trigger_count);
-            printf("Average ready-list size when sizeout triggers: %.4f\n", (float)total_list_size_when_size_trigger / (float)size_trigger_count);
-        }
+        // int table_size = rte_hash_count(conn_tables);
+        // if (table_size <= 5)
+        // {
+        //     printf("Timeout triggers(percent): %.4f\n", time_trigger_count / (float)(time_trigger_count + size_trigger_count));
+        //     printf("Size triggers(percent): %.4f\n", size_trigger_count / (float)(time_trigger_count + size_trigger_count));
+        //     printf("Average ready-list size when timeout triggers: %.4f\n", (float)total_list_size_when_timeout_trigger / (float)time_trigger_count);
+        //     printf("Average ready-list size when sizeout triggers: %.4f\n", (float)total_list_size_when_size_trigger / (float)size_trigger_count);
+        // }
     }
 
     int res_code;
@@ -1234,6 +1241,11 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
 
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
 {
+    if (pkt == NULL && meta == NULL){
+        force_wake_up();
+        return 0;
+    }
+
     struct rte_tcp_hdr *tcp_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
     struct rte_ether_hdr *eth_hdr;
