@@ -19,11 +19,11 @@ struct xio_socket;
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
 extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset);
 extern int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
-                uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
+                uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
                 char *buffer, int buffer_length);
-extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol);
 extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
-extern int xio_close(struct xio_socket *xs, int *error_code);
+extern int xio_close(struct xio_socket *xs, int *error_code, uint8_t protocol);
 extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code);
 extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code);
 extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code);
@@ -79,6 +79,9 @@ const (
 	ONVM_POLLER_NUM = 8
 	// Error code
 	END_OF_PKT = 87
+	// Protocol Number
+	UDP_PROTO_NUM = 0x11
+	TCP_PROTO_NUM = 0x06
 )
 
 type Buffer struct {
@@ -126,6 +129,13 @@ type Connection struct {
 	sync_chan  chan struct{} // For waiting ACK
 	buffer     *shareList
 	pkt        *Pkt
+}
+
+type UDP_Connection struct {
+	xio_socket *C.struct_xio_socket
+	four_tuple Four_tuple_rte
+	sync_chan  *sema
+	dst_id     uint8
 }
 
 type XIO_Connection struct {
@@ -774,7 +784,7 @@ func (connection Connection) Write(b []byte) (int, error) {
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
-		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
+		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port), TCP_PROTO_NUM,
 		buffer_ptr, C.int(len))
 
 	runtime.KeepAlive(b)
@@ -796,7 +806,7 @@ func (connection Connection) writeControlMessage(msg_type int) error {
 	// Use CGO to call functions of NFLib
 	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
 		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
-		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port),
+		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port), TCP_PROTO_NUM,
 		nil, C.int(0))
 
 	return nil
@@ -1284,7 +1294,7 @@ func (connection XIO_Connection) Write(b []byte) (int, error) {
 	buffer_len := len(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len), nil)
+	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len), nil, TCP_PROTO_NUM)
 	length = int(ret)
 	if length < 0 {
 		err = fmt.Errorf("xio_write error")
@@ -1302,7 +1312,7 @@ func (connection XIO_Connection) Close() error {
 
 	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
 
-	ret := C.xio_close(connection.xio_socket, nil)
+	ret := C.xio_close(connection.xio_socket, nil, TCP_PROTO_NUM)
 	if int(ret) == -1 {
 		err = fmt.Errorf("xio_close failed")
 	}
@@ -1350,6 +1360,57 @@ func (connection XIO_Connection) SetReadDeadline(t time.Time) error {
 func (connection XIO_Connection) SetWriteDeadline(t time.Time) error {
 	logger.Log.Tracef("Start XIO_Connection.SetWriteDeadline")
 	return nil
+}
+
+/*
+********************************
+
+	API for UDP connection
+
+********************************
+*/
+
+func ListenXIO_UDP(network string, address net.UDPAddr) (*UDP_Connection, error) {
+	// logger.Log.Traceln("Start ListenXIO_UDP")
+	// logger.Log.Debugf("Listen at %s", address.String())
+
+	// ip_addr := address.IP.String()
+	// port := uint16(address.Port)
+	// local_address = ip_addr
+
+	// var four_tuple Four_tuple_rte
+	// four_tuple.Src_ip = inet_addr(ip_addr)
+	// four_tuple.Src_port = port
+	// four_tuple.Dst_ip = 0
+	// four_tuple.Dst_port = 0
+
+	// id, err := IpToID(ip_addr)
+	// laddr := OnvmAddr{
+	// 	service_id: uint8(id),
+	// 	network:    "onvm-udp",
+	// 	ipv4_addr:  ip_addr,
+	// 	port:       port,
+	// }
+
+	// if err != nil {
+	// 	return nil, err
+	// }
+
+	// udp_conn := &UDP_Connection {
+
+	// }
+
+	return nil, nil
+}
+
+func (udp_conn UDP_Connection) WriteTo(buf []byte, addr *net.UDPAddr) (int, error) {
+
+	return 0, nil
+}
+
+func (udp_conn UDP_Connection) ReadFrom(buf []byte) (int, *net.UDPAddr, error) {
+
+	return 0, nil, nil
 }
 
 func inet_addr(ipaddr string) uint32 {

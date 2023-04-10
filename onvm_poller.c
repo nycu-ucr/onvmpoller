@@ -16,9 +16,9 @@ long get_time_nano(struct timespec *ts);
 double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
 long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
-int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol);
 int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
-int xio_close(struct xio_socket *xs, int *error_code);
+int xio_close(struct xio_socket *xs, int *error_code, uint8_t protocol);
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code);
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code);
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code);
@@ -32,11 +32,11 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 */
 
 /* PKT TYPE */
-#define HTTP_FRAME 0
-#define ESTABLISH_CONN 1
-#define CLOSE_CONN 2
-#define REPLY_CONN 3
-#define BIG_FRAME 4
+#define HTTP_FRAME      0
+#define ESTABLISH_CONN  1
+#define CLOSE_CONN      2
+#define REPLY_CONN      3
+#define UDP_DGRAM       4
 
 /* const */
 #define TCP_PROTO_NUM 0x06
@@ -62,9 +62,11 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
 uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
 uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
+uint16_t UDP_HDR_LEN = sizeof(struct rte_udp_hdr);
 
 struct rte_mempool *pktmbuf_pool;
 struct rte_hash *conn_tables;
+struct rte_hash *udp_conn_tables;
 struct rte_hash *IpToID;
 struct onvm_nf_local_ctx *globalVar_nf_local_ctx;
 
@@ -297,28 +299,34 @@ pkt_tcp_hdr(struct rte_mbuf *pkt)
 }
 
 /* Only when TX & RX both close then we can delete socket from conn_tables */
-static inline void try_delete_socket(struct xio_socket *xs)
+static inline void try_delete_socket(struct xio_socket *xs, uint8_t protocol)
 {
-    if (rte_atomic16_read(xs->rx_status) && rte_atomic16_read(xs->tx_status))
-    {
-        struct ipv4_4tuple key = swap_four_tuple(xs->fourTuple);
+    if (protocol == IPPROTO_TCP) {
+        // TCP
+        if (rte_atomic16_read(xs->rx_status) && rte_atomic16_read(xs->tx_status))
+        {
+            struct ipv4_4tuple key = swap_four_tuple(xs->fourTuple);
 
-        int ret;
-        ret = rte_hash_del_key(conn_tables, (void *)&key);
-        if (ret < 0)
-        {
-            printf("[try_delete_socket] Unable to delete from conn_tables\n");
+            int ret;
+            ret = rte_hash_del_key(conn_tables, (void *)&key);
+            if (ret < 0)
+            {
+                printf("[try_delete_socket] Unable to delete from conn_tables\n");
+            }
+            if (!isEmpty(xs->socket_buf))
+            {
+                printf("[try_delete_socket] Delete socket before empty socket buffer\n");
+            }
+            free(xs->rwlock);
+            free(xs->socket_buf);
+            free(xs->tx_status);
+            free(xs->rx_status);
+            free(xs);
         }
-        if (!isEmpty(xs->socket_buf))
-        {
-            printf("[try_delete_socket] Delete socket before empty socket buffer\n");
-        }
-        free(xs->rwlock);
-        free(xs->socket_buf);
-        free(xs->tx_status);
-        free(xs->rx_status);
-        free(xs);
+    } else {
+        // UDP
     }
+
 }
 
 void get_monotonic_time(struct timespec *ts)
@@ -370,6 +378,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     char cmd2[path_len + nfName_size + 5];
     sprintf(cmd2, "%s%s.json", file_path, nf_name);
     char *argv[] = {cmd0, cmd1, cmd2};
+    printf("Config file: %s\n", cmd2);
 
     // Initialize ONVM
     arg_offset = onvm_nflib_init(argc, argv, NF_TAG, *nf_local_ctx, nf_function_table);
@@ -411,6 +420,9 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
         rte_exit(EXIT_FAILURE, "Unable to create the connection lookup table\n");
     }
 
+    // TODO: create udp conn talbe
+    udp_conn_tables = NULL;
+
     /* Create IP address to openNetVM's NFID */
     char IpToID_name[nfName_size + 7];
     sprintf(IpToID_name, "IpToID_%s", nf_name);
@@ -428,7 +440,11 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     }
 
     // Parse the input lines and insert the key-value pairs into the hash table.
-    FILE *fp = fopen("/home/hstsai/onvm/testbed/bin/ipid.txt", "r");
+    char ipid_fname[] = "/home/hstsai/onvm/testbed/bin/ipid.txt";
+    FILE *fp = fopen(ipid_fname, "r");
+    if (fp == NULL) {
+        rte_exit(EXIT_FAILURE, "Unable to open %s", ipid_fname);
+    }
     char line[256];
     while (fgets(line, 256, fp) != NULL)
     {
@@ -567,13 +583,14 @@ struct rte_mbuf *handle_payload(char *buffer, int buffer_length)
 }
 
 int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
-                  uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port,
+                  uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
                   char *buffer, int buffer_length)
 {
     struct rte_mbuf *pkt;
     struct onvm_pkt_meta *pmeta;
     uint8_t *pkt_payload;
     struct rte_tcp_hdr *pkt_tcp_hdr;
+    struct rte_udp_hdr *pkt_udp_hdr;
     struct rte_ipv4_hdr *pkt_iph;
     struct rte_ether_hdr *pkt_eth_hdr;
 
@@ -597,6 +614,9 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         pkt = rte_pktmbuf_alloc(pktmbuf_pool);
         break;
     case HTTP_FRAME:
+        pkt = handle_payload(buffer, buffer_length);
+        break;
+    case UDP_DGRAM:
         pkt = handle_payload(buffer, buffer_length);
         break;
     default:
@@ -635,37 +655,49 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // printf("[onvm_send_pkt][pkt->data_off: %d][before]\n", pkt->data_off);
     // printf("[onvm_send_pkt][pkt->pkt_len: %d][before]\n", pkt->pkt_len);
 
-    /* Set TCP header */
-    // get_monotonic_time(&t_start);
-    pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
-    // get_monotonic_time(&t_end);
-    // printf("[ONVM] rte_pktmbuf_prepend latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
-    if (pkt_tcp_hdr == NULL)
-    {
-        printf("Failed to prepend TCP header. Consider splitting up the packet.\n");
-        return -1;
+    if (protocol == IPPROTO_TCP) {
+        /* Set TCP header */
+        // get_monotonic_time(&t_start);
+        pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
+        // get_monotonic_time(&t_end);
+        // printf("[ONVM] rte_pktmbuf_prepend latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
+        if (pkt_tcp_hdr == NULL)
+        {
+            printf("Failed to prepend TCP header. Consider splitting up the packet.\n");
+            return -1;
+        }
+        pkt_tcp_hdr->src_port = src_port;
+        pkt_tcp_hdr->dst_port = dst_port;
+        switch (pkt_type)
+        {
+        case ESTABLISH_CONN:
+            pkt_tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG;
+            break;
+        case REPLY_CONN:
+            pkt_tcp_hdr->tcp_flags = RTE_TCP_ACK_FLAG;
+            break;
+        case CLOSE_CONN:
+            pkt_tcp_hdr->tcp_flags = RTE_TCP_FIN_FLAG;
+            break;
+        case HTTP_FRAME:
+            pkt_tcp_hdr->tcp_flags = RTE_TCP_PSH_FLAG;
+            break;
+        default:
+            printf("[onvm_send_pkt] Unknown pkt type: %d\n", pkt_type);
+            break;
+        }
+        // rte_memcpy(pkt_tcp_hdr, pkt_tcp_hdr, sizeof(TCP_HDR_LEN)); // + option_len);
+    } else if (protocol == IPPROTO_UDP) {
+        /* Set UDP header */
+        pkt_udp_hdr = (struct rte_udp_hdr *)rte_pktmbuf_prepend(pkt, UDP_HDR_LEN);
+
+        pkt_udp_hdr->src_port = src_port;
+        pkt_udp_hdr->dst_port = dst_port;
+        pkt_udp_hdr->dgram_len = buffer_length + UDP_HDR_LEN;
+
+    } else {
+        printf("[ERROR] Unknown protocol: %d\n", protocol);
     }
-    pkt_tcp_hdr->src_port = src_port;
-    pkt_tcp_hdr->dst_port = dst_port;
-    switch (pkt_type)
-    {
-    case ESTABLISH_CONN:
-        pkt_tcp_hdr->tcp_flags = RTE_TCP_SYN_FLAG;
-        break;
-    case REPLY_CONN:
-        pkt_tcp_hdr->tcp_flags = RTE_TCP_ACK_FLAG;
-        break;
-    case CLOSE_CONN:
-        pkt_tcp_hdr->tcp_flags = RTE_TCP_FIN_FLAG;
-        break;
-    case HTTP_FRAME:
-        pkt_tcp_hdr->tcp_flags = RTE_TCP_PSH_FLAG;
-        break;
-    default:
-        printf("[onvm_send_pkt]Unknown pkt type: %d\n", pkt_type);
-        break;
-    }
-    // rte_memcpy(pkt_tcp_hdr, pkt_tcp_hdr, sizeof(TCP_HDR_LEN)); // + option_len);
 
     /* Set IP header */
     pkt_iph = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, IP_HDR_LEN);
@@ -676,7 +708,7 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     }
     pkt_iph->src_addr = src_ip;
     pkt_iph->dst_addr = dst_ip;
-    pkt_iph->next_proto_id = TCP_PROTO_NUM;
+    pkt_iph->next_proto_id = protocol;
     pkt_iph->version_ihl = IPV4_VERSION_IHL;
     // rte_memcpy(pkt_iph, pkt_iph, sizeof(IP_HDR_LEN));
 
@@ -985,6 +1017,7 @@ static inline void reset_list(struct list_node *head)
 */
 static inline int threshold()
 {
+    return 1;
     int table_size = rte_hash_count(conn_tables);
 
     /* Ready-list size trigger */
@@ -1014,6 +1047,7 @@ static inline int threshold()
 
 static inline void force_wake_up()
 {
+    return;
     if (list_size == 0)
     {
         return;
@@ -1161,7 +1195,7 @@ static inline int handle_CLOSE_CONN(struct ipv4_4tuple *four_tuple, struct rte_m
     if (!rte_atomic16_read(xs->rx_status))
     {
         rte_atomic16_set(xs->rx_status, 1);
-        try_delete_socket(xs);
+        try_delete_socket(xs, IPPROTO_TCP);
 
         // int table_size = rte_hash_count(conn_tables);
         // if (table_size <= 5)
@@ -1273,46 +1307,46 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         return -1;
     }
 
-    if (ipv4_hdr->next_proto_id != IP_PROTOCOL_TCP)
-    {
-        // printf("Error packet is not TCP packet\n");
-        return -1;
-    }
-
-    tcp_hdr = pkt_tcp_hdr(pkt);
-    struct ipv4_4tuple four_tuple = {
-        .ip_dst = ipv4_hdr->dst_addr,
-        .ip_src = ipv4_hdr->src_addr,
-        .port_dst = tcp_hdr->dst_port,
-        .port_src = tcp_hdr->src_port,
-    };
-
     int res_code;
-    /* Check the packet type */
-    switch (tcp_hdr->tcp_flags)
-    {
-    case RTE_TCP_SYN_FLAG:
-        /* ESTABLISH_CONN */
-        res_code = handle_ESTABLISH_CONN(&four_tuple, pkt);
-        break;
-    case RTE_TCP_ACK_FLAG:
-        /* REPLY_CONN */
-        res_code = handle_REPLY_CONN(&four_tuple, pkt);
-        break;
-    case RTE_TCP_FIN_FLAG:
-        /* CLOSE_CONN */
-        res_code = handle_CLOSE_CONN(&four_tuple, pkt);
-        break;
-    case RTE_TCP_PSH_FLAG:
-        /* HTTP_FRAME */
-        res_code = handle_HTTP_FRAME(&four_tuple, pkt);
-        break;
+    if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
+        tcp_hdr = pkt_tcp_hdr(pkt);
+        struct ipv4_4tuple four_tuple = {
+            .ip_dst = ipv4_hdr->dst_addr,
+            .ip_src = ipv4_hdr->src_addr,
+            .port_dst = tcp_hdr->dst_port,
+            .port_src = tcp_hdr->src_port,
+        };
+
+        /* Check the packet type */
+        switch (tcp_hdr->tcp_flags) {
+        case RTE_TCP_SYN_FLAG:
+            /* ESTABLISH_CONN */
+            res_code = handle_ESTABLISH_CONN(&four_tuple, pkt);
+            break;
+        case RTE_TCP_ACK_FLAG:
+            /* REPLY_CONN */
+            res_code = handle_REPLY_CONN(&four_tuple, pkt);
+            break;
+        case RTE_TCP_FIN_FLAG:
+            /* CLOSE_CONN */
+            res_code = handle_CLOSE_CONN(&four_tuple, pkt);
+            break;
+        case RTE_TCP_PSH_FLAG:
+            /* HTTP_FRAME */
+            res_code = handle_HTTP_FRAME(&four_tuple, pkt);
+            break;
+        }
+    } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+
+    } else {
+        // printf("[ERROR] packet is not TCP or UDP packet\n");
+        res_code = -1;
     }
 
     return res_code;
 }
 
-struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4tuple four_tuple, void *sem)
+struct xio_socket *xio_new_socket(int socket_type, int service_id, uint8_t protocol, struct ipv4_4tuple four_tuple, void *sem)
 {
     // printf("[xio_new_socket] Start create type-%d socket\n", socket_type);
     struct xio_socket *xs = (struct xio_socket *)malloc(sizeof(struct xio_socket));
@@ -1343,10 +1377,14 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4
        Q: Why key need to be swaped when insert to table?
        A: The incoming pkt don't need to be swaped to look-up socket.
     */
-    ret = rte_hash_add_key_data(conn_tables, (void *)&key, (void *)xs);
-    if (ret < 0)
-    {
-        printf("[xio_new_socket] Unable to add to conn_tables\n");
+    if (protocol == IPPROTO_TCP) {
+        ret = rte_hash_add_key_data(conn_tables, (void *)&key, (void *)xs);
+        if (ret < 0)
+        {
+            printf("[xio_new_socket] Unable to add to conn_tables\n");
+        }
+    } else {
+
     }
 
     return xs;
@@ -1357,12 +1395,12 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, struct ipv4_4
    FAIL: return -1
    SUCCESS: return number of bytes that were successfully written
 */
-int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code)
+int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol)
 {
     // printf("[xio_write] Start write\n");
     int ret;
     ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, HTTP_FRAME,
-                        xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                        xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst, protocol,
                         (char *)buffer, buffer_length);
 
     if (ret < 0)
@@ -1443,7 +1481,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
    FAIL: return -1
    SUCCESS: return 0
 */
-int xio_close(struct xio_socket *xs, int *error_code)
+int xio_close(struct xio_socket *xs, int *error_code, uint8_t protocol)
 {
     // printf("[xio_close] Start close\n");
     int ret = 0;
@@ -1453,7 +1491,7 @@ int xio_close(struct xio_socket *xs, int *error_code)
 
         /* Send CLOSE_CONN control message */
         ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, CLOSE_CONN,
-                            xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                            xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst, protocol,
                             NULL, 0);
 
         if (ret < 0)
@@ -1465,7 +1503,7 @@ int xio_close(struct xio_socket *xs, int *error_code)
         /* Close loacl socket */
         rte_atomic16_set(xs->tx_status, 1);
 
-        try_delete_socket(xs);
+        try_delete_socket(xs, protocol);
     }
 
     return ret;
@@ -1497,11 +1535,11 @@ struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_d
     }
 
     /* Create new XIO socket structure */
-    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, four_tuple, sem);
+    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, IPPROTO_TCP, four_tuple, sem);
 
     /* Send ESTABLISH control message */
     onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, ESTABLISH_CONN,
-                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst, IPPROTO_TCP,
                   NULL, 0);
 
     /* Set socket status to waiting ESTABLISH_ACK */
@@ -1556,11 +1594,11 @@ struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error
         .port_dst = req->port,
         .port_src = listener->fourTuple.port_src,
     };
-    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, four_tuple, sem);
+    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, IPPROTO_TCP, four_tuple, sem);
 
     /* Send ESTABLISH_ACK control message */
     onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, REPLY_CONN,
-                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst,
+                  xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst, IPPROTO_TCP,
                   NULL, 0);
 
     rte_rwlock_write_lock(xs->rwlock);
@@ -1595,7 +1633,7 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
         return NULL;
     }
 
-    struct xio_socket *listener = xio_new_socket(LISTENER_SOCKET, service_id, four_tuple, complete_chan_ptr);
+    struct xio_socket *listener = xio_new_socket(LISTENER_SOCKET, service_id, IPPROTO_TCP, four_tuple, complete_chan_ptr);
 
     rte_rwlock_write_lock(listener->rwlock);
     if (listener != NULL)
