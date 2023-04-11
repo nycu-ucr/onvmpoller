@@ -6,6 +6,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <rte_rcu_qsbr.h>
 #include "xio.h"
 
 // extern int XIO_wait(struct list_node *)
@@ -106,18 +107,18 @@ static inline void print_socket(struct xio_socket *xs)
         printf("[print_socket] Empty socket\n");
         return;
     }
-    printf("xio_socket->status = %d\n", xs->status);
-    printf("xio_socket->socket_type = %d\n", xs->socket_type);
-    printf("xio_socket->service_id = %d\n", xs->service_id);
-    printf("xio_socket->fourTuple.ip_src = %d\n", xs->fourTuple.ip_src);
-    printf("xio_socket->fourTuple.port_src = %d\n", xs->fourTuple.port_src);
-    printf("xio_socket->fourTuple.ip_dst = %d\n", xs->fourTuple.ip_dst);
-    printf("xio_socket->fourTuple.port_dst = %d\n", xs->fourTuple.port_dst);
+    printf("\txio_socket->status = %d\n", xs->status);
+    printf("\txio_socket->socket_type = %d\n", xs->socket_type);
+    printf("\txio_socket->service_id = %d\n", xs->service_id);
+    printf("\txio_socket->fourTuple.ip_src = %d\n", xs->fourTuple.ip_src);
+    printf("\txio_socket->fourTuple.port_src = %d\n", xs->fourTuple.port_src);
+    printf("\txio_socket->fourTuple.ip_dst = %d\n", xs->fourTuple.ip_dst);
+    printf("\txio_socket->fourTuple.port_dst = %d\n", xs->fourTuple.port_dst);
 }
 
-static inline void print_fourTuple(struct ipv4_4tuple *four_tuple)
+static inline void print_fourTuple(const struct ipv4_4tuple *four_tuple)
 {
-    printf("IP_SRC:%d\nPORT_SRC:%d\nIP_DST:%d\nPORT_DST:%d\n", four_tuple->ip_src, four_tuple->port_src, four_tuple->ip_dst, four_tuple->port_dst);
+    printf("\tIP_SRC:%d\n\tPORT_SRC:%d\n\tIP_DST:%d\n\tPORT_DST:%d\n", four_tuple->ip_src, four_tuple->port_src, four_tuple->ip_dst, four_tuple->port_dst);
 }
 
 /* define the hash function for the ipv4_4tuple key */
@@ -139,9 +140,31 @@ static inline uint32_t ipv4_2tuple_hash(const void *key, __rte_unused uint32_t k
     // Only take dst ip addr and port
     const struct ipv4_4tuple *tuple = (const struct ipv4_4tuple *)key;
     uint32_t hash = rte_jhash_2words(tuple->ip_dst,
-                                     (uint32_t)tuple->port_dst,
+                                     ((uint32_t)tuple->port_dst << 16),
                                      0);
+    // printf("[ipv4_2tuple_hash]:\n");
+    // print_fourTuple(tuple);
+    // printf("\tHash: %u\n", hash);
+
     return hash;
+}
+
+void dump_conn_tables(struct rte_hash *table) {
+    const void *next_key;
+    void *next_data;
+    uint32_t iter = 0;
+
+    printf("[dump_conn_tables]:\n");
+    while (rte_hash_iterate(table, &next_key, &next_data, &iter) >= 0){
+        const struct ipv4_4tuple *key = (const struct ipv4_4tuple *) next_key;
+        struct xio_socket *xs = (struct xio_socket *) next_data;
+
+        printf("Key:\n");
+        print_fourTuple(key);
+        printf("Value:\n");
+        print_socket(xs);
+    }
+    printf("\n");
 }
 
 /* Simple functional fifo queue */
@@ -455,7 +478,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
         .name = udp_conn_table_name,
         .entries = 1024 * 1024 * 1,
         .key_len = sizeof(struct ipv4_4tuple),
-        .hash_func = ipv4_2tuple_hash, // rte_hash_crc may be faster but the key need to be less related
+        .hash_func = ipv4_4tuple_hash, // rte_hash_crc may be faster but the key need to be less related
         .hash_func_init_val = 0,
         .extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY,
     };
@@ -1320,7 +1343,7 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
 }
 
 static inline int handle_UDP_DGRAM(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt) {
-    printf("[handle_UDP_DGRAM] Recieve pkt\n");
+    // printf("[handle_UDP_DGRAM] Recieve pkt\n");
     // print_fourTuple(four_tuple);
 
     int res_code;
@@ -1341,6 +1364,11 @@ static inline int handle_UDP_DGRAM(struct ipv4_4tuple *four_tuple, struct rte_mb
 
     int ret;
     struct xio_socket *xs;
+    uint32_t remote_ip = four_tuple->ip_src;
+    uint16_t remote_port = four_tuple->port_src;
+
+    four_tuple->ip_src = 0;
+    four_tuple->port_src = 0;
     ret = rte_hash_lookup_data(udp_conn_tables, four_tuple, (void **)&xs);
     if (ret < 0)
     {
@@ -1352,8 +1380,8 @@ static inline int handle_UDP_DGRAM(struct ipv4_4tuple *four_tuple, struct rte_mb
     des->payload_len = payload_len;
     des->start_offset = 0;
     des->pkt = mbuf_list;
-    des->remote_ip = four_tuple->ip_src;
-    des->remote_port = four_tuple->port_src;
+    des->remote_ip = remote_ip;
+    des->remote_port = remote_port;
 
     rte_rwlock_write_lock(xs->rwlock);
     enqueue(xs->socket_buf, des);
@@ -1502,6 +1530,7 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, uint8_t proto
         if (ret < 0) {
             printf("[xio_new_socket] Unable to add to udp_conn_tables\n");
         }
+        // dump_conn_tables(udp_conn_tables);
     }
 
     return xs;
@@ -1513,7 +1542,7 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, uint8_t proto
    SUCCESS: return socket ptr
 */
 struct xio_socket *xio_new_udp_socket(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem) {
-    printf("[xio_new_udp_socket] Start xio_new_udp_socket\n");
+    // printf("[xio_new_udp_socket] Start xio_new_udp_socket\n");
 
     struct ipv4_4tuple four_tuple = {
         .ip_src    = ip_src,
@@ -1567,7 +1596,7 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *er
 */
 int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint32_t remote_ip, uint16_t remote_port)
 {
-    printf("[xio_write_udp] Start write\n");
+    // printf("[xio_write_udp] Start write\n");
     int ret;
 
     struct ipv4_4tuple four_tuple = {
@@ -1576,8 +1605,13 @@ int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uin
         .ip_dst     = remote_ip,
         .port_dst   = remote_port,
     };
+
+    int service_id = convert_IpToID(remote_ip);
+    if (service_id == -1) {
+        rte_exit(EXIT_FAILURE, "[xio_write_udp] service ID is not exist. remote ip: %d\n", remote_ip);
+    }
     
-    ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, UDP_DGRAM,
+    ret = onvm_send_pkt(globalVar_nf_local_ctx, service_id, UDP_DGRAM,
                         four_tuple.ip_src, four_tuple.port_src, four_tuple.ip_dst, four_tuple.port_dst, IPPROTO_UDP,
                         (char *)buffer, buffer_length);
 
@@ -1622,6 +1656,7 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
             if (remote_ip != NULL && remote_port != NULL) {
                 *remote_ip = pkt_desc->remote_ip;
                 *remote_port = pkt_desc->remote_port;
+                // printf("[xio_read] UDP case, remote is %d:%d\n", pkt_desc->remote_ip, pkt_desc->remote_port);
             } else {
                 printf("[ERROR] [xio_read] In UDP, you should provide pointer to remote_ip and remote_port\n");
             }

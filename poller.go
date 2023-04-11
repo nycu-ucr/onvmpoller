@@ -1372,7 +1372,7 @@ func (connection XIO_Connection) SetWriteDeadline(t time.Time) error {
 ********************************
 */
 
-func ListenXIO_UDP(network string, address net.UDPAddr) (*UDP_Connection, error) {
+func ListenXIO_UDP(network string, address *net.UDPAddr) (*UDP_Connection, error) {
 	logger.Log.Traceln("Start ListenXIO_UDP")
 	logger.Log.Debugf("Listen at %s", address.String())
 
@@ -1401,9 +1401,8 @@ func ListenXIO_UDP(network string, address net.UDPAddr) (*UDP_Connection, error)
 	if udp_conn.xio_socket == nil {
 		err := fmt.Errorf("[ListenXIO_UDP] Create udp socket failed")
 		udp_conn.Close()
+
 		return &udp_conn, err
-	} else {
-		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
 	}
 
 	return &udp_conn, nil
@@ -1479,15 +1478,9 @@ func (udp_conn *UDP_Connection) ReadFrom(b []byte) (int, *net.UDPAddr, error) {
 
 	runtime.KeepAlive(b)
 
-	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", unMarshalIP(remote_ip), remote_port))
+	udp_addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", unMarshalIP(remote_ip), remote_port))
 	if err != nil {
 		return 0, nil, err
-	}
-
-	udp_addr := &net.UDPAddr{
-		IP:   addr.IP,
-		Port: addr.Port,
-		Zone: addr.Zone,
 	}
 
 	return length, udp_addr, err
