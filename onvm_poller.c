@@ -16,20 +16,15 @@ long get_time_nano(struct timespec *ts);
 double get_elapsed_time_sec(struct timespec *before, struct timespec *after);
 long get_elapsed_time_nano(struct timespec *before, struct timespec *after);
 
-int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol);
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol, uint32_t *remote_ip, uint16_t *remote_port);
 int xio_close(struct xio_socket *xs, int *error_code, uint8_t protocol);
 struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code);
 struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code);
 struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code);
 
-/*
-********************************
-
-            Define
-
-********************************
-*/
+struct xio_socket *xio_new_udp_socket(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
+int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint32_t remote_ip, uint16_t remote_port);
 
 /* PKT TYPE */
 #define HTTP_FRAME      0
@@ -37,9 +32,6 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 #define CLOSE_CONN      2
 #define REPLY_CONN      3
 #define UDP_DGRAM       4
-
-/* const */
-#define TCP_PROTO_NUM 0x06
 
 /* dpdk config*/
 #define MBUF_SIZE 4096
@@ -60,7 +52,7 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 */
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
-uint16_t IP_HDR_LEN = sizeof(struct rte_ipv4_hdr);
+uint16_t IP_HDR_LEN  = sizeof(struct rte_ipv4_hdr);
 uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
 uint16_t UDP_HDR_LEN = sizeof(struct rte_udp_hdr);
 
@@ -88,6 +80,8 @@ struct pkt_descriptor
 {
     int payload_len;
     int start_offset;
+    uint32_t remote_ip;     // for UDP
+    uint16_t remote_port;   // for UDP
     struct mbuf_list *pkt;
 };
 
@@ -131,8 +125,22 @@ static inline uint32_t ipv4_4tuple_hash(const void *key, __rte_unused uint32_t k
                                         __rte_unused uint32_t init_val)
 {
     const struct ipv4_4tuple *tuple = (const struct ipv4_4tuple *)key;
-    uint32_t hash = rte_jhash_3words(tuple->ip_dst, tuple->ip_src,
-                                     ((uint32_t)tuple->port_dst << 16) | tuple->port_src, 0);
+    uint32_t hash = rte_jhash_3words(tuple->ip_dst,
+                                     tuple->ip_src,
+                                     ((uint32_t)tuple->port_dst << 16) | tuple->port_src,
+                                     0);
+    return hash;
+}
+
+static inline uint32_t ipv4_2tuple_hash(const void *key, __rte_unused uint32_t key_len,
+                                        __rte_unused uint32_t init_val)
+{
+    // This is for UDP
+    // Only take dst ip addr and port
+    const struct ipv4_4tuple *tuple = (const struct ipv4_4tuple *)key;
+    uint32_t hash = rte_jhash_2words(tuple->ip_dst,
+                                     (uint32_t)tuple->port_dst,
+                                     0);
     return hash;
 }
 
@@ -293,9 +301,15 @@ static inline int string_len(char *p)
 static inline struct rte_tcp_hdr *
 pkt_tcp_hdr(struct rte_mbuf *pkt)
 {
-    uint8_t *pkt_data =
-        rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr);
+    uint8_t *pkt_data = rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr);
     return (struct rte_tcp_hdr *)pkt_data;
+}
+
+static inline struct rte_udp_hdr *
+pkt_udp_hdr(struct rte_mbuf *pkt)
+{
+    uint8_t *pkt_data = rte_pktmbuf_mtod(pkt, uint8_t *) + sizeof(struct rte_ether_hdr) + sizeof(struct rte_ipv4_hdr);
+    return (struct rte_udp_hdr *)pkt_data;
 }
 
 /* Only when TX & RX both close then we can delete socket from conn_tables */
@@ -325,8 +339,22 @@ static inline void try_delete_socket(struct xio_socket *xs, uint8_t protocol)
         }
     } else {
         // UDP
-    }
+        struct ipv4_4tuple key = swap_four_tuple(xs->fourTuple);
 
+        int ret;
+        ret = rte_hash_del_key(udp_conn_tables, (void *)&key);
+        if (ret < 0) {
+            printf("[try_delete_socket] Unable to delete from udp_conn_tables\n");
+        }
+        if (!isEmpty(xs->socket_buf)) {
+            printf("[try_delete_socket] Delete socket before empty socket buffer\n");
+        }
+        free(xs->rwlock);
+        free(xs->socket_buf);
+        free(xs->tx_status);
+        free(xs->rx_status);
+        free(xs);
+    }
 }
 
 void get_monotonic_time(struct timespec *ts)
@@ -420,8 +448,21 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
         rte_exit(EXIT_FAILURE, "Unable to create the connection lookup table\n");
     }
 
-    // TODO: create udp conn talbe
-    udp_conn_tables = NULL;
+    // Create udp conn talbe
+    char udp_conn_table_name[32] = {'\0'};
+    sprintf(udp_conn_table_name, "udp_conn_table_%s", nf_name);
+    struct rte_hash_parameters xio_udp_ipv4_hash_params = {
+        .name = udp_conn_table_name,
+        .entries = 1024 * 1024 * 1,
+        .key_len = sizeof(struct ipv4_4tuple),
+        .hash_func = ipv4_2tuple_hash, // rte_hash_crc may be faster but the key need to be less related
+        .hash_func_init_val = 0,
+        .extra_flag = RTE_HASH_EXTRA_FLAGS_RW_CONCURRENCY,
+    };
+    udp_conn_tables = rte_hash_create(&xio_udp_ipv4_hash_params);
+    if (udp_conn_tables == NULL) {
+        rte_exit(EXIT_FAILURE, "Unable to create the udp connection lookup table\n");
+    }
 
     /* Create IP address to openNetVM's NFID */
     char IpToID_name[nfName_size + 7];
@@ -620,7 +661,7 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         pkt = handle_payload(buffer, buffer_length);
         break;
     default:
-        printf("[onvm_send_pkt]Unknown pkt type: %d\n", pkt_type);
+        printf("[onvm_send_pkt] Unknown pkt type: %d\n", pkt_type);
         break;
     }
     // get_monotonic_time(&t_start);
@@ -657,6 +698,7 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
 
     if (protocol == IPPROTO_TCP) {
         /* Set TCP header */
+
         // get_monotonic_time(&t_start);
         pkt_tcp_hdr = (struct rte_tcp_hdr *)rte_pktmbuf_prepend(pkt, TCP_HDR_LEN);
         // get_monotonic_time(&t_end);
@@ -689,6 +731,7 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
         // rte_memcpy(pkt_tcp_hdr, pkt_tcp_hdr, sizeof(TCP_HDR_LEN)); // + option_len);
     } else if (protocol == IPPROTO_UDP) {
         /* Set UDP header */
+
         pkt_udp_hdr = (struct rte_udp_hdr *)rte_pktmbuf_prepend(pkt, UDP_HDR_LEN);
 
         pkt_udp_hdr->src_port = src_port;
@@ -750,11 +793,12 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // printf("onvm_send_pkt() send packet to NF: %d\n", service_id);
 }
 
-static inline int calculate_payload_len(struct rte_mbuf *pkt)
+static inline int calculate_payload_len(struct rte_mbuf *pkt, uint8_t protocol)
 {
-    int payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN);
-    pkt = pkt->next;
+    uint16_t l4_header_length = (protocol == IPPROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
+    int payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + l4_header_length);
 
+    pkt = pkt->next;
     while (pkt != NULL)
     {
         payload_len = payload_len + pkt->data_len;
@@ -783,11 +827,12 @@ static inline int copy(uint8_t *dst_ptr, uint8_t *src_ptr, int copy_len)
     return copy_len;
 }
 
-int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
+int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset, uint8_t protocol)
 {
     struct rte_mbuf *pkt = pkt_list->pkt;
     struct rte_mbuf *head = pkt;               // Restore the pointer
     struct mbuf_list *tmp_pkt_list = pkt_list; // For move pointer
+    uint16_t l4_header_length = (protocol == IPPROTO_TCP) ? TCP_HDR_LEN : UDP_HDR_LEN;
 
     pkt->next = NULL;
     // Rebuild packet
@@ -814,7 +859,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
     printf("\n");
 #endif
 
-    int remaining_pkt_len = calculate_payload_len(pkt) - start_offset;
+    int remaining_pkt_len = calculate_payload_len(pkt, protocol) - start_offset;
     int end_offset = start_offset;
 
     // Calc already read part, the current position of payload pointer
@@ -824,7 +869,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
     if (c_q == 0 && c_r == 0 && remaining_pkt_len <= buff_cap && remaining_pkt_len <= MBUF_SIZE)
     {
         // Shortcut
-        uint8_t *payload_ptr = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+        uint8_t *payload_ptr = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + l4_header_length;
         rte_memcpy(buffer_ptr, payload_ptr, remaining_pkt_len);
         end_offset += remaining_pkt_len;
         // printf("[handle_assemble] (shortcut): read %d bytes data\n", end_offset - start_offset);
@@ -842,7 +887,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
     if (c_q == 0)
     {
         // First segment has header
-        payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + TCP_HDR_LEN;
+        payload_ptr = rte_pktmbuf_mtod(c_pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + l4_header_length;
     }
     else
     {
@@ -963,8 +1008,7 @@ int handle_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_lis
     }
 }
 
-// int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct rte_mbuf *pkt, int start_offset)
-int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset)
+int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset, uint8_t protocol)
 {
     // printf("[payload_assemble] Start\n");
     int end_offset = 0;
@@ -973,7 +1017,7 @@ int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_li
     // struct timespec t_end;
 
     // get_monotonic_time(&t_start);
-    end_offset = handle_assemble(buffer_ptr, buff_cap, pkt_list, start_offset);
+    end_offset = handle_assemble(buffer_ptr, buff_cap, pkt_list, start_offset, protocol);
     // get_monotonic_time(&t_end);
     // printf("[ONVM] handle_assemble latency: %ld\n", get_elapsed_time_nano(&t_start, &t_end));
     // get_monotonic_time(&t_start);
@@ -1231,7 +1275,7 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
     }
     else
     {
-        payload_len = calculate_payload_len(pkt);
+        payload_len = calculate_payload_len(pkt, IPPROTO_TCP);
     }
 
     int ret;
@@ -1247,6 +1291,8 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
     des->payload_len = payload_len;
     des->start_offset = 0;
     des->pkt = mbuf_list;
+    des->remote_ip = 0;
+    des->remote_port = 0;
 
     rte_rwlock_write_lock(xs->rwlock);
     enqueue(xs->socket_buf, des);
@@ -1273,6 +1319,67 @@ static inline int handle_HTTP_FRAME(struct ipv4_4tuple *four_tuple, struct rte_m
     return res_code;
 }
 
+static inline int handle_UDP_DGRAM(struct ipv4_4tuple *four_tuple, struct rte_mbuf *pkt) {
+    printf("[handle_UDP_DGRAM] Recieve pkt\n");
+    // print_fourTuple(four_tuple);
+
+    int res_code;
+    struct mbuf_list *mbuf_list;
+    mbuf_list = create_mbuf_list(pkt);
+
+    int payload_len = 0;
+    uint8_t *payload;
+    if (pkt->next == NULL)
+    {
+        payload_len = rte_pktmbuf_data_len(pkt) - (ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN);
+        payload = rte_pktmbuf_mtod(pkt, uint8_t *) + ETH_HDR_LEN + IP_HDR_LEN + UDP_HDR_LEN;
+    }
+    else
+    {
+        payload_len = calculate_payload_len(pkt, IPPROTO_UDP);
+    }
+
+    int ret;
+    struct xio_socket *xs;
+    ret = rte_hash_lookup_data(udp_conn_tables, four_tuple, (void **)&xs);
+    if (ret < 0)
+    {
+        printf("[handle_UDP_DGRAM] Failed to retrieve value from udp_conn_tables\n");
+        return -1;
+    }
+
+    struct pkt_descriptor *des = (struct pkt_descriptor *)malloc(sizeof(struct pkt_descriptor));
+    des->payload_len = payload_len;
+    des->start_offset = 0;
+    des->pkt = mbuf_list;
+    des->remote_ip = four_tuple->ip_src;
+    des->remote_port = four_tuple->port_src;
+
+    rte_rwlock_write_lock(xs->rwlock);
+    enqueue(xs->socket_buf, des);
+    if (xs->status == READER_WAITING)
+    {
+        /* Reset status */
+        xs->status = EST_COMPLETE;
+        rte_rwlock_write_unlock(xs->rwlock);
+
+        res_code = batch_wake_up(UDP_DGRAM, xs->go_channel_ptr);
+    }
+    else if (xs->status == EST_COMPLETE)
+    {
+        // printf("[handle_UDP_DGRAM] EST_COMPLETE status\n");
+        rte_rwlock_write_unlock(xs->rwlock);
+    }
+    else
+    {
+        // printf("[handle_UDP_DGRAM] ELSE_STATUS status\n");
+        rte_rwlock_write_unlock(xs->rwlock);
+        /* [TODO] handle different socket status */
+    }
+
+    return res_code;
+}
+
 int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm_nf_local_ctx *ctx)
 {
     if (pkt == NULL && meta == NULL){
@@ -1280,7 +1387,6 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
         return 0;
     }
 
-    struct rte_tcp_hdr *tcp_hdr;
     struct rte_ipv4_hdr *ipv4_hdr;
     struct rte_ether_hdr *eth_hdr;
 
@@ -1309,7 +1415,7 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
 
     int res_code;
     if (ipv4_hdr->next_proto_id == IPPROTO_TCP) {
-        tcp_hdr = pkt_tcp_hdr(pkt);
+        struct rte_tcp_hdr *tcp_hdr = pkt_tcp_hdr(pkt);
         struct ipv4_4tuple four_tuple = {
             .ip_dst = ipv4_hdr->dst_addr,
             .ip_src = ipv4_hdr->src_addr,
@@ -1337,7 +1443,16 @@ int packet_handler(struct rte_mbuf *pkt, struct onvm_pkt_meta *meta, struct onvm
             break;
         }
     } else if (ipv4_hdr->next_proto_id == IPPROTO_UDP) {
+        /* UDP DGRAM */
+        struct rte_udp_hdr *udp_hdr = pkt_udp_hdr(pkt);
+        struct ipv4_4tuple four_tuple = {
+            .ip_dst = ipv4_hdr->dst_addr,
+            .ip_src = ipv4_hdr->src_addr,
+            .port_dst = udp_hdr->dst_port,
+            .port_src = udp_hdr->src_port,
+        };
 
+        res_code = handle_UDP_DGRAM(&four_tuple, pkt);
     } else {
         // printf("[ERROR] packet is not TCP or UDP packet\n");
         res_code = -1;
@@ -1360,7 +1475,7 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, uint8_t proto
     xs->socket_buf = createQueue();
 
     xs->go_channel_ptr = sem;
-    xs->rwlock = (rte_rwlock_t *)malloc(sizeof(rte_rwlock_t));
+    xs->rwlock    = (rte_rwlock_t *)malloc(sizeof(rte_rwlock_t));
     xs->rx_status = (rte_atomic16_t *)malloc(sizeof(rte_atomic16_t));
     xs->tx_status = (rte_atomic16_t *)malloc(sizeof(rte_atomic16_t));
 
@@ -1374,18 +1489,50 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, uint8_t proto
     int ret;
     struct ipv4_4tuple key = swap_four_tuple(four_tuple);
     /*
-       Q: Why key need to be swaped when insert to table?
-       A: The incoming pkt don't need to be swaped to look-up socket.
+       Q: Why does the key need to be swapped when inserted into the table?
+       A: The incoming pkt don't need to be swapped while searching the table.
     */
     if (protocol == IPPROTO_TCP) {
         ret = rte_hash_add_key_data(conn_tables, (void *)&key, (void *)xs);
-        if (ret < 0)
-        {
+        if (ret < 0) {
             printf("[xio_new_socket] Unable to add to conn_tables\n");
         }
     } else {
-
+        ret = rte_hash_add_key_data(udp_conn_tables, (void *)&key, (void *)xs);
+        if (ret < 0) {
+            printf("[xio_new_socket] Unable to add to udp_conn_tables\n");
+        }
     }
+
+    return xs;
+}
+
+/*
+   [Return]
+   FAIL: return NULL
+   SUCCESS: return socket ptr
+*/
+struct xio_socket *xio_new_udp_socket(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem) {
+    printf("[xio_new_udp_socket] Start xio_new_udp_socket\n");
+
+    struct ipv4_4tuple four_tuple = {
+        .ip_src    = ip_src,
+        .port_src  = port_src,
+        .ip_dst    = ip_dst,
+        .port_dst  = port_dst,
+    };
+
+    /* Check whether the ip address is valid */
+    // Since UDP is connection-less, the service_id won't be used.
+    int service_id = 0;
+    service_id = convert_IpToID(four_tuple.ip_src);
+    if (service_id < 0) {
+        printf("[xio_new_udp_socket] Unable to convert IpToID\n");
+        return NULL;
+    }
+
+    /* Create new XIO socket structure */
+    struct xio_socket *xs = xio_new_socket(XIO_SOCKET, service_id, IPPROTO_UDP, four_tuple, sem);
 
     return xs;
 }
@@ -1395,12 +1542,13 @@ struct xio_socket *xio_new_socket(int socket_type, int service_id, uint8_t proto
    FAIL: return -1
    SUCCESS: return number of bytes that were successfully written
 */
-int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol)
+int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code)
 {
     // printf("[xio_write] Start write\n");
     int ret;
+
     ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, HTTP_FRAME,
-                        xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst, protocol,
+                        xs->fourTuple.ip_src, xs->fourTuple.port_src, xs->fourTuple.ip_dst, xs->fourTuple.port_dst, IPPROTO_TCP,
                         (char *)buffer, buffer_length);
 
     if (ret < 0)
@@ -1415,9 +1563,39 @@ int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *er
 /*
    [Return]
    FAIL: return -1
+   SUCCESS: return number of bytes that were successfully written
+*/
+int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint32_t remote_ip, uint16_t remote_port)
+{
+    printf("[xio_write_udp] Start write\n");
+    int ret;
+
+    struct ipv4_4tuple four_tuple = {
+        .ip_src     = xs->fourTuple.ip_src,
+        .port_src   = xs->fourTuple.port_src,
+        .ip_dst     = remote_ip,
+        .port_dst   = remote_port,
+    };
+    
+    ret = onvm_send_pkt(globalVar_nf_local_ctx, xs->service_id, UDP_DGRAM,
+                        four_tuple.ip_src, four_tuple.port_src, four_tuple.ip_dst, four_tuple.port_dst, IPPROTO_UDP,
+                        (char *)buffer, buffer_length);
+
+    if (ret < 0)
+    {
+        printf("[xio_write_udp] onvm_send_pkt not success\n");
+        return -1;
+    }
+
+    return buffer_length;
+}
+
+/*
+   [Return]
+   FAIL: return -1
    SUCCESS: return number of bytes that were successfully read
 */
-int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code)
+int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol, uint32_t *remote_ip, uint16_t *remote_port)
 {
     // printf("[xio_read] Start read\n");
     int ret = 0;
@@ -1438,8 +1616,19 @@ int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *err
            Already have pkt descriptor in socket's buffer
            so we can directly call payload_assemble
         */
+        
+        // Retrieve report ip address and port
+        if (protocol == IPPROTO_UDP) {
+            if (remote_ip != NULL && remote_port != NULL) {
+                *remote_ip = pkt_desc->remote_ip;
+                *remote_port = pkt_desc->remote_port;
+            } else {
+                printf("[ERROR] [xio_read] In UDP, you should provide pointer to remote_ip and remote_port\n");
+            }
+        }
+
         // printf("[xio_read] payload length: %d\n", pkt_desc->payload_len);
-        int end_offset = payload_assemble(buffer, buffer_length, pkt_desc->pkt, pkt_desc->start_offset);
+        int end_offset = payload_assemble(buffer, buffer_length, pkt_desc->pkt, pkt_desc->start_offset, protocol);
 
         rte_rwlock_write_lock(xs->rwlock);
         ret = end_offset - pkt_desc->start_offset;

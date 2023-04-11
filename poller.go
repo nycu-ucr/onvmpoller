@@ -17,17 +17,19 @@ struct ipv4_4tuple;
 struct xio_socket;
 
 extern int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName);
-extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset);
+extern int payload_assemble(uint8_t *buffer_ptr, int buff_cap, struct mbuf_list *pkt_list, int start_offset, uint8_t protocol);
 extern int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                 uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
                 char *buffer, int buffer_length);
-extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol);
-extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+extern int xio_write(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code);
+extern int xio_read(struct xio_socket *xs, uint8_t *buffer, int buffer_length, int *error_code, uint8_t protocol, uint32_t *remote_ip, uint16_t *remote_port);
 extern int xio_close(struct xio_socket *xs, int *error_code, uint8_t protocol);
 extern struct xio_socket *xio_connect(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem, int *error_code);
 extern struct xio_socket *xio_accept(struct xio_socket *listener, char *sem, int *error_code);
 extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *complete_chan_ptr, int *error_code);
 
+extern struct xio_socket *xio_new_udp_socket(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
+extern int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint32_t remote_ip, uint16_t remote_port);
 */
 import "C"
 
@@ -735,7 +737,7 @@ func (connection Connection) reading(b []byte) (int, error) {
 	buff_cap := cap(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 	// length, err2 = buffer.Read(b)
-	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset))
+	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset), TCP_PROTO_NUM)
 	end_offset := int(offset)
 	length = end_offset - connection.pkt.Start_offset
 
@@ -1253,7 +1255,7 @@ func (connection XIO_Connection) Read(b []byte) (int, error) {
 	err_code_ptr := (*C.int)(unsafe.Pointer(&err_code))
 	for {
 		err_code = 0
-		ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len), err_code_ptr)
+		ret := C.xio_read(connection.xio_socket, buffer_ptr, C.int(buffer_len), err_code_ptr, TCP_PROTO_NUM, nil, nil)
 		length = int(ret)
 
 		if err_code == int(syscall.EAGAIN) {
@@ -1294,7 +1296,7 @@ func (connection XIO_Connection) Write(b []byte) (int, error) {
 	buffer_len := len(b)
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 
-	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len), nil, TCP_PROTO_NUM)
+	ret := C.xio_write(connection.xio_socket, buffer_ptr, C.int(buffer_len), nil)
 	length = int(ret)
 	if length < 0 {
 		err = fmt.Errorf("xio_write error")
@@ -1371,46 +1373,137 @@ func (connection XIO_Connection) SetWriteDeadline(t time.Time) error {
 */
 
 func ListenXIO_UDP(network string, address net.UDPAddr) (*UDP_Connection, error) {
-	// logger.Log.Traceln("Start ListenXIO_UDP")
-	// logger.Log.Debugf("Listen at %s", address.String())
+	logger.Log.Traceln("Start ListenXIO_UDP")
+	logger.Log.Debugf("Listen at %s", address.String())
 
-	// ip_addr := address.IP.String()
-	// port := uint16(address.Port)
-	// local_address = ip_addr
+	ip_addr := address.IP.String()
+	port := uint16(address.Port)
+	local_address = ip_addr
 
-	// var four_tuple Four_tuple_rte
-	// four_tuple.Src_ip = inet_addr(ip_addr)
-	// four_tuple.Src_port = port
-	// four_tuple.Dst_ip = 0
-	// four_tuple.Dst_port = 0
+	// Initialize a connection
+	var udp_conn UDP_Connection
 
-	// id, err := IpToID(ip_addr)
-	// laddr := OnvmAddr{
-	// 	service_id: uint8(id),
-	// 	network:    "onvm-udp",
-	// 	ipv4_addr:  ip_addr,
-	// 	port:       port,
-	// }
+	udp_conn.four_tuple.Src_ip = inet_addr(ip_addr)
+	udp_conn.four_tuple.Src_port = port
+	udp_conn.four_tuple.Dst_ip = 0
+	udp_conn.four_tuple.Dst_port = 0
 
-	// if err != nil {
-	// 	return nil, err
-	// }
+	condVar := newSema()
+	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
+	udp_conn.sync_chan = condVar
 
-	// udp_conn := &UDP_Connection {
+	// Create udp socket in C
+	xs := C.xio_new_udp_socket(C.uint32_t(udp_conn.four_tuple.Src_ip), C.uint16_t(udp_conn.four_tuple.Src_port),
+		C.uint32_t(udp_conn.four_tuple.Dst_ip), C.uint16_t(udp_conn.four_tuple.Dst_port), condVarPtr)
 
-	// }
+	udp_conn.xio_socket = xs
 
-	return nil, nil
+	if udp_conn.xio_socket == nil {
+		err := fmt.Errorf("[ListenXIO_UDP] Create udp socket failed")
+		udp_conn.Close()
+		return &udp_conn, err
+	} else {
+		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
+	}
+
+	return &udp_conn, nil
 }
 
-func (udp_conn UDP_Connection) WriteTo(buf []byte, addr *net.UDPAddr) (int, error) {
+func (udp_conn *UDP_Connection) WriteTo(b []byte, addr *net.UDPAddr) (int, error) {
+	// defer TimeTrack(time.Now())
+	logger.Log.Tracef("Start UDP_Connection.WriteTo, four-tuple: %v\tremote: %v", udp_conn.four_tuple, addr.String())
+	logger.Log.Debugf("Write %d data.", len(b))
 
-	return 0, nil
+	var length int
+	var err error
+
+	buffer_len := len(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
+	remote_ip := C.uint32_t(inet_addr(addr.IP.String()))
+	remote_port := C.uint16_t(addr.Port)
+
+	ret := C.xio_write_udp(udp_conn.xio_socket, buffer_ptr, C.int(buffer_len), remote_ip, remote_port)
+	length = int(ret)
+	if length < 0 {
+		err = fmt.Errorf("xio_write_udp error")
+		return 0, err
+	}
+
+	runtime.KeepAlive(b)
+
+	return length, nil
 }
 
-func (udp_conn UDP_Connection) ReadFrom(buf []byte) (int, *net.UDPAddr, error) {
+func (udp_conn *UDP_Connection) ReadFrom(b []byte) (int, *net.UDPAddr, error) {
+	// defer TimeTrack(time.Now())
+	logger.Log.Tracef("Start UDP_Connection.ReadFrom, four-tuple: %v, buffer (len, cap) = (%v, %v)", udp_conn.four_tuple, len(b), cap(b))
 
-	return 0, nil, nil
+	var length int
+	var err error
+	var remote_ip uint32
+	var remote_port uint16
+
+	remote_ip_ptr := (*C.uint32_t)(unsafe.Pointer(&remote_ip))
+	remote_port_ptr := (*C.uint16_t)(unsafe.Pointer(&remote_port))
+
+	buffer_len := len(b)
+	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
+
+	err_code := 0
+	err_code_ptr := (*C.int)(unsafe.Pointer(&err_code))
+	for {
+		err_code = 0
+		ret := C.xio_read(udp_conn.xio_socket, buffer_ptr, C.int(buffer_len), err_code_ptr, UDP_PROTO_NUM, remote_ip_ptr, remote_port_ptr)
+		length = int(ret)
+
+		if err_code == int(syscall.EAGAIN) {
+			// Wait for pkt
+			ok := udp_conn.sync_chan.wait()
+			runtime.KeepAlive(udp_conn.sync_chan)
+			// logger.Log.Warnf("Reader wake-up")
+			if ok {
+				/* Socket closed */
+				return 0, nil, io.EOF
+			}
+			continue
+		} else if err_code == END_OF_PKT {
+			err = errors.New("EOP")
+			break
+		} else if err_code != 0 {
+			err := fmt.Errorf("Read: xio_read errno=%d", err_code)
+			return 0, nil, err
+		} else {
+			break
+		}
+	}
+
+	runtime.KeepAlive(b)
+
+	addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", unMarshalIP(remote_ip), remote_port))
+	if err != nil {
+		return 0, nil, err
+	}
+
+	udp_addr := &net.UDPAddr{
+		IP:   addr.IP,
+		Port: addr.Port,
+		Zone: addr.Zone,
+	}
+
+	return length, udp_addr, err
+}
+
+func (udp_conn *UDP_Connection) Close() error {
+	var err error
+
+	logger.Log.Tracef("Close UDP connection four-tuple: %v\n", udp_conn.four_tuple)
+
+	ret := C.xio_close(udp_conn.xio_socket, nil, UDP_PROTO_NUM)
+	if int(ret) == -1 {
+		err = fmt.Errorf("xio_close failed")
+	}
+
+	return err
 }
 
 func inet_addr(ipaddr string) uint32 {
