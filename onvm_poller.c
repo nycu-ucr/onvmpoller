@@ -1084,7 +1084,6 @@ static inline void reset_list(struct list_node *head)
 */
 static inline int threshold()
 {
-    return 1;
     int table_size = rte_hash_count(conn_tables);
 
     /* Ready-list size trigger */
@@ -1114,7 +1113,6 @@ static inline int threshold()
 
 static inline void force_wake_up()
 {
-    return;
     if (list_size == 0)
     {
         return;
