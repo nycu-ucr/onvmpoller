@@ -1499,6 +1499,15 @@ func (udp_conn *UDP_Connection) Close() error {
 	return err
 }
 
+func (udp_conn *UDP_Connection) LocalAddr() *net.UDPAddr {
+	udp_addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", unMarshalIP(udp_conn.four_tuple.Src_ip), udp_conn.four_tuple.Src_port))
+	if err != nil {
+		logger.Log.Error(err.Error())
+	}
+
+	return udp_addr
+}
+
 func inet_addr(ipaddr string) uint32 {
 	var (
 		ip                 = strings.Split(ipaddr, ".")
