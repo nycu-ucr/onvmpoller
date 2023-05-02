@@ -7,6 +7,7 @@
 #include <arpa/inet.h>
 #include <time.h>
 #include <rte_rcu_qsbr.h>
+#include <rte_icmp.h>
 #include "xio.h"
 
 // extern int XIO_wait(struct list_node *)
@@ -26,6 +27,8 @@ struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_t ip_ds
 
 struct xio_socket *xio_new_udp_socket(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint32_t remote_ip, uint16_t remote_port);
+
+int trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip);
 
 /* PKT TYPE */
 #define HTTP_FRAME      0
@@ -54,6 +57,7 @@ int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uin
 
 uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
 uint16_t IP_HDR_LEN  = sizeof(struct rte_ipv4_hdr);
+uint16_t ICMP_HDR_LEN  = sizeof(struct rte_icmp_hdr);
 uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
 uint16_t UDP_HDR_LEN = sizeof(struct rte_udp_hdr);
 
@@ -646,6 +650,65 @@ struct rte_mbuf *handle_payload(char *buffer, int buffer_length)
     return pkt;
 }
 
+int _trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip) {
+    struct rte_mbuf *pkt;
+    struct onvm_pkt_meta *pmeta;
+    struct rte_icmp_hdr *pkt_icmp_hdr;
+    struct rte_ipv4_hdr *pkt_ip_hdr;
+    struct rte_ether_hdr *pkt_eth_hdr;
+
+    pkt = rte_pktmbuf_alloc(pktmbuf_pool);
+    if (pkt == NULL) {
+        printf("Payload handling error\n");
+        return -1;
+    }
+    pkt_icmp_hdr = (struct rte_icmp_hdr *)rte_pktmbuf_prepend(pkt, ICMP_HDR_LEN);
+    if (pkt_icmp_hdr == NULL) {
+        printf("Failed to prepend ICMP header.\n");
+        return -1;
+    }
+    pkt_icmp_hdr->icmp_type = RTE_IP_ICMP_ECHO_REQUEST;
+    pkt_icmp_hdr->icmp_code = 0;
+    pkt_icmp_hdr->icmp_cksum = 0;
+
+    /* Set IP header */
+    pkt_ip_hdr = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, IP_HDR_LEN);
+    if (pkt_ip_hdr == NULL) {
+        printf("Failed to prepend IP header. Consider splitting up the packet.\n");
+        return -1;
+    }
+    pkt_ip_hdr->src_addr = src_ip;
+    pkt_ip_hdr->dst_addr = dst_ip;
+    pkt_ip_hdr->next_proto_id = IPPROTO_ICMP;
+    pkt_ip_hdr->version_ihl = 0x45;  // version is 4 and IHL is 5
+
+    /* Set ethernet header */
+    pkt_eth_hdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, ETH_HDR_LEN);
+    if (pkt_eth_hdr == NULL) {
+        printf("Failed to prepend ethernet header. Consider splitting up the packet.\n");
+        return -1;
+    }
+
+    pkt->pkt_len = pkt->data_len;
+
+    // Fill out the meta data of the packet
+    pmeta = onvm_get_pkt_meta(pkt);
+    pmeta->destination = service_id;
+    pmeta->action = ONVM_NF_ACTION_TONF;
+
+    pkt->hash.rss = 0;
+    pkt->port = 1;  // Port 0 connect to AN; Port 1 connect DN
+ 
+    return onvm_nflib_return_pkt(globalVar_nf_local_ctx->nf, pkt);
+}
+
+int trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip) {
+    for (int x=0; x < 5; x++) {
+        // printf("Send %d ping packet\n", x+1);
+        _trigger_paging(service_id, src_ip, dst_ip);
+    }
+}
+
 int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
                   uint32_t src_ip, uint16_t src_port, uint32_t dst_ip, uint16_t dst_port, uint8_t protocol,
                   char *buffer, int buffer_length)
@@ -655,7 +718,7 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     uint8_t *pkt_payload;
     struct rte_tcp_hdr *pkt_tcp_hdr;
     struct rte_udp_hdr *pkt_udp_hdr;
-    struct rte_ipv4_hdr *pkt_iph;
+    struct rte_ipv4_hdr *pkt_ip_hdr;
     struct rte_ether_hdr *pkt_eth_hdr;
 
     // struct timespec t_start;
@@ -766,17 +829,17 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     }
 
     /* Set IP header */
-    pkt_iph = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, IP_HDR_LEN);
-    if (pkt_iph == NULL)
+    pkt_ip_hdr = (struct rte_ipv4_hdr *)rte_pktmbuf_prepend(pkt, IP_HDR_LEN);
+    if (pkt_ip_hdr == NULL)
     {
         printf("Failed to prepend IP header. Consider splitting up the packet.\n");
         return -1;
     }
-    pkt_iph->src_addr = src_ip;
-    pkt_iph->dst_addr = dst_ip;
-    pkt_iph->next_proto_id = protocol;
-    pkt_iph->version_ihl = IPV4_VERSION_IHL;
-    // rte_memcpy(pkt_iph, pkt_iph, sizeof(IP_HDR_LEN));
+    pkt_ip_hdr->src_addr = src_ip;
+    pkt_ip_hdr->dst_addr = dst_ip;
+    pkt_ip_hdr->next_proto_id = protocol;
+    pkt_ip_hdr->version_ihl = IPV4_VERSION_IHL;
+    // rte_memcpy(pkt_ip_hdr, pkt_ip_hdr, sizeof(IP_HDR_LEN));
 
     /* Set ethernet header */
     pkt_eth_hdr = (struct rte_ether_hdr *)rte_pktmbuf_prepend(pkt, ETH_HDR_LEN);
@@ -788,7 +851,7 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // rte_memcpy(pkt_eth_hdr, pkt_eth_hdr, sizeof(pkt_eth_hdr));
 
     pkt->pkt_len = pkt->data_len;
-    // pkt_iph->total_length = rte_cpu_to_be_16(buffer_length + sizeof(struct rte_tcp_hdr) +
+    // pkt_ip_hdr->total_length = rte_cpu_to_be_16(buffer_length + sizeof(struct rte_tcp_hdr) +
     //                                          sizeof(struct rte_ipv4_hdr) - sizeof(struct rte_ether_hdr));
     // printf("Pkt len %d, total iph len %lu\n", pkt->pkt_len,
     //        buffer_length + sizeof(struct rte_tcp_hdr) +

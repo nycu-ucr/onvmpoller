@@ -30,6 +30,8 @@ extern struct xio_socket *xio_listen(uint32_t ip_src, uint16_t port_src, uint32_
 
 extern struct xio_socket *xio_new_udp_socket(uint32_t ip_src, uint16_t port_src, uint32_t ip_dst, uint16_t port_dst, char *sem);
 extern int xio_write_udp(struct xio_socket *xs, uint8_t *buffer, int buffer_length, uint32_t remote_ip, uint16_t remote_port);
+
+extern int trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip);
 */
 import "C"
 
@@ -1575,4 +1577,8 @@ func (c *sema) close() {
 	c.closed = true
 	c.cond.Signal()
 	c.cond.L.Unlock()
+}
+
+func TriggerPaging(service_id int, src_ip string, dst_ip string) {
+	C.trigger_paging(C.int(service_id), C.uint32_t(inet_addr(src_ip)), C.uint32_t(inet_addr(dst_ip)))
 }
