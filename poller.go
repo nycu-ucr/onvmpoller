@@ -36,10 +36,7 @@ extern int trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip);
 import "C"
 
 import (
-	"bytes"
 	"container/list"
-	"encoding/binary"
-	"encoding/gob"
 	"errors"
 	"fmt"
 	"io"
@@ -52,12 +49,10 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
-	"github.com/cornelk/hashmap"
 	"github.com/nycu-ucr/onvmpoller/logger"
 	"github.com/sirupsen/logrus"
 	"gopkg.in/yaml.v3"
@@ -79,20 +74,12 @@ const (
 	PM_CHANNEL_SIZE = 1024
 	// Logger level
 	LOG_LEVEL = logrus.WarnLevel
-	// Packet manager numbers
-	ONVM_POLLER_NUM = 8
 	// Error code
 	END_OF_PKT = 87
 	// Protocol Number
 	UDP_PROTO_NUM = 0x11
 	TCP_PROTO_NUM = 0x06
 )
-
-type Buffer struct {
-	buffer  []byte
-	counter int
-	is_done bool
-}
 
 type Config struct {
 	// Map the IP address to Service ID
@@ -102,14 +89,6 @@ type Config struct {
 type NFip struct {
 	// Map the NF to IP address
 	Map map[string]string `yaml:"NFIPMap,omitempty"`
-}
-
-type ChannelData struct {
-	PacketType  int
-	FourTuple   Four_tuple_rte
-	Payload_len int
-	// PacketList  []*C.struct_rte_mbuf
-	PacketList *C.struct_mbuf_list
 }
 
 type Pkt struct {
@@ -125,16 +104,7 @@ type buffer struct {
 	cond *sync.Cond
 }
 
-type Connection struct {
-	dst_id uint8
-	// rxchan         chan ([]byte)
-	four_tuple Four_tuple_rte
-	state      *connState
-	sync_chan  chan struct{} // For waiting ACK
-	buffer     *shareList
-	pkt        *Pkt
-}
-
+// XIO UDP Connection
 type UDP_Connection struct {
 	xio_socket *C.struct_xio_socket
 	four_tuple Four_tuple_rte
@@ -142,6 +112,7 @@ type UDP_Connection struct {
 	dst_id     uint8
 }
 
+// XIO TCP Connection
 type XIO_Connection struct {
 	xio_socket *C.struct_xio_socket
 	four_tuple Four_tuple_rte
@@ -156,22 +127,11 @@ type XIO_Listener struct {
 	complete_chan *sema
 }
 
-type connState struct {
-	is_rxchan_closed atomic.Bool
-	is_txchan_closed atomic.Bool
-}
-
 type Four_tuple_rte struct {
 	Src_ip   uint32
 	Src_port uint16
 	Dst_ip   uint32
 	Dst_port uint16
-}
-
-type OnvmListener struct {
-	laddr         OnvmAddr         // Local Address
-	conn          *Connection      // For handling the incoming connection
-	complete_chan chan *Connection // Used in Accept() to get completed connection
 }
 
 type OnvmAddr struct {
@@ -181,64 +141,30 @@ type OnvmAddr struct {
 	port       uint16
 }
 
-type OnvmPoll struct {
-	/*
-		Connection table
-		key: Use four-tuple to calculate this hash-key
-		value: pointer to the Connection
-	*/
-	tables *hashmap.Map[uint32, *Connection]
-	// pkt_table      *hashmap.Map[int, *C.struct_rte_mbuf]
-	syn_chan       chan (*Four_tuple_rte)
-	ack_chan       chan (*Four_tuple_rte)
-	fin_frame_chan chan (*ChannelData) //*sharedBuffer
-}
-
 type PortManager struct {
 	pool            map[uint16]bool
 	get_port_ch     chan uint16
 	release_port_ch chan uint16
 }
 
-type StatusFlag struct {
-	is_rxchan_closed bool
-	is_txchan_closed bool
-	is_ready         bool
-}
-
 /* Global Variables */
 var (
 	config        Config
 	nfIP          NFip
-	onvmpoll      []*OnvmPoll
 	local_address string
 	nf_ctx        *C.struct_onvm_nf_local_ctx
-	listener      *OnvmListener
 	xio_listener  *XIO_Listener
 	port_manager  *PortManager
-	conn_pool     sync.Pool
-
-	// Control Message (bytes)
-	SYN = []byte("SYN")
-	ACK = []byte("ACK")
-	FIN = []byte("FIN")
 )
 
 func init() {
 	/* Initialize Global Variable */
 	init_config()
-	// initOnvmPoll()
 
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
 		release_port_ch: make(chan uint16, PM_CHANNEL_SIZE),
-	}
-
-	conn_pool = sync.Pool{
-		New: func() any {
-			return createConnection()
-		},
 	}
 
 	/* Setup Logger */
@@ -270,7 +196,6 @@ func init() {
 
 func runOnvmPoller() {
 	go C.onvm_nflib_run(nf_ctx)
-	// runPktWorker()
 }
 
 /*********************************
@@ -290,7 +215,9 @@ func TriggerPaging(service_id int, src_ip string, dst_ip string) {
 }
 
 /*********************************
+
 	     Hepler functions
+
 *********************************/
 
 func init_config() {
@@ -360,26 +287,6 @@ func parseAddress(address string) (string, uint16) {
 	return ip_addr, port
 }
 
-func intToIP4(ipInt int64) string {
-	b0 := strconv.FormatInt((ipInt>>24)&0xff, 10)
-	b1 := strconv.FormatInt((ipInt>>16)&0xff, 10)
-	b2 := strconv.FormatInt((ipInt>>8)&0xff, 10)
-	b3 := strconv.FormatInt((ipInt & 0xff), 10)
-
-	return b0 + "." + b1 + "." + b2 + "." + b3
-}
-
-func makeConnCtrlMsg(msg_type int) []byte {
-	switch msg_type {
-	case ESTABLISH_CONN:
-		return SYN
-	case REPLY_CONN:
-		return ACK
-	default:
-		return FIN
-	}
-}
-
 func unMarshalIP(ip uint32) string {
 	ipInt := int64(ip)
 	// need to do two bit shifting and “0xff” masking
@@ -390,75 +297,25 @@ func unMarshalIP(ip uint32) string {
 	return b3 + "." + b2 + "." + b1 + "." + b0
 }
 
-func hashV4Flow(four_tuple Four_tuple_rte) uint32 {
-	flowHash := (four_tuple.Src_ip * 59) ^ (four_tuple.Dst_ip) ^ (uint32(four_tuple.Src_port) << 16) ^ uint32(four_tuple.Dst_port) ^ uint32(6)
-
-	return flowHash
-}
-
-func encodeChannelDataToBytes(tx_data ChannelData) ([]byte, error) {
-	// Encode TxChannelData to bytes
-	// logger.Log.Tracef("EncodeChannelDataToBytes, tx_data:%+v", tx_data)
-	var buf bytes.Buffer
-
-	enc := gob.NewEncoder(&buf)
-	err := enc.Encode(tx_data)
-
-	return buf.Bytes(), err
-}
-
-func decodeToChannelData(buf []byte) (ChannelData, error) {
-	// Decode bytes to RxChannelData
-	var rx_data ChannelData
-
-	dec := gob.NewDecoder(bytes.NewReader(buf))
-	err := dec.Decode(&rx_data)
-
-	return rx_data, err
-}
-
-func swapFourTuple(four_tuple Four_tuple_rte) Four_tuple_rte {
-	return Four_tuple_rte{
-		Src_ip:   four_tuple.Dst_ip,
-		Src_port: four_tuple.Dst_port,
-		Dst_ip:   four_tuple.Src_ip,
-		Dst_port: four_tuple.Src_port,
-	}
-}
-
-func parseFourTupleByIndex(four_tuple string, index int) string {
-	tuples := strings.Split(four_tuple, ",")
-	return tuples[index]
-}
-
-/* Use four-tuple to get the poller-index to dispatch */
-func (four_tuple *Four_tuple_rte) getPollIndex() int {
-	return int(four_tuple.Src_port+four_tuple.Dst_port) % ONVM_POLLER_NUM
+func inet_addr(ipaddr string) uint32 {
+	var (
+		ip                 = strings.Split(ipaddr, ".")
+		ip1, ip2, ip3, ip4 uint64
+		ret                uint32
+	)
+	ip1, _ = strconv.ParseUint(ip[0], 10, 8)
+	ip2, _ = strconv.ParseUint(ip[1], 10, 8)
+	ip3, _ = strconv.ParseUint(ip[2], 10, 8)
+	ip4, _ = strconv.ParseUint(ip[3], 10, 8)
+	ret = uint32(ip4)<<24 + uint32(ip3)<<16 + uint32(ip2)<<8 + uint32(ip1)
+	return ret
 }
 
 /*********************************
+
 	Methods of packet handling
+
 *********************************/
-
-func initOnvmPoll() {
-	onvmpoll = make([]*OnvmPoll, ONVM_POLLER_NUM)
-	for i := 0; i < ONVM_POLLER_NUM; i++ {
-		onvmpoll[i] = &OnvmPoll{
-			tables:         hashmap.New[uint32, *Connection](),
-			syn_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
-			ack_chan:       make(chan *Four_tuple_rte, 128/ONVM_POLLER_NUM),
-			fin_frame_chan: make(chan *ChannelData, 128/ONVM_POLLER_NUM),
-		}
-	}
-}
-
-func runPktWorker() {
-	for i := 0; i < ONVM_POLLER_NUM; i++ {
-		go onvmpoll[i].connectionHandler()
-		go onvmpoll[i].finHandler()
-		go onvmpoll[i].replyHandler()
-	}
-}
 
 //export XIO_wait
 func XIO_wait(list *C.struct_list_node) int {
@@ -485,87 +342,10 @@ func XIO_wait(list *C.struct_list_node) int {
 	return res_code
 }
 
-func (poll *OnvmPoll) connectionHandler() {
-	logger.Log.Traceln("Start connectionWorker")
-
-	for four_tuple := range poll.syn_chan {
-		var new_conn *Connection
-
-		logger.Log.Traceln("Receive one connection request")
-
-		// Initialize the new connection
-		// new_conn = createConnection()
-		new_conn = conn_pool.Get().(*Connection)
-		initConnectionCh(new_conn)
-		new_conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(listener.laddr.ipv4_addr)[12:16])
-		new_conn.four_tuple.Src_port = listener.laddr.port
-		new_conn.four_tuple.Dst_ip = four_tuple.Src_ip
-		new_conn.four_tuple.Dst_port = four_tuple.Src_port
-
-		// Add the connection to table
-		poll.Add(new_conn)
-
-		dst_id, _ := IpToID(unMarshalIP(four_tuple.Src_ip))
-		new_conn.dst_id = uint8(dst_id)
-
-		// Send ACK back to client
-		err := new_conn.writeControlMessage(REPLY_CONN)
-		if err != nil {
-			logger.Log.Errorln(err.Error())
-			new_conn.Close()
-		} else {
-			logger.Log.Tracef("Write connection response to (%v, %v)",
-				new_conn.four_tuple.Dst_ip,
-				new_conn.four_tuple.Dst_port)
-		}
-
-		// s := intToIP4(int64(four_tuple.Src_ip))
-		// t, _ := IpToID(s)
-		// logger.Log.Debugf("Accept connection: %v:%v (NF: %v)", s, four_tuple.Src_port, t)
-		listener.complete_chan <- new_conn
-	}
-}
-
-func (poll *OnvmPoll) replyHandler() {
-	for four_tuple := range poll.ack_chan {
-		conn, ok := poll.tables.Get(hashV4Flow(*four_tuple))
-		if !ok {
-			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
-		} else {
-			// conn.state.is_ready.Store(true)
-			conn.sync_chan <- struct{}{}
-		}
-	}
-}
-
-func (poll *OnvmPoll) finHandler() {
-	for channel_data := range poll.fin_frame_chan {
-		// Let onvmpoller delete the connection
-		conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
-		if !ok {
-			logger.Log.Errorf("DeliverPacket, close can not get the connection via four-tuple:%v\n", channel_data.FourTuple)
-		} else {
-			if !conn.state.is_rxchan_closed.Load() {
-				logger.Log.Tracef("DeliverPacket, close connection, four-tuple: %v\n", conn.four_tuple)
-				conn.buffer.close()
-				conn.state.is_rxchan_closed.Store(true)
-				poll.Delete(conn)
-			}
-		}
-	}
-}
-
-func (poll *OnvmPoll) frameHandler(channel_data *ChannelData) {
-	conn, ok := poll.tables.Get(hashV4Flow(channel_data.FourTuple))
-	if !ok {
-		logger.Log.Errorf("DeliverPacket-HTTP Frame, Can not get connection via four-tuple %v", channel_data.FourTuple)
-	} else {
-		conn.buffer.send(&Pkt{Payload_len: channel_data.Payload_len, PacketList: channel_data.PacketList})
-	}
-}
-
 /*********************************
+
 	Methods of Port Manager
+
 *********************************/
 
 func (pm *PortManager) DistributePort() {
@@ -611,76 +391,9 @@ func (pm *PortManager) ReleasePort(port uint16) {
 }
 
 /*********************************
-	Methods of OnvmPoll
-*********************************/
 
-func createConnection() *Connection {
-	// Create a new connection with unique connection ID
-	var conn Connection
-	var cs connState
-	conn.state = &cs
-	conn.buffer = newShareList()
-	conn.pkt = &Pkt{Payload_len: 0, Start_offset: 0, PacketList: nil, is_done: true}
-
-	return &conn
-}
-
-func initConnectionCh(conn *Connection) {
-	var new_state connState
-
-	// conn.rxchan = make(chan []byte, 5) // For non-blocking
-	conn.sync_chan = make(chan struct{})
-
-	/* Need to reset the connection state */
-	conn.state = &new_state
-	conn.buffer = newShareList()
-}
-
-func (poll *OnvmPoll) Add(conn *Connection) {
-	// Add connection to connection table
-	poll.tables.Insert(hashV4Flow(swapFourTuple(conn.four_tuple)), conn)
-}
-
-func (poll *OnvmPoll) Delete(conn *Connection) error {
-	// defer TimeTrack(time.Now())
-	// Delete the connection from connection and four-tuple tables
-	if conn.state.is_txchan_closed.Load() && conn.state.is_rxchan_closed.Load() {
-		var four_tuple Four_tuple_rte = swapFourTuple(conn.four_tuple)
-		ok := poll.tables.Del(hashV4Flow(four_tuple))
-		if !ok {
-			msg := fmt.Sprintf("Delete connection from four-tuple fail, %v is not exsit", four_tuple)
-			err := errors.New(msg)
-			logger.Log.Errorln(msg)
-			return err
-		}
-
-		port_manager.ReleasePort(conn.four_tuple.Src_port)
-
-		// Recycle the connection
-		conn_pool.Put(conn)
-
-		logger.Log.Tracef("Close connection sucessfully.")
-	}
-
-	return nil
-}
-
-func GetConnByReverseFourTuple(four_tuple Four_tuple_rte) (*Connection, error) {
-	swap_four_tuple := swapFourTuple(four_tuple)
-	poller_index := swap_four_tuple.getPollIndex()
-	c, ok := onvmpoll[poller_index].tables.Get(hashV4Flow(swap_four_tuple))
-
-	if !ok {
-		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", four_tuple)
-
-		return nil, err
-	} else {
-		return c, nil
-	}
-}
-
-/*********************************
 	Methods of OnvmAddr
+
 *********************************/
 
 func (oa OnvmAddr) Network() string {
@@ -691,280 +404,6 @@ func (oa OnvmAddr) String() string {
 	s := fmt.Sprintf("Network: %s, Service ID: %2d, IP Address: %s, Port: %5d.",
 		oa.network, oa.service_id, oa.ipv4_addr, oa.port)
 	return s
-}
-
-/*********************************
-	Methods of Connection
-*********************************/
-
-// Read implements the net.Conn Read method.
-func (connection Connection) Read(b []byte) (int, error) {
-	// defer TimeTrack(time.Now())
-	logger.Log.Tracef("Start Connection.Read, four-tuple: %v", connection.four_tuple)
-
-	var length int
-	var err error
-
-	// List is empty, waiting for packet
-	if connection.pkt.is_done {
-		is_close := connection.buffer.recv(connection.pkt)
-
-		if is_close {
-			err = io.EOF
-			return length, err
-		}
-	}
-
-	// if true {
-	// 	conn, _ := GetConnByReverseFourTuple(connection.four_tuple)
-	// 	conn.pkt = connection.pkt
-	// 	// logger.Log.Errorln("Read", connection.four_tuple)
-	// 	logger.Log.Debugf("1: Conn ptr: %p, Conn pkt ptr: %p", &connection, connection.pkt)
-	// 	logger.Log.Debugf("2: Conn ptr: %p, Conn pkt ptr: %p", conn, conn.pkt)
-	// 	logger.Log.Debugf("Read, Pkt info, start offset: %v, payload length: %v", connection.pkt.Start_offset, connection.pkt.Payload_len)
-	// }
-
-	runtime.KeepAlive(b)
-
-	return connection.reading(b)
-}
-
-func (connection Connection) reading(b []byte) (int, error) {
-	logger.Log.Tracef("Start Connection.reading, four-tuple: %v", connection.four_tuple)
-	// defer TimeTrack(time.Now())
-	var length int
-	var err error
-
-	buff_cap := cap(b)
-	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
-	// length, err2 = buffer.Read(b)
-	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset), TCP_PROTO_NUM)
-	end_offset := int(offset)
-	length = end_offset - connection.pkt.Start_offset
-
-	if end_offset == connection.pkt.Payload_len {
-		connection.pkt.is_done = true
-	} else {
-		connection.pkt.Start_offset = end_offset
-	}
-
-	runtime.KeepAlive(b)
-
-	logger.Log.Tracef("reading read %v (buffer_cap: %v)", length, buff_cap)
-	return length, err
-}
-
-// Read ACK
-func (connection Connection) readACK() error {
-	// defer TimeTrack(time.Now())
-	logger.Log.Tracef("Start readACK, four-tuple: %v", connection.four_tuple)
-
-	var err error
-	// Receive packet from onvmpoller
-	_, ok := <-connection.sync_chan
-
-	if !ok {
-		err = fmt.Errorf("EOF")
-	}
-
-	return err
-}
-
-// Write implements the net.Conn Write method.
-func (connection Connection) Write(b []byte) (int, error) {
-	// defer TimeTrack(time.Now())
-	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
-	logger.Log.Debugf("Write %d data.", len(b))
-
-	len := len(b)
-	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
-
-	// Translate Go structure to C char *
-	// var buffer_ptr *C.char
-	// buffer_ptr = (*C.char)(C.CBytes(b))
-	buffer_ptr := (*C.char)(unsafe.Pointer(&b[0]))
-
-	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(HTTP_FRAME),
-		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
-		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port), TCP_PROTO_NUM,
-		buffer_ptr, C.int(len))
-
-	runtime.KeepAlive(b)
-
-	return len, nil
-}
-
-// For connection control message
-func (connection Connection) writeControlMessage(msg_type int) error {
-	// defer TimeTrack(time.Now())
-	logger.Log.Tracef("Start Connection.writeControlMessage, four-tuple: %v", connection.four_tuple)
-
-	// buffer := makeConnCtrlMsg(msg_type)
-	// Translate Go structure to C char *
-	// var buffer_ptr *C.char
-	// buffer_ptr = (*C.char)(C.CBytes(buffer))
-	// buffer_ptr := (*C.char)(unsafe.Pointer(&buffer[0]))
-
-	// Use CGO to call functions of NFLib
-	C.onvm_send_pkt(nf_ctx, C.int(connection.dst_id), C.int(msg_type),
-		C.uint32_t(connection.four_tuple.Src_ip), C.uint16_t(connection.four_tuple.Src_port),
-		C.uint32_t(connection.four_tuple.Dst_ip), C.uint16_t(connection.four_tuple.Dst_port), TCP_PROTO_NUM,
-		nil, C.int(0))
-
-	return nil
-}
-
-// Close implements the net.Conn Close method.
-func (connection Connection) Close() error {
-	var err error
-
-	logger.Log.Tracef("Close connection four-tuple: %v\n", connection.four_tuple)
-
-	if !connection.state.is_txchan_closed.Load() {
-		// Notify peer connection can be closed
-		connection.writeControlMessage(CLOSE_CONN)
-
-		// Close local connection
-		connection.state.is_txchan_closed.Store(true)
-
-		pollIndex := connection.four_tuple.getPollIndex()
-		err = onvmpoll[pollIndex].Delete(&connection)
-	}
-
-	return err
-}
-
-// LocalAddr implements the net.Conn LocalAddr method.
-func (connection Connection) LocalAddr() net.Addr {
-	var oa OnvmAddr
-	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Src_ip)
-	oa.port = connection.four_tuple.Src_port
-	oa.network = "onvm"
-	id, _ := IpToID(oa.ipv4_addr)
-	oa.service_id = uint8(id)
-
-	return oa
-}
-
-// RemoteAddr implements the net.Conn RemoteAddr method.
-func (connection Connection) RemoteAddr() net.Addr {
-	var oa OnvmAddr
-	oa.ipv4_addr = unMarshalIP(connection.four_tuple.Dst_ip)
-	oa.port = connection.four_tuple.Dst_port
-	oa.network = "onvm"
-	id, _ := IpToID(oa.ipv4_addr)
-	oa.service_id = uint8(id)
-
-	return oa
-}
-
-// SetDeadline implements the net.Conn SetDeadline method.
-func (connection Connection) SetDeadline(t time.Time) error {
-	return nil
-}
-
-// SetReadDeadline implements the net.Conn SetReadDeadline method.
-func (connection Connection) SetReadDeadline(t time.Time) error {
-	return nil
-}
-
-// SetWriteDeadline implements the net.Conn SetWriteDeadline method.
-func (connection Connection) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-/*********************************
-	Methods of OnvmListner
-*********************************/
-
-func (ol OnvmListener) Accept() (net.Conn, error) {
-	logger.Log.Traceln("Start OnvmListener.Accept")
-	return <-ol.complete_chan, nil
-}
-
-func (ol OnvmListener) Close() error {
-	err := ol.conn.Close()
-	return err
-}
-
-func (ol OnvmListener) Addr() net.Addr {
-	return ol.laddr
-}
-
-/*
-********************************
-
-	API for HTTP Server
-
-********************************
-*/
-
-func ListenONVM(network, address string) (net.Listener, error) {
-	logger.Log.Traceln("Start ListenONVM")
-	logger.Log.Debugf("Listen at %s", address)
-
-	if network != "onvm" {
-		msg := fmt.Sprintf("Unsppourt network type: %v", network)
-		err := errors.New(msg)
-		return nil, err
-	}
-	ip_addr, port := parseAddress(address)
-	local_address = ip_addr
-
-	return listen(ip_addr, port)
-}
-
-func DialONVM(network, address string) (net.Conn, error) {
-	logger.Log.Traceln("Start DialONVM")
-
-	ip_addr, port := parseAddress(address)
-
-	// Initialize a connection
-	// conn := createConnection()
-	conn := conn_pool.Get().(*Connection)
-	initConnectionCh(conn)
-	// conn.four_tuple.Src_ip = binary.BigEndian.Uint32(net.ParseIP(local_address)[12:16])
-	conn.four_tuple.Src_ip = inet_addr(local_address)
-	conn.four_tuple.Src_port = port_manager.GetPort()
-	// conn.four_tuple.Dst_ip = binary.BigEndian.Uint32(net.ParseIP(ip_addr)[12:16])
-	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
-	conn.four_tuple.Dst_port = port
-	logger.Log.Debugf("I'm %s:%v, Dial to %s", local_address, conn.four_tuple.Src_port, address)
-
-	// Add the connection to table, otherwise it can't receive response
-	pollIndex := conn.four_tuple.getPollIndex()
-	onvmpoll[pollIndex].Add(conn)
-
-	dst_id, _ := IpToID(ip_addr)
-	conn.dst_id = uint8(dst_id)
-
-	// Send connection request to server
-	err := conn.writeControlMessage(ESTABLISH_CONN)
-	logger.Log.Traceln("Dial write connection create request")
-
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		conn.Close()
-		return conn, err
-	} else {
-		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
-	}
-
-	// Wait for response
-	logger.Log.Traceln("Dial wait connection create response")
-	err = conn.readACK()
-	if err != nil {
-		logger.Log.Errorln(err.Error())
-		conn.Close()
-		return conn, err
-	} else {
-		logger.Log.Traceln("Dial get connection create response")
-	}
-
-	logger.Log.Debugln("DialONVM done")
-
-	return conn, nil
 }
 
 func TimeTrack(start time.Time) {
@@ -1046,10 +485,109 @@ func (c *shareList) close() {
 /*
 ********************************
 
-	API for XIO listener
+	API for HTTP Server
 
 ********************************
 */
+
+func DialONVM(network, address string) (net.Conn, error) {
+	logger.Log.Panicln("ListenONVM is no loger used, use ListenXIO instead")
+
+	return nil, nil
+}
+
+func ListenONVM(network, address string) (net.Listener, error) {
+	logger.Log.Panicln("ListenONVM is no loger used, use ListenXIO instead")
+
+	return nil, nil
+}
+
+func ListenXIO_UDP(network string, address *net.UDPAddr) (*UDP_Connection, error) {
+	logger.Log.Traceln("Start ListenXIO_UDP")
+	logger.Log.Debugf("Listen at %s", address.String())
+
+	ip_addr := address.IP.String()
+	port := uint16(address.Port)
+	local_address = ip_addr
+
+	// Initialize a connection
+	var udp_conn UDP_Connection
+
+	udp_conn.four_tuple.Src_ip = inet_addr(ip_addr)
+	udp_conn.four_tuple.Src_port = port
+	udp_conn.four_tuple.Dst_ip = 0
+	udp_conn.four_tuple.Dst_port = 0
+
+	condVar := newSema()
+	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
+	udp_conn.sync_chan = condVar
+
+	// Create udp socket in C
+	xs := C.xio_new_udp_socket(C.uint32_t(udp_conn.four_tuple.Src_ip), C.uint16_t(udp_conn.four_tuple.Src_port),
+		C.uint32_t(udp_conn.four_tuple.Dst_ip), C.uint16_t(udp_conn.four_tuple.Dst_port), condVarPtr)
+
+	udp_conn.xio_socket = xs
+
+	if udp_conn.xio_socket == nil {
+		err := fmt.Errorf("[ListenXIO_UDP] Create udp socket failed")
+		udp_conn.Close()
+
+		return &udp_conn, err
+	}
+
+	return &udp_conn, nil
+}
+
+func DialXIO(network, address string) (net.Conn, error) {
+	logger.Log.Traceln("Start DialXIO")
+
+	ip_addr, port := parseAddress(address)
+
+	// Initialize a connection
+	var conn XIO_Connection
+	conn.four_tuple.Src_ip = inet_addr(local_address)
+	conn.four_tuple.Src_port = port_manager.GetPort()
+	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
+	conn.four_tuple.Dst_port = port
+
+	condVar := newSema()
+	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
+	conn.sync_chan = condVar
+
+	dst_id, _ := IpToID(ip_addr)
+	conn.dst_id = uint8(dst_id)
+
+	// Send connection request to server
+	xs := C.xio_connect(C.uint32_t(conn.four_tuple.Src_ip), C.uint16_t(conn.four_tuple.Src_port),
+		C.uint32_t(conn.four_tuple.Dst_ip), C.uint16_t(conn.four_tuple.Dst_port), condVarPtr, nil)
+	conn.xio_socket = xs
+
+	if conn.xio_socket == nil {
+		err := fmt.Errorf("Read ACK failed")
+		conn.Close()
+		return conn, err
+	} else {
+		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
+	}
+
+	// Wait for response
+	logger.Log.Traceln("Dial wait connection create response")
+	ok := condVar.wait()
+	runtime.KeepAlive(condVar)
+
+	if ok {
+		err := fmt.Errorf("Read ACK failed")
+
+		return nil, err
+	}
+
+	logger.Log.Debugln("DialXIO done")
+	// logger.Log.Warnf("[Dial] srcIP:%s, srcPort:%d, dstIP:%s, dstPort:%d",
+	// 	unMarshalIP(conn.four_tuple.Src_ip), conn.four_tuple.Src_port,
+	// 	unMarshalIP(conn.four_tuple.Dst_ip), conn.four_tuple.Dst_port)
+
+	return conn, nil
+}
 
 func ListenXIO(network, address string) (net.Listener, error) {
 	logger.Log.Traceln("Start ListenXIO")
@@ -1172,65 +710,6 @@ func (xl XIO_Listener) Close() error {
 
 func (xl XIO_Listener) Addr() net.Addr {
 	return xl.laddr
-}
-
-/*
-********************************
-
-	API for XIO Dial
-
-********************************
-*/
-
-func DialXIO(network, address string) (net.Conn, error) {
-	logger.Log.Traceln("Start DialXIO")
-
-	ip_addr, port := parseAddress(address)
-
-	// Initialize a connection
-	var conn XIO_Connection
-	conn.four_tuple.Src_ip = inet_addr(local_address)
-	conn.four_tuple.Src_port = port_manager.GetPort()
-	conn.four_tuple.Dst_ip = inet_addr(ip_addr)
-	conn.four_tuple.Dst_port = port
-
-	condVar := newSema()
-	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
-	conn.sync_chan = condVar
-
-	dst_id, _ := IpToID(ip_addr)
-	conn.dst_id = uint8(dst_id)
-
-	// Send connection request to server
-	xs := C.xio_connect(C.uint32_t(conn.four_tuple.Src_ip), C.uint16_t(conn.four_tuple.Src_port),
-		C.uint32_t(conn.four_tuple.Dst_ip), C.uint16_t(conn.four_tuple.Dst_port), condVarPtr, nil)
-	conn.xio_socket = xs
-
-	if conn.xio_socket == nil {
-		err := fmt.Errorf("Read ACK failed")
-		conn.Close()
-		return conn, err
-	} else {
-		logger.Log.Tracef(fmt.Sprintf("Write connection request to (%v,%v)", ip_addr, port))
-	}
-
-	// Wait for response
-	logger.Log.Traceln("Dial wait connection create response")
-	ok := condVar.wait()
-	runtime.KeepAlive(condVar)
-
-	if ok {
-		err := fmt.Errorf("Read ACK failed")
-
-		return nil, err
-	}
-
-	logger.Log.Debugln("DialONVM done")
-	// logger.Log.Warnf("[Dial] srcIP:%s, srcPort:%d, dstIP:%s, dstPort:%d",
-	// 	unMarshalIP(conn.four_tuple.Src_ip), conn.four_tuple.Src_port,
-	// 	unMarshalIP(conn.four_tuple.Dst_ip), conn.four_tuple.Dst_port)
-
-	return conn, nil
 }
 
 /*
@@ -1373,42 +852,6 @@ func (connection XIO_Connection) SetWriteDeadline(t time.Time) error {
 ********************************
 */
 
-func ListenXIO_UDP(network string, address *net.UDPAddr) (*UDP_Connection, error) {
-	logger.Log.Traceln("Start ListenXIO_UDP")
-	logger.Log.Debugf("Listen at %s", address.String())
-
-	ip_addr := address.IP.String()
-	port := uint16(address.Port)
-	local_address = ip_addr
-
-	// Initialize a connection
-	var udp_conn UDP_Connection
-
-	udp_conn.four_tuple.Src_ip = inet_addr(ip_addr)
-	udp_conn.four_tuple.Src_port = port
-	udp_conn.four_tuple.Dst_ip = 0
-	udp_conn.four_tuple.Dst_port = 0
-
-	condVar := newSema()
-	condVarPtr := (*C.char)(unsafe.Pointer(condVar))
-	udp_conn.sync_chan = condVar
-
-	// Create udp socket in C
-	xs := C.xio_new_udp_socket(C.uint32_t(udp_conn.four_tuple.Src_ip), C.uint16_t(udp_conn.four_tuple.Src_port),
-		C.uint32_t(udp_conn.four_tuple.Dst_ip), C.uint16_t(udp_conn.four_tuple.Dst_port), condVarPtr)
-
-	udp_conn.xio_socket = xs
-
-	if udp_conn.xio_socket == nil {
-		err := fmt.Errorf("[ListenXIO_UDP] Create udp socket failed")
-		udp_conn.Close()
-
-		return &udp_conn, err
-	}
-
-	return &udp_conn, nil
-}
-
 func (udp_conn *UDP_Connection) WriteTo(b []byte, addr *net.UDPAddr) (int, error) {
 	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start UDP_Connection.WriteTo, four-tuple: %v\tremote: %v", udp_conn.four_tuple, addr.String())
@@ -1507,20 +950,6 @@ func (udp_conn *UDP_Connection) LocalAddr() *net.UDPAddr {
 	}
 
 	return udp_addr
-}
-
-func inet_addr(ipaddr string) uint32 {
-	var (
-		ip                 = strings.Split(ipaddr, ".")
-		ip1, ip2, ip3, ip4 uint64
-		ret                uint32
-	)
-	ip1, _ = strconv.ParseUint(ip[0], 10, 8)
-	ip2, _ = strconv.ParseUint(ip[1], 10, 8)
-	ip3, _ = strconv.ParseUint(ip[2], 10, 8)
-	ip4, _ = strconv.ParseUint(ip[3], 10, 8)
-	ret = uint32(ip4)<<24 + uint32(ip3)<<16 + uint32(ip2)<<8 + uint32(ip1)
-	return ret
 }
 
 type sema struct {

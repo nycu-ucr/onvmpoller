@@ -55,11 +55,11 @@ int trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip);
 ********************************
 */
 
-uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
-uint16_t IP_HDR_LEN  = sizeof(struct rte_ipv4_hdr);
+uint16_t ETH_HDR_LEN   = sizeof(struct rte_ether_hdr);
+uint16_t IP_HDR_LEN    = sizeof(struct rte_ipv4_hdr);
 uint16_t ICMP_HDR_LEN  = sizeof(struct rte_icmp_hdr);
-uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
-uint16_t UDP_HDR_LEN = sizeof(struct rte_udp_hdr);
+uint16_t TCP_HDR_LEN   = sizeof(struct rte_tcp_hdr);
+uint16_t UDP_HDR_LEN   = sizeof(struct rte_udp_hdr);
 
 struct rte_mempool *pktmbuf_pool;
 struct rte_hash *conn_tables;
@@ -134,22 +134,6 @@ static inline uint32_t ipv4_4tuple_hash(const void *key, __rte_unused uint32_t k
                                      tuple->ip_src,
                                      ((uint32_t)tuple->port_dst << 16) | tuple->port_src,
                                      0);
-    return hash;
-}
-
-static inline uint32_t ipv4_2tuple_hash(const void *key, __rte_unused uint32_t key_len,
-                                        __rte_unused uint32_t init_val)
-{
-    // This is for UDP
-    // Only take dst ip addr and port
-    const struct ipv4_4tuple *tuple = (const struct ipv4_4tuple *)key;
-    uint32_t hash = rte_jhash_2words(tuple->ip_dst,
-                                     ((uint32_t)tuple->port_dst << 16),
-                                     0);
-    // printf("[ipv4_2tuple_hash]:\n");
-    // print_fourTuple(tuple);
-    // printf("\tHash: %u\n", hash);
-
     return hash;
 }
 
