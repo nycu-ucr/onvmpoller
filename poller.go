@@ -226,8 +226,7 @@ var (
 
 func init() {
 	/* Initialize Global Variable */
-	initConfig()
-	initNfIP()
+	init_config()
 	// initOnvmPoll()
 
 	port_manager = &PortManager{
@@ -246,6 +245,7 @@ func init() {
 	logger.SetLogLevel(LOG_LEVEL)
 
 	/* Parse NF Name */
+	// TODO: Modify this
 	NfName := parseNfName(os.Args[0])
 	var char_ptr *C.char = C.CString(NfName)
 
@@ -265,7 +265,7 @@ func init() {
 	runOnvmPoller()
 
 	time.Sleep(2 * time.Second)
-	logger.Log.Warnln("Init onvmpoller (XIO-refactor ver)")
+	logger.Log.Warnln("Init onvmpoller (XIO-refactor version)")
 }
 
 func runOnvmPoller() {
@@ -285,18 +285,27 @@ func CloseONVM() {
 	C.onvm_nflib_stop(nf_ctx)
 }
 
+func TriggerPaging(service_id int, src_ip string, dst_ip string) {
+	C.trigger_paging(C.int(service_id), C.uint32_t(inet_addr(src_ip)), C.uint32_t(inet_addr(dst_ip)))
+}
+
 /*********************************
 	     Hepler functions
 *********************************/
 
-func initConfig() {
-	// Get absolute file name of ipid.yaml
-	var ipid_fname string
-	if dir, err := os.Getwd(); err != nil {
-		ipid_fname = "./ipid.yaml"
-	} else {
-		ipid_fname = dir + "/ipid.yaml"
+func init_config() {
+	var ipid_fname string = os.Getenv("ONVMPOLLER_IPID_YAML")
+	var nfip_fname string = os.Getenv("ONVMPOLLER_NFIP_YAML")
+
+	if ipid_fname == "" {
+		logger.Log.Panicln("Config file (ipid.yaml) is not exist")
 	}
+	if nfip_fname == "" {
+		logger.Log.Panicln("Config file (NFip.yaml) is not exist")
+	}
+
+	logger.Log.Infof("Config file (ipid.yaml) is %s\n", ipid_fname)
+	logger.Log.Infof("Config file (NFip.yaml) is %s\n", nfip_fname)
 
 	// Read and decode the yaml content
 	if yaml_content, err := ioutil.ReadFile(ipid_fname); err != nil {
@@ -306,19 +315,9 @@ func initConfig() {
 			panic(unMarshalErr)
 		}
 	}
-}
-
-func initNfIP() {
-	// Get absolute file name of ipid.yaml
-	var nfIP_fname string
-	if dir, err := os.Getwd(); err != nil {
-		nfIP_fname = "./NFip.yaml"
-	} else {
-		nfIP_fname = dir + "/NFip.yaml"
-	}
 
 	// Read and decode the yaml content
-	if yaml_content, err := ioutil.ReadFile(nfIP_fname); err != nil {
+	if yaml_content, err := ioutil.ReadFile(nfip_fname); err != nil {
 		panic(err)
 	} else {
 		if unMarshalErr := yaml.Unmarshal(yaml_content, &nfIP); unMarshalErr != nil {
@@ -1577,8 +1576,4 @@ func (c *sema) close() {
 	c.closed = true
 	c.cond.Signal()
 	c.cond.L.Unlock()
-}
-
-func TriggerPaging(service_id int, src_ip string, dst_ip string) {
-	C.trigger_paging(C.int(service_id), C.uint32_t(inet_addr(src_ip)), C.uint32_t(inet_addr(dst_ip)))
 }

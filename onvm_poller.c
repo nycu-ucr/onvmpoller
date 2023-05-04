@@ -425,6 +425,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     nf_function_table->pkt_handler = &packet_handler;
 
     int argc = 3;
+    // TODO: Modify this
     char file_path[] = "/home/hstsai/onvm/NF_json/";
     int path_len = strlen(file_path);
 
@@ -508,7 +509,10 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     }
 
     // Parse the input lines and insert the key-value pairs into the hash table.
-    char ipid_fname[] = "/home/hstsai/onvm/testbed/bin/ipid.txt";
+    char *ipid_fname = getenv("ONVMPOLLER_IPID_TXT");
+    if (ipid_fname == NULL) {
+        rte_exit(EXIT_FAILURE, "Env variable 'ONVMPOLLER_IPID_TXT' is not exist");
+    }
     FILE *fp = fopen(ipid_fname, "r");
     if (fp == NULL) {
         rte_exit(EXIT_FAILURE, "Unable to open %s", ipid_fname);
