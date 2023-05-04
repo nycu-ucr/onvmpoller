@@ -230,6 +230,8 @@ func init() {
 	initNfIP()
 	// initOnvmPoll()
 
+	ReadIncomplete = errors.New("Continue")
+
 	port_manager = &PortManager{
 		pool:            make(map[uint16]bool),
 		get_port_ch:     make(chan uint16, PM_CHANNEL_SIZE),
@@ -357,6 +359,10 @@ func parseAddress(address string) (string, uint16) {
 	addr := strings.Split(address, ":")
 	v, _ := strconv.ParseUint(addr[1], 10, 64)
 	ip_addr, port := addr[0], uint16(v)
+
+	if ip_addr == "localhost" {
+		ip_addr = "127.0.0.1"
+	}
 
 	return ip_addr, port
 }
@@ -531,7 +537,7 @@ func (poll *OnvmPoll) replyHandler() {
 	for four_tuple := range poll.ack_chan {
 		conn, ok := poll.tables.Get(hashV4Flow(*four_tuple))
 		if !ok {
-			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %v", four_tuple)
+			logger.Log.Errorf("DeliverPacket-ACK, Can not get connection via four-tuple %+v", four_tuple)
 		} else {
 			// conn.state.is_ready.Store(true)
 			conn.sync_chan <- struct{}{}
@@ -637,9 +643,38 @@ func initConnectionCh(conn *Connection) {
 	conn.buffer = newShareList()
 }
 
+func GetConnByReverseFourTuple(four_tuple Four_tuple_rte) (*Connection, error) {
+	swap_four_tuple := swapFourTuple(four_tuple)
+	poller_index := swap_four_tuple.getPollIndex()
+	c, ok := onvmpoll[poller_index].tables.Get(hashV4Flow(swap_four_tuple))
+
+	if !ok {
+		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", four_tuple)
+
+		return nil, err
+	} else {
+		return c, nil
+	}
+}
+
+func showAllConnections() {
+	logger.Log.Tracef("showAllConnections")
+	for i := 0; i < ONVM_POLLER_NUM; i++ {
+		onvmpoll[i].tables.Range(func(key uint32, conn *Connection) bool {
+			fmt.Printf("%v:%v -> %v:%v\n",
+				intToIP4(int64(conn.four_tuple.Src_ip)), conn.four_tuple.Src_port,
+				intToIP4(int64(conn.four_tuple.Dst_ip)), conn.four_tuple.Dst_port,
+			)
+
+			return true
+		})
+	}
+}
+
 func (poll *OnvmPoll) Add(conn *Connection) {
 	// Add connection to connection table
 	poll.tables.Insert(hashV4Flow(swapFourTuple(conn.four_tuple)), conn)
+	// showAllConnections()
 }
 
 func (poll *OnvmPoll) Delete(conn *Connection) error {
@@ -664,20 +699,6 @@ func (poll *OnvmPoll) Delete(conn *Connection) error {
 	}
 
 	return nil
-}
-
-func GetConnByReverseFourTuple(four_tuple Four_tuple_rte) (*Connection, error) {
-	swap_four_tuple := swapFourTuple(four_tuple)
-	poller_index := swap_four_tuple.getPollIndex()
-	c, ok := onvmpoll[poller_index].tables.Get(hashV4Flow(swap_four_tuple))
-
-	if !ok {
-		err := fmt.Errorf("GetConnByReverseFourTuple, Can not get connection via four-tuple %v", four_tuple)
-
-		return nil, err
-	} else {
-		return c, nil
-	}
 }
 
 /*********************************
@@ -716,15 +737,6 @@ func (connection Connection) Read(b []byte) (int, error) {
 		}
 	}
 
-	// if true {
-	// 	conn, _ := GetConnByReverseFourTuple(connection.four_tuple)
-	// 	conn.pkt = connection.pkt
-	// 	// logger.Log.Errorln("Read", connection.four_tuple)
-	// 	logger.Log.Debugf("1: Conn ptr: %p, Conn pkt ptr: %p", &connection, connection.pkt)
-	// 	logger.Log.Debugf("2: Conn ptr: %p, Conn pkt ptr: %p", conn, conn.pkt)
-	// 	logger.Log.Debugf("Read, Pkt info, start offset: %v, payload length: %v", connection.pkt.Start_offset, connection.pkt.Payload_len)
-	// }
-
 	runtime.KeepAlive(b)
 
 	return connection.reading(b)
@@ -740,18 +752,25 @@ func (connection Connection) reading(b []byte) (int, error) {
 	buffer_ptr := (*C.uint8_t)(unsafe.Pointer(&b[0]))
 	// length, err2 = buffer.Read(b)
 	offset := C.payload_assemble(buffer_ptr, C.int(buff_cap), connection.pkt.PacketList, C.int(connection.pkt.Start_offset), TCP_PROTO_NUM)
+
 	end_offset := int(offset)
 	length = end_offset - connection.pkt.Start_offset
 
 	if end_offset == connection.pkt.Payload_len {
 		connection.pkt.is_done = true
+		// err = io.EOF // TODO: This will result in hijack operation failed
 	} else {
 		connection.pkt.Start_offset = end_offset
+		err = ReadIncomplete
 	}
 
 	runtime.KeepAlive(b)
 
-	logger.Log.Tracef("reading read %v (buffer_cap: %v)", length, buff_cap)
+	logger.Log.Debugf("(%v:%v -> %v:%v) reading read %v (buffer_cap: %v) (Pkt length: %v) (end offset: %v) (err: %+v)",
+		intToIP4(int64(connection.four_tuple.Dst_ip)), connection.four_tuple.Dst_port,
+		intToIP4(int64(connection.four_tuple.Src_ip)), connection.four_tuple.Src_port,
+		length, buff_cap, connection.pkt.Payload_len, end_offset, err)
+
 	return length, err
 }
 
@@ -775,7 +794,10 @@ func (connection Connection) readACK() error {
 func (connection Connection) Write(b []byte) (int, error) {
 	// defer TimeTrack(time.Now())
 	logger.Log.Tracef("Start Connection.Write, four-tuple: %v", connection.four_tuple)
-	logger.Log.Debugf("Write %d data.", len(b))
+	logger.Log.Tracef("(%v:%v -> %v:%v) Write %d data.",
+		intToIP4(int64(connection.four_tuple.Src_ip)), connection.four_tuple.Src_port,
+		intToIP4(int64(connection.four_tuple.Dst_ip)), connection.four_tuple.Dst_port,
+		len(b))
 
 	len := len(b)
 	// fmt.Printf("Poller []byte ptr: %p\n", &b[0])
