@@ -1,12 +1,12 @@
 package onvmpoller
 
 // #cgo CFLAGS: -m64 -pthread -O3 -march=native
-// #cgo CFLAGS: -I/home/hstsai/onvm/onvm-upf/onvm/onvm_nflib
-// #cgo CFLAGS: -I/home/hstsai/onvm/onvm-upf/onvm/lib
-// #cgo CFLAGS: -I/home/hstsai/onvm/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/include
-// #cgo LDFLAGS: /home/hstsai/onvm/onvm-upf/onvm/onvm_nflib/x86_64-native-linuxapp-gcc/libonvm.a
-// #cgo LDFLAGS: /home/hstsai/onvm/onvm-upf/onvm/lib/x86_64-native-linuxapp-gcc/lib/libonvmhelper.a -lm
-// #cgo LDFLAGS: -L/home/hstsai/onvm/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/lib
+// #cgo CFLAGS: -I/home/johnson/onvm/onvm-upf/onvm/onvm_nflib
+// #cgo CFLAGS: -I/home/johnson/onvm/onvm-upf/onvm/lib
+// #cgo CFLAGS: -I/home/johnson/onvm/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/include
+// #cgo LDFLAGS: /home/johnson/onvm/onvm-upf/onvm/onvm_nflib/x86_64-native-linuxapp-gcc/libonvm.a
+// #cgo LDFLAGS: /home/johnson/onvm/onvm-upf/onvm/lib/x86_64-native-linuxapp-gcc/lib/libonvmhelper.a -lm
+// #cgo LDFLAGS: -L/home/johnson/onvm/onvm-upf/dpdk/x86_64-native-linuxapp-gcc/lib
 // #cgo LDFLAGS: -lrte_flow_classify -Wl,--whole-archive -lrte_pipeline -Wl,--no-whole-archive -Wl,--whole-archive -lrte_table -Wl,--no-whole-archive -Wl,--whole-archive -lrte_port -Wl,--no-whole-archive -lrte_pdump -lrte_distributor -lrte_ip_frag -lrte_meter -lrte_fib -lrte_rib -lrte_lpm -lrte_acl -lrte_jobstats -Wl,--whole-archive -lrte_metrics -Wl,--no-whole-archive -lrte_bitratestats -lrte_latencystats -lrte_power -lrte_efd -lrte_bpf -lrte_ipsec -Wl,--whole-archive -lrte_cfgfile -lrte_gro -lrte_gso -lrte_hash -lrte_member -lrte_vhost -lrte_kvargs -lrte_telemetry -lrte_mbuf -lrte_net -lrte_ethdev -lrte_bbdev -lrte_cryptodev -lrte_security -lrte_compressdev -lrte_eventdev -lrte_rawdev -lrte_timer -lrte_mempool -lrte_stack -lrte_mempool_ring -lrte_mempool_octeontx2 -lrte_ring -lrte_pci -lrte_eal -lrte_cmdline -lrte_reorder -lrte_sched -lrte_rcu -lrte_graph -lrte_node -lrte_kni -lrte_common_cpt -lrte_common_octeontx -lrte_common_octeontx2 -lrte_common_dpaax -lrte_bus_pci -lrte_bus_vdev -lrte_bus_dpaa -lrte_bus_fslmc -lrte_mempool_bucket -lrte_mempool_stack -lrte_mempool_dpaa -lrte_mempool_dpaa2 -lrte_pmd_af_packet -lrte_pmd_ark -lrte_pmd_atlantic -lrte_pmd_avp -lrte_pmd_axgbe -lrte_pmd_bnxt -lrte_pmd_bond -lrte_pmd_cxgbe -lrte_pmd_dpaa -lrte_pmd_dpaa2 -lrte_pmd_e1000 -lrte_pmd_ena -lrte_pmd_enetc -lrte_pmd_enic -lrte_pmd_fm10k -lrte_pmd_failsafe -lrte_pmd_hinic -lrte_pmd_hns3 -lrte_pmd_i40e -lrte_pmd_iavf -lrte_pmd_ice -lrte_common_iavf -lrte_pmd_igc -lrte_pmd_ionic -lrte_pmd_ixgbe -lrte_pmd_kni -lrte_pmd_lio -lrte_pmd_memif -lrte_pmd_nfp -lrte_pmd_null -lrte_pmd_octeontx2 -lrte_pmd_qede -lrte_pmd_ring -lrte_pmd_softnic -lrte_pmd_sfc_efx -lrte_pmd_tap -lrte_pmd_thunderx_nicvf -lrte_pmd_vdev_netvsc -lrte_pmd_virtio -lrte_pmd_vhost -lrte_pmd_ifc -lrte_pmd_vmxnet3_uio -lrte_bus_vmbus -lrte_pmd_netvsc -lrte_pmd_bbdev_null -lrte_pmd_bbdev_fpga_lte_fec -lrte_pmd_bbdev_fpga_5gnr_fec -lrte_pmd_bbdev_turbo_sw -lrte_pmd_null_crypto -lrte_pmd_nitrox -lrte_pmd_octeontx_crypto -lrte_pmd_octeontx2_crypto -lrte_pmd_crypto_scheduler -lrte_pmd_dpaa2_sec -lrte_pmd_dpaa_sec -lrte_pmd_caam_jr -lrte_pmd_virtio_crypto -lrte_pmd_octeontx_zip -lrte_pmd_qat -lrte_pmd_skeleton_event -lrte_pmd_sw_event -lrte_pmd_dsw_event -lrte_pmd_octeontx_ssovf -lrte_pmd_dpaa_event -lrte_pmd_dpaa2_event -lrte_mempool_octeontx -lrte_pmd_octeontx -lrte_pmd_octeontx2_event -lrte_pmd_opdl_event -lrte_rawdev_skeleton -lrte_rawdev_dpaa2_cmdif -lrte_rawdev_dpaa2_qdma -lrte_bus_ifpga -lrte_rawdev_ioat -lrte_rawdev_ntb -lrte_rawdev_octeontx2_dma -lrte_rawdev_octeontx2_ep -Wl,--no-whole-archive -lrt -lm -lnuma -ldl
 /*
 #include <onvm_nflib.h>
@@ -40,8 +40,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
-	"log"
 	"net"
 	"os"
 	"regexp"
@@ -171,8 +169,12 @@ func init() {
 	logger.SetLogLevel(LOG_LEVEL)
 
 	/* Parse NF Name */
-	// TODO: Modify this
-	NfName := parseNfName(os.Args[0])
+	NfName := os.Getenv("NF_NAME")
+	if NfName == "" {
+		logger.Log.Warnln("Unable to get NF_NAME from env var.")
+	} else {
+		NfName = strings.ToLower(NfName)
+	}
 	var char_ptr *C.char = C.CString(NfName)
 
 	/* Set local_address by NF config */
@@ -235,7 +237,7 @@ func init_config() {
 	logger.Log.Infof("Config file (NFip.yaml) is %s\n", nfip_fname)
 
 	// Read and decode the yaml content
-	if yaml_content, err := ioutil.ReadFile(ipid_fname); err != nil {
+	if yaml_content, err := os.ReadFile(ipid_fname); err != nil {
 		panic(err)
 	} else {
 		if unMarshalErr := yaml.Unmarshal(yaml_content, &config); unMarshalErr != nil {
@@ -244,7 +246,7 @@ func init_config() {
 	}
 
 	// Read and decode the yaml content
-	if yaml_content, err := ioutil.ReadFile(nfip_fname); err != nil {
+	if yaml_content, err := os.ReadFile(nfip_fname); err != nil {
 		panic(err)
 	} else {
 		if unMarshalErr := yaml.Unmarshal(yaml_content, &nfIP); unMarshalErr != nil {
@@ -272,11 +274,6 @@ func NfToIP(nf string) (ip string, err error) {
 	}
 
 	return
-}
-
-func parseNfName(args string) string {
-	nfName := strings.Split(args, "/")
-	return nfName[1]
 }
 
 func parseAddress(address string) (string, uint16) {
@@ -419,7 +416,7 @@ func TimeTrack(start time.Time) {
 	runtimeFunc := regexp.MustCompile(`^.*\.(.*)$`)
 	name := runtimeFunc.ReplaceAllString(funcObj.Name(), "$1")
 
-	log.Println(fmt.Sprintf("%s took %d(ns)", name, elapsed.Nanoseconds()))
+	logger.Log.Infoln((fmt.Sprintf("%s took %d(ns)", name, elapsed.Nanoseconds())))
 }
 
 type shareList struct {
