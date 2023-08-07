@@ -409,8 +409,10 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     nf_function_table->pkt_handler = &packet_handler;
 
     int argc = 3;
-    // TODO: Modify this
-    char file_path[] = "/home/hstsai/onvm/NF_json/";
+    char *file_path = getenv("ONVM_NF_JSON");
+    if (file_path == NULL) {
+        rte_exit(EXIT_FAILURE, "Env variable 'ONVM_NF_JSON' is not exist");
+    }
     int path_len = strlen(file_path);
 
     char cmd0[] = "./go.sh";
