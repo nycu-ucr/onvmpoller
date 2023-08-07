@@ -55,11 +55,11 @@ int trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip);
 ********************************
 */
 
-uint16_t ETH_HDR_LEN = sizeof(struct rte_ether_hdr);
-uint16_t IP_HDR_LEN  = sizeof(struct rte_ipv4_hdr);
+uint16_t ETH_HDR_LEN   = sizeof(struct rte_ether_hdr);
+uint16_t IP_HDR_LEN    = sizeof(struct rte_ipv4_hdr);
 uint16_t ICMP_HDR_LEN  = sizeof(struct rte_icmp_hdr);
-uint16_t TCP_HDR_LEN = sizeof(struct rte_tcp_hdr);
-uint16_t UDP_HDR_LEN = sizeof(struct rte_udp_hdr);
+uint16_t TCP_HDR_LEN   = sizeof(struct rte_tcp_hdr);
+uint16_t UDP_HDR_LEN   = sizeof(struct rte_udp_hdr);
 
 struct rte_mempool *pktmbuf_pool;
 struct rte_hash *conn_tables;
@@ -134,22 +134,6 @@ static inline uint32_t ipv4_4tuple_hash(const void *key, __rte_unused uint32_t k
                                      tuple->ip_src,
                                      ((uint32_t)tuple->port_dst << 16) | tuple->port_src,
                                      0);
-    return hash;
-}
-
-static inline uint32_t ipv4_2tuple_hash(const void *key, __rte_unused uint32_t key_len,
-                                        __rte_unused uint32_t init_val)
-{
-    // This is for UDP
-    // Only take dst ip addr and port
-    const struct ipv4_4tuple *tuple = (const struct ipv4_4tuple *)key;
-    uint32_t hash = rte_jhash_2words(tuple->ip_dst,
-                                     ((uint32_t)tuple->port_dst << 16),
-                                     0);
-    // printf("[ipv4_2tuple_hash]:\n");
-    // print_fourTuple(tuple);
-    // printf("\tHash: %u\n", hash);
-
     return hash;
 }
 
@@ -425,7 +409,10 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     nf_function_table->pkt_handler = &packet_handler;
 
     int argc = 3;
-    char file_path[] = "/home/hstsai/onvm/NF_json/";
+    char *file_path = getenv("ONVM_NF_JSON");
+    if (file_path == NULL) {
+        rte_exit(EXIT_FAILURE, "Env variable 'ONVM_NF_JSON' is not exist");
+    }
     int path_len = strlen(file_path);
 
     char cmd0[] = "./go.sh";
@@ -508,7 +495,10 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     }
 
     // Parse the input lines and insert the key-value pairs into the hash table.
-    char ipid_fname[] = "/home/hstsai/onvm/testbed/bin/ipid.txt";
+    char *ipid_fname = getenv("ONVMPOLLER_IPID_TXT");
+    if (ipid_fname == NULL) {
+        rte_exit(EXIT_FAILURE, "Env variable 'ONVMPOLLER_IPID_TXT' is not exist");
+    }
     FILE *fp = fopen(ipid_fname, "r");
     if (fp == NULL) {
         rte_exit(EXIT_FAILURE, "Unable to open %s", ipid_fname);
