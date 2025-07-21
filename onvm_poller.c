@@ -682,7 +682,8 @@ int _trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip) {
     pkt->pkt_len = pkt->data_len;
 
     // Fill out the meta data of the packet
-    pmeta = onvm_get_pkt_meta(pkt);
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    pmeta = onvm_get_pkt_meta(pkt, onvm_config->dynfield_offset);
     pmeta->destination = service_id;
     pmeta->action = ONVM_NF_ACTION_TONF;
 
@@ -851,7 +852,8 @@ int onvm_send_pkt(struct onvm_nf_local_ctx *ctx, int service_id, int pkt_type,
     // onvm_pkt_set_checksums(pkt);
 
     // Fill out the meta data of the packet
-    pmeta = onvm_get_pkt_meta(pkt);
+    struct onvm_configuration *onvm_config = onvm_nflib_get_onvm_config();
+    pmeta = onvm_get_pkt_meta(pkt, onvm_config->dynfield_offset);
     pmeta->destination = service_id;
     pmeta->action = ONVM_NF_ACTION_TONF;
 
