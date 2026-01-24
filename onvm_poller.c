@@ -395,8 +395,9 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     printf("[NF Name]: %s\n", nfName);
     const char *NF_TAG = nfName;
     int nfName_size = string_len(nfName);
-    char nf_name[nfName_size];
+    char nf_name[nfName_size + 1];
     memcpy(nf_name, nfName, nfName_size);
+    nf_name[nfName_size] = '\0';
 
     int arg_offset;
     struct onvm_nf_function_table *nf_function_table;
@@ -417,8 +418,9 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
 
     char cmd0[] = "./go.sh";
     char cmd1[] = "-F";
-    char cmd2[path_len + nfName_size + 5];
-    sprintf(cmd2, "%s%s.json", file_path, nf_name);
+    size_t cmd2_len = strlen(file_path) + strlen(nf_name) + strlen(".json") + 1;
+    char cmd2[cmd2_len];
+    snprintf(cmd2, sizeof(cmd2), "%s%s.json", file_path, nf_name);
     char *argv[] = {cmd0, cmd1, cmd2};
     printf("Config file: %s\n", cmd2);
 
@@ -446,8 +448,10 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     }
 
     /* Create connection look-up table */
-    char conn_table_name[nfName_size + 11];
-    sprintf(conn_table_name, "conn_table_%s", nf_name);
+    size_t conn_len = strlen("conn_table_") + strlen(nf_name) + 1;
+    char conn_table_name[conn_len];
+    snprintf(conn_table_name, sizeof(conn_table_name), "conn_table_%s", nf_name);
+    printf("conn_table_name: %s\n", conn_table_name);
     struct rte_hash_parameters xio_ipv4_hash_params = {
         .name = conn_table_name,
         .entries = 1024 * 1024 * 1,
@@ -459,7 +463,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
     conn_tables = rte_hash_create(&xio_ipv4_hash_params);
     if (conn_tables == NULL)
     {
-        rte_exit(EXIT_FAILURE, "Unable to create the connection lookup table\n");
+        rte_exit(EXIT_FAILURE, "Unable to create the connection lookup table [%s]\n", nf_name);
     }
 
     // Create udp conn talbe
