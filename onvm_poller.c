@@ -438,7 +438,7 @@ int onvm_init(struct onvm_nf_local_ctx **nf_local_ctx, char *nfName)
         }
     }
 
-    pktmbuf_pool = rte_mempool_lookup(PKTMBUF_POOL_NAME);
+    pktmbuf_pool = rte_mempool_lookup(CP_PKTMBUF_POOL_NAME);
     if (pktmbuf_pool == NULL)
     {
         onvm_nflib_stop(*nf_local_ctx);
