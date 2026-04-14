@@ -661,7 +661,7 @@ int _trigger_paging(int service_id, uint32_t src_ip, uint32_t dst_ip) {
         printf("Failed to prepend ICMP header.\n");
         return -1;
     }
-    pkt_icmp_hdr->icmp_type = RTE_IP_ICMP_ECHO_REQUEST;
+    pkt_icmp_hdr->icmp_type = RTE_ICMP_TYPE_ECHO_REQUEST;
     pkt_icmp_hdr->icmp_code = 0;
     pkt_icmp_hdr->icmp_cksum = 0;
 
