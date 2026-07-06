@@ -1,12 +1,12 @@
 package onvmpoller
 
 // #cgo CFLAGS: -m64 -pthread -O3 -march=native
-// #cgo CFLAGS: -I/home/johnson/L25GC-plus/NFs/onvm-upf/onvm/onvm_nflib
-// #cgo CFLAGS: -I/home/johnson/L25GC-plus/NFs/onvm-upf/onvm/lib
+// #cgo CFLAGS: -I${SRCDIR}/../onvm-upf/onvm/onvm_nflib
+// #cgo CFLAGS: -I${SRCDIR}/../onvm-upf/onvm/lib
 // #cgo CFLAGS: -I/usr/local/include/
-// #cgo LDFLAGS: /home/johnson/L25GC-plus/NFs/onvm-upf/build/onvm/onvm_nflib/libonvm.a
-// #cgo LDFLAGS: /home/johnson/L25GC-plus/NFs/onvm-upf/build/onvm/lib/libonvmhelper.a -lm
-// #cgo LDFLAGS: -L/home/johnson/L25GC-plus/NFs/onvm-upf/subprojects/dpdk/build/lib/
+// #cgo LDFLAGS: ${SRCDIR}/../onvm-upf/build/onvm/onvm_nflib/libonvm.a
+// #cgo LDFLAGS: ${SRCDIR}/../onvm-upf/build/onvm/lib/libonvmhelper.a -lm
+// #cgo LDFLAGS: -L${SRCDIR}/../onvm-upf/subprojects/dpdk/build/lib/
 // #cgo LDFLAGS: -L/usr/local/lib -lrte_hash -lrte_mempool -lrte_eal -lrte_log -lrte_ring -lrte_ethdev
 /*
 #include <onvm_nflib.h>
@@ -156,6 +156,10 @@ var (
 )
 
 func init() {
+	if os.Getenv("ONVMPOLLER_ENABLE") != "1" {
+		return
+	}
+
 	/* Initialize Global Variable */
 	init_config()
 
